@@ -226,8 +226,8 @@ class PowerBIConnector:
             logger.error(f"Connection failed: {str(e)}")
             raise Exception(f"Connection failed: {str(e)}")
 
-    def discover_tables(self) -> List[str]:
-        """Discover all user-facing tables in the dataset"""
+    def discover_tables(self) -> List[Dict[str, Any]]:
+        """Discover all user-facing tables in the dataset with their descriptions and relationships"""
         if not self.connected:
             raise Exception("Not connected to Power BI")
 
@@ -253,17 +253,29 @@ class PowerBIConnector:
                             and not table_name.startswith("DateTableTemplate_")
                             and not row["TABLE_SCHEMA"] == "$SYSTEM"
                         ):
-                            tables_list.append(table_name)
+                            # Get table description from TMSCHEMA_TABLES
+                            table_description = self._get_table_description_direct(table_name)
+
+                            # Get relationships for this table
+                            table_relationships = self._get_table_relationships(table_name)
+
+                            tables_list.append(
+                                {
+                                    "name": table_name,
+                                    "description": table_description or "No description available",
+                                    "relationships": table_relationships,
+                                }
+                            )
 
             self.tables = tables_list
-            logger.info(f"Discovered {len(tables_list)} tables")
+            logger.info(f"Discovered {len(tables_list)} tables with relationships")
             return tables_list
         except Exception as e:
             logger.error(f"Failed to discover tables: {str(e)}")
             raise Exception(f"Failed to discover tables: {str(e)}")
 
     def get_table_schema(self, table_name: str) -> Dict[str, Any]:
-        """Get schema information for a specific table"""
+        """Get schema information for a specific table including description and column descriptions"""
         if not self.connected:
             raise Exception("Not connected to Power BI")
 
@@ -273,6 +285,9 @@ class PowerBIConnector:
             with Pyadomd(self.connection_string) as conn:
                 cursor = conn.cursor()
 
+                # Get table description
+                table_description = self._get_table_description_direct(table_name)
+
                 # Try to get column information
                 try:
                     dax_query = f"EVALUATE TOPN(1, '{table_name}')"
@@ -280,15 +295,361 @@ class PowerBIConnector:
                     columns = [desc[0] for desc in cursor.description]
                     cursor.close()
 
-                    return {"table_name": table_name, "type": "data_table", "columns": columns}
+                    # Get column descriptions from TMSCHEMA_COLUMNS
+                    column_descriptions = self._get_column_descriptions(table_name)
+
+                    # Create enhanced columns list with descriptions
+                    enhanced_columns = []
+                    for col_name in columns:
+                        # Find description for this column
+                        col_description = None
+                        col_data_type = None
+
+                        # Try exact match first
+                        for col_info in column_descriptions:
+                            if col_info["name"] == col_name:
+                                col_description = col_info["description"]
+                                col_data_type = col_info["data_type"]
+                                break
+
+                        # If no exact match, try partial match (remove table prefix if present)
+                        if not col_description:
+                            # Extract column name from format like "Employee Skills[Id]" -> "Id"
+                            if "[" in col_name and "]" in col_name:
+                                clean_col_name = col_name.split("[")[1].replace("]", "")
+                            else:
+                                clean_col_name = col_name
+
+                            for col_info in column_descriptions:
+                                if col_info["name"] == clean_col_name:
+                                    col_description = col_info["description"]
+                                    col_data_type = col_info["data_type"]
+                                    logger.debug(f"Matched column '{col_name}' with '{clean_col_name}'")
+                                    break
+
+                        # Create enhanced column info
+                        enhanced_columns.append(
+                            {
+                                "name": col_name,
+                                "description": col_description or "No description available",
+                                "data_type": col_data_type,
+                            }
+                        )
+
+                    return {
+                        "table_name": table_name,
+                        "type": "data_table",
+                        "description": table_description or "No description available",
+                        "columns": enhanced_columns,
+                    }
                 except:
                     # This might be a measure table
                     cursor.close()
-                    return self.get_measures_for_table(table_name)
+                    measure_info = self.get_measures_for_table(table_name)
+                    measure_info["description"] = table_description or "No description available"
+                    return measure_info
 
         except Exception as e:
             logger.error(f"Failed to get schema for table '{table_name}': {str(e)}")
             raise Exception(f"Failed to get schema for table '{table_name}': {str(e)}")
+
+    def _get_table_description_direct(self, table_name: str) -> Optional[str]:
+        """Get table description using direct Pyadomd connection"""
+        try:
+            with Pyadomd(self.connection_string) as conn:
+                cursor = conn.cursor()
+                # Try different approaches to get table description
+
+                # First try: Direct query
+                desc_query = f"SELECT [Description] FROM $SYSTEM.TMSCHEMA_TABLES WHERE [Name] = '{table_name}'"
+                logger.debug(f"Trying query: {desc_query}")
+                cursor.execute(desc_query)
+                results = cursor.fetchall()  # Use fetchall instead of fetchone
+                cursor.close()
+
+                if results and len(results) > 0:
+                    result = results[0]
+                    if result and len(result) > 0 and result[0]:
+                        logger.debug(f"Found description for {table_name}: {result[0]}")
+                        return str(result[0])
+                    else:
+                        logger.debug(f"Description is empty for table {table_name}")
+                else:
+                    logger.debug(f"No results found for table {table_name}")
+
+                # Second try: Show all columns to understand the schema
+                cursor = conn.cursor()
+                debug_query = "SELECT TOP 5 [Name], [Description] FROM $SYSTEM.TMSCHEMA_TABLES"
+                logger.debug(f"Debug query: {debug_query}")
+                cursor.execute(debug_query)
+                debug_results = cursor.fetchall()
+                cursor.close()
+
+                logger.debug(f"Debug results from TMSCHEMA_TABLES: {debug_results}")
+
+                return None
+        except Exception as e:
+            logger.debug(f"Failed to get description for table '{table_name}': {str(e)}")
+            return None
+
+    def _get_table_relationships(self, table_name: str) -> List[Dict[str, Any]]:
+        """Get relationships for a specific table"""
+        try:
+            with Pyadomd(self.connection_string) as conn:
+                # First get the table ID
+                cursor = conn.cursor()
+                table_id_query = f"SELECT [ID] FROM $SYSTEM.TMSCHEMA_TABLES WHERE [Name] = '{table_name}'"
+                logger.debug(f"Table ID query: {table_id_query}")
+                cursor.execute(table_id_query)
+                table_id_result = cursor.fetchone()
+                logger.debug(f"fetchone() returned: {table_id_result} (type: {type(table_id_result)})")
+
+                if not table_id_result:
+                    cursor.close()
+                    logger.debug(f"Table ID not found for {table_name}")
+                    return []
+
+                # fetchone() returns a generator that yields tuples, we need the first value from the first tuple
+                table_id_tuple = list(table_id_result)[0]  # Get first tuple from generator: (13,)
+                table_id = table_id_tuple[0]  # Get the integer from the tuple: 13
+                cursor.close()
+                logger.debug(f"Found table ID {table_id} (type: {type(table_id)}) for table '{table_name}'")
+                relationships = []
+
+                # First, let's see what relationships exist in the model at all
+                cursor = conn.cursor()
+                all_rels_query = "SELECT [FromTableID], [ToTableID], [IsActive] FROM $SYSTEM.TMSCHEMA_RELATIONSHIPS"
+                logger.debug(f"All relationships query: {all_rels_query}")
+                cursor.execute(all_rels_query)
+                all_rels = cursor.fetchall()
+                cursor.close()
+                logger.debug(f"Found {len(all_rels)} total relationships in model: {all_rels}")
+
+                # Get relationships where this table is the "From" table (Many side)
+                cursor = conn.cursor()
+                from_rel_query = f"""
+                SELECT
+                    [ToTableID], [ToColumnID], [FromColumnID],
+                    [IsActive], [Type], [CrossFilteringBehavior],
+                    [FromCardinality], [ToCardinality]
+                FROM $SYSTEM.TMSCHEMA_RELATIONSHIPS
+                WHERE [FromTableID] = {table_id}
+                """
+                logger.debug(f"From relationships query: {from_rel_query}")
+                cursor.execute(from_rel_query)
+                from_relationships = cursor.fetchall()
+                cursor.close()
+                logger.debug(
+                    f"Found {len(from_relationships)} 'from' relationships for table {table_name}: {from_relationships}"
+                )
+
+                # Process "From" relationships (where current table is Many side)
+                for rel in from_relationships:
+                    to_table_id, to_column_id, from_column_id = rel[0], rel[1], rel[2]
+                    is_active, _, cross_filter = rel[3], rel[4], rel[5]
+                    from_cardinality, to_cardinality = rel[6], rel[7]
+
+                    # Get related table name
+                    cursor = conn.cursor()
+                    to_table_query = f"SELECT [Name] FROM $SYSTEM.TMSCHEMA_TABLES WHERE [ID] = {to_table_id}"
+                    cursor.execute(to_table_query)
+                    to_table_result = cursor.fetchone()
+
+                    if to_table_result:
+                        to_table_name = list(to_table_result)[0][0]  # Extract string from tuple
+                        cursor.close()
+
+                        # Get column names
+                        cursor = conn.cursor()
+                        from_col_query = (
+                            f"SELECT [ExplicitName] FROM $SYSTEM.TMSCHEMA_COLUMNS WHERE [ID] = {from_column_id}"
+                        )
+                        cursor.execute(from_col_query)
+                        from_col_result = cursor.fetchone()
+                        from_col_name = (
+                            list(from_col_result)[0][0] if from_col_result else None
+                        )  # Extract string from tuple
+                        cursor.close()
+
+                        cursor = conn.cursor()
+                        to_col_query = (
+                            f"SELECT [ExplicitName] FROM $SYSTEM.TMSCHEMA_COLUMNS WHERE [ID] = {to_column_id}"
+                        )
+                        cursor.execute(to_col_query)
+                        to_col_result = cursor.fetchone()
+                        to_col_name = list(to_col_result)[0][0] if to_col_result else None  # Extract string from tuple
+                        cursor.close()
+
+                        if from_col_name and to_col_name:
+                            relationships.append(
+                                {
+                                    "relatedTable": to_table_name,
+                                    "fromColumn": from_col_name,
+                                    "toColumn": to_col_name,
+                                    "cardinality": self._format_cardinality(from_cardinality, to_cardinality),
+                                    "isActive": bool(is_active),
+                                    "crossFilterDirection": self._format_cross_filter(cross_filter),
+                                    "relationshipType": "Many-to-One",
+                                }
+                            )
+                    else:
+                        cursor.close()
+
+                # Get relationships where this table is the "To" table (One side)
+                cursor = conn.cursor()
+                to_rel_query = f"""
+                SELECT
+                    [FromTableID], [FromColumnID], [ToColumnID],
+                    [IsActive], [Type], [CrossFilteringBehavior],
+                    [FromCardinality], [ToCardinality]
+                FROM $SYSTEM.TMSCHEMA_RELATIONSHIPS
+                WHERE [ToTableID] = {table_id}
+                """
+                logger.debug(f"To relationships query: {to_rel_query}")
+                cursor.execute(to_rel_query)
+                to_relationships = cursor.fetchall()
+                cursor.close()
+                logger.debug(
+                    f"Found {len(to_relationships)} 'to' relationships for table {table_name}: {to_relationships}"
+                )
+
+                # Process "To" relationships (where current table is One side)
+                for rel in to_relationships:
+                    from_table_id, from_column_id, to_column_id = rel[0], rel[1], rel[2]
+                    is_active, _, cross_filter = rel[3], rel[4], rel[5]
+                    from_cardinality, to_cardinality = rel[6], rel[7]
+
+                    # Get related table name
+                    cursor = conn.cursor()
+                    from_table_query = f"SELECT [Name] FROM $SYSTEM.TMSCHEMA_TABLES WHERE [ID] = {from_table_id}"
+                    cursor.execute(from_table_query)
+                    from_table_result = cursor.fetchone()
+
+                    if from_table_result:
+                        from_table_name = list(from_table_result)[0][0]  # Extract string from tuple
+                        cursor.close()
+
+                        # Get column names
+                        cursor = conn.cursor()
+                        from_col_query = (
+                            f"SELECT [ExplicitName] FROM $SYSTEM.TMSCHEMA_COLUMNS WHERE [ID] = {from_column_id}"
+                        )
+                        cursor.execute(from_col_query)
+                        from_col_result = cursor.fetchone()
+                        from_col_name = (
+                            list(from_col_result)[0][0] if from_col_result else None
+                        )  # Extract string from tuple
+                        cursor.close()
+
+                        cursor = conn.cursor()
+                        to_col_query = (
+                            f"SELECT [ExplicitName] FROM $SYSTEM.TMSCHEMA_COLUMNS WHERE [ID] = {to_column_id}"
+                        )
+                        cursor.execute(to_col_query)
+                        to_col_result = cursor.fetchone()
+                        to_col_name = list(to_col_result)[0][0] if to_col_result else None  # Extract string from tuple
+                        cursor.close()
+
+                        if from_col_name and to_col_name:
+                            relationships.append(
+                                {
+                                    "relatedTable": from_table_name,
+                                    "fromColumn": to_col_name,  # Current table column
+                                    "toColumn": from_col_name,  # Related table column
+                                    "cardinality": self._format_cardinality(to_cardinality, from_cardinality),
+                                    "isActive": bool(is_active),
+                                    "crossFilterDirection": self._format_cross_filter(cross_filter),
+                                    "relationshipType": "One-to-Many",
+                                }
+                            )
+                    else:
+                        cursor.close()
+
+                logger.debug(f"Found {len(relationships)} relationships for table {table_name}")
+                return relationships
+
+        except Exception as e:
+            logger.warning(f"Failed to get relationships for table '{table_name}': {str(e)}")
+            import traceback
+
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            return []
+
+    def _get_column_descriptions(self, table_name: str) -> List[Dict[str, Any]]:
+        """Get column descriptions for a specific table"""
+        try:
+            with Pyadomd(self.connection_string) as conn:
+                # First get the table ID
+                cursor = conn.cursor()
+                table_id_query = f"SELECT [ID] FROM $SYSTEM.TMSCHEMA_TABLES WHERE [Name] = '{table_name}'"
+                logger.debug(f"Table ID query for column descriptions: {table_id_query}")
+                cursor.execute(table_id_query)
+                table_id_result = cursor.fetchone()
+
+                if not table_id_result:
+                    cursor.close()
+                    logger.debug(f"Table ID not found for {table_name}")
+                    return []
+
+                # Extract table ID from generator and tuple
+                table_id_tuple = list(table_id_result)[0]  # Get first tuple from generator
+                table_id = table_id_tuple[0]  # Get the integer from the tuple
+                cursor.close()
+                logger.debug(f"Found table ID: {table_id} for column descriptions")
+
+                # Get column descriptions from TMSCHEMA_COLUMNS
+                cursor = conn.cursor()
+                columns_query = f"""
+                SELECT
+                    [ExplicitName] as ColumnName,
+                    [Description] as ColumnDescription,
+                    [ExplicitDataType] as DataType
+                FROM $SYSTEM.TMSCHEMA_COLUMNS
+                WHERE [TableID] = {table_id}
+                ORDER BY [ExplicitName]
+                """
+                logger.debug(f"Columns query: {columns_query}")
+                cursor.execute(columns_query)
+                columns_results = cursor.fetchall()
+                cursor.close()
+
+                logger.debug(f"Found {len(columns_results)} columns with metadata")
+
+                # Process results
+                column_descriptions = []
+                for col_result in columns_results:
+                    col_name = col_result[0] if col_result[0] else "Unknown"
+                    col_description = col_result[1] if len(col_result) > 1 and col_result[1] else None
+                    col_data_type = col_result[2] if len(col_result) > 2 else None
+
+                    column_descriptions.append(
+                        {"name": col_name, "description": col_description, "data_type": col_data_type}
+                    )
+
+                    # Debug output
+                    desc_text = col_description if col_description else "No description"
+                    logger.debug(f"Column {col_name} ({col_data_type}): {desc_text}")
+
+                return column_descriptions
+
+        except Exception as e:
+            logger.warning(f"Failed to get column descriptions for table '{table_name}': {str(e)}")
+            import traceback
+
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            return []
+
+    def _format_cardinality(self, from_cardinality: int, to_cardinality: int) -> str:
+        """Format cardinality based on numeric codes"""
+        cardinality_map = {1: "One", 2: "Many"}
+        from_card = cardinality_map.get(from_cardinality, "Unknown")
+        to_card = cardinality_map.get(to_cardinality, "Unknown")
+        return f"{from_card}-to-{to_card}"
+
+    def _format_cross_filter(self, cross_filter_behavior: int) -> str:
+        """Format cross filter direction based on numeric codes"""
+        cross_filter_map = {1: "Single", 2: "Both", 3: "Automatic", 4: "None"}
+        return cross_filter_map.get(cross_filter_behavior, "Unknown")
 
     def get_measures_for_table(self, table_name: str) -> Dict[str, Any]:
         """Get measures for a measure table"""
@@ -308,7 +669,7 @@ class PowerBIConnector:
                 if not table_id_result:
                     return {"table_name": table_name, "type": "unknown", "measures": []}
 
-                table_id = table_id_result[0]
+                table_id = list(table_id_result)[0]
 
                 # Get measures
                 measure_cursor = conn.cursor()
@@ -380,15 +741,15 @@ class DataAnalyzer:
         """Generate a DAX query based on user question"""
         prompt = f"""
         You are a Power BI DAX expert. Generate a DAX query to answer the following question.
-        
+
         Available tables and their schemas:
         {safe_json_dumps(self.context['schemas'], indent=2)}
-        
+
         Sample data for reference:
         {safe_json_dumps(self.context['sample_data'], indent=2)}
-        
+
         User question: {user_question}
-        
+
         IMPORTANT RULES:
         1. Generate only the DAX query without any explanation
         2. Do NOT use any HTML or XML tags in the query
@@ -396,7 +757,7 @@ class DataAnalyzer:
         4. Use only valid DAX syntax
         5. Reference only columns that exist in the schema
         6. The query should be executable as-is
-        
+
         Example format:
         EVALUATE SUMMARIZE(Sales, Product[Category], "Total", SUM(Sales[Amount]))
         """
@@ -421,14 +782,14 @@ class DataAnalyzer:
         """Interpret query results and provide a natural language answer"""
         prompt = f"""
         You are a data analyst helping users understand their Power BI data.
-        
+
         User question: {user_question}
-        
+
         DAX query executed: {dax_query}
-        
+
         Query results:
         {safe_json_dumps(query_results, indent=2)}
-        
+
         Provide a clear, concise answer to the user's question based on the results.
         Include relevant numbers and insights. Format the response in a user-friendly way.
         Do not use any HTML or XML markup in your response.
@@ -449,10 +810,10 @@ class DataAnalyzer:
         """Suggest relevant questions based on available data"""
         prompt = f"""
         Based on the following Power BI dataset structure, suggest 5 interesting questions a user might ask:
-        
+
         Tables and schemas:
         {safe_json_dumps(self.context['schemas'], indent=2)}
-        
+
         Generate 5 diverse questions that would showcase different aspects of the data.
         Return only the questions as a JSON array.
         """
@@ -668,30 +1029,33 @@ class PowerBIMCPServer:
             sample_data = {}
 
             # Get schemas for first 5 tables only to speed up
-            for table in tables[:5]:
+            for table_info in tables[:5]:
+                table_name = table_info["name"]
                 try:
                     schema = await asyncio.get_event_loop().run_in_executor(
-                        None, self.connector.get_table_schema, table
+                        None, self.connector.get_table_schema, table_name
                     )
-                    schemas[table] = schema
+                    schemas[table_name] = schema
 
                     if schema["type"] == "data_table":
                         samples = await asyncio.get_event_loop().run_in_executor(
-                            None, self.connector.get_sample_data, table, 3
+                            None, self.connector.get_sample_data, table_name, 3
                         )
-                        sample_data[table] = samples
+                        sample_data[table_name] = samples
                 except Exception as e:
-                    logger.warning(f"Failed to get schema for table {table}: {e}")
+                    logger.warning(f"Failed to get schema for table {table_name}: {e}")
 
             if self.analyzer:
-                self.analyzer.set_data_context(tables, schemas, sample_data)
+                # Extract table names for the analyzer
+                table_names = [table_info["name"] for table_info in tables]
+                self.analyzer.set_data_context(table_names, schemas, sample_data)
                 logger.info(f"Context prepared with {len(tables)} tables")
 
         except Exception as e:
             logger.error(f"Failed to prepare context: {e}")
 
     async def _handle_list_tables(self) -> str:
-        """List all available tables"""
+        """List all available tables with descriptions and relationships"""
         if not self.is_connected:
             return "Not connected to Power BI. Please connect first using 'connect_powerbi'."
 
@@ -701,8 +1065,25 @@ class PowerBIMCPServer:
             if not tables:
                 return "No tables found in the dataset."
 
-            table_list = "\n".join([f"- {table}" for table in tables])
-            return f"Available tables:\n{table_list}"
+            result = "Available tables with relationships:\n\n"
+            for table in tables:
+                result += f"📊 **{table['name']}**\n"
+                result += f"   Description: {table['description']}\n"
+
+                if table.get("relationships"):
+                    result += f"   Relationships ({len(table['relationships'])}):\n"
+                    for rel in table["relationships"]:
+                        result += f"     • {rel['relationshipType']} with {rel['relatedTable']}\n"
+                        result += (
+                            f"       {table['name']}.{rel['fromColumn']} → {rel['relatedTable']}.{rel['toColumn']}\n"
+                        )
+                        result += f"       Cardinality: {rel['cardinality']}, Active: {rel['isActive']}\n"
+                        result += f"       Cross Filter: {rel['crossFilterDirection']}\n"
+                else:
+                    result += "   Relationships: None\n"
+                result += "\n"
+
+            return result
         except Exception as e:
             logger.error(f"Failed to list tables: {e}")
             return f"Error listing tables: {str(e)}"
@@ -723,16 +1104,34 @@ class PowerBIMCPServer:
                 sample_data = await asyncio.get_event_loop().run_in_executor(
                     None, self.connector.get_sample_data, table_name, 5
                 )
+                # Extract column names from enhanced column objects
+                column_names = [col["name"] for col in schema["columns"]]
                 result = (
-                    f"Table: {table_name}\nType: Data Table\nColumns: {', '.join(schema['columns'])}\n\nSample data:\n"
+                    f"Table: {table_name}\n"
+                    f"Type: Data Table\n"
+                    f"Description: {schema.get('description', 'No description available')}\n"
+                    f"Columns: {', '.join(column_names)}\n\nColumn Details:\n"
                 )
+                # Add detailed column information
+                for col in schema["columns"]:
+                    result += f"  - {col['name']}: {col.get('description', 'No description')} ({col.get('data_type', 'Unknown type')})\n"
+                result += "\nSample data:\n"
                 result += safe_json_dumps(sample_data, indent=2)
             elif schema["type"] == "measure_table":
-                result = f"Table: {table_name}\nType: Measure Table\nMeasures:\n"
+                result = (
+                    f"Table: {table_name}\n"
+                    f"Type: Measure Table\n"
+                    f"Description: {schema.get('description', 'No description available')}\n"
+                    f"Measures:\n"
+                )
                 for measure in schema["measures"]:
                     result += f"\n- {measure['name']}:\n  DAX: {measure['dax']}\n"
             else:
-                result = f"Table: {table_name}\nType: {schema['type']}"
+                result = (
+                    f"Table: {table_name}\n"
+                    f"Type: {schema['type']}\n"
+                    f"Description: {schema.get('description', 'No description available')}"
+                )
 
             return result
 

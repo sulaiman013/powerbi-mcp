@@ -1,132 +1,46 @@
-# Agent Instructions
+# PowerBI MCP Server
 
-When modifying code in this repository:
+This project is a Model Context Protocol (MCP) server that provides AI assistants with access to Power BI datasets and metadata. It enables querying Power BI data models through ADOMD.NET and returns structured information about tables, relationships, and data.
 
-## Environment Consistency Requirements
+## Repository Structure
 
-This repository supports three distinct environments that must be kept consistent:
+- `/src`: Main server implementation (`server.py`)
+- `/tests`: Test suite organized by layers (unit, local, integration)
+- `/scripts`: Setup and utility scripts including `install_dotnet_adomd.sh`
+- `/docs`: Documentation for setup, troubleshooting, and integration testing
 
-### 1. **Local Development Environment (Windows)**
-- Windows with Visual Studio Code
-- SSMS/ADOMD.NET libraries
-- `.env` file for configuration
-- Manual package installation
+## Technology Stack
 
-### 2. **Docker Environment (Linux)**
-- Linux container with Python 3.11-slim
-- Uses `install_dotnet_adomd.sh --system`
-- Environment variables via `docker-entrypoint.sh`
-- Systemwide .NET installation (`/usr/share/dotnet`)
+- **Python 3.11+** for the MCP server implementation
+- **ADOMD.NET** for Power BI connectivity and data model querying
+- **pytest** for testing with layered test structure
+- **Model Context Protocol (MCP)** for AI assistant integration
 
-### 3. **Copilot Agent Environment (Linux)**
-- Linux container/codespace
-- Uses `install_dotnet_adomd.sh --user`
-- Environment variables via secrets (no .env file)
-- User-local .NET installation (`$HOME/.local/dotnet`)
+## Development Workflow
 
-### **Consistency Rules:**
-- **All environments must use the same `install_dotnet_adomd.sh` script** (with appropriate `--system` or `--user` flag)
-- **All environments must use `pip install -r requirements.txt`** for Python dependencies
-- **All environments must support the same core functionality** (MCP server, Power BI connectivity, testing)
-- **When adding new dependencies:** Update `requirements.txt` and verify compatibility across all environments
-- **When modifying installation scripts:** Test in Docker environment first, then update copilot-setup-steps.yml
-- **Environment-specific differences are acceptable only for:**
-  - Installation paths (system vs user)
-  - Configuration delivery method (.env vs secrets)
-  - Platform-specific workarounds
+1. **Development-First Approach**: Always create separate `dev_*.py` files to test new functionality with live Power BI data before modifying main server code
+2. **Test Integration**: Verify functionality works with real datasets before integrating into `server.py`
+3. **Full Test Validation**: Run complete test suite after any changes
 
-## Environment Setup
-- Recreate the environment described in the `Dockerfile` (install the .NET runtime and ADOMD.NET library) so tests mimic the container as closely as possible.
+## Code Quality Standards
 
-## Code Quality Requirements
-- **ALWAYS run code formatting checks before committing changes (GitHub Actions will fail otherwise):**
-  ```bash
-  # Check code formatting (GitHub Actions equivalent)
-  black --check --diff src/ tests/ --line-length=120
-  isort --check-only --diff src/ tests/ --profile=black
-  flake8 src/ tests/ --config=.flake8
-  
-  # Auto-format code if checks fail
-  black src/ tests/ --line-length=120
-  isort src/ tests/ --profile=black
-  ```
-
-### **⚠️ CRITICAL: Code Formatting is MANDATORY**
-- **GitHub Actions will FAIL if code is not properly formatted with black**
-- **Always run `black --check` before committing**
-- **All formatting issues must be fixed before push**
+- **Mandatory code formatting before commits**: Run `black --check --diff src/ tests/ --line-length=120`
+- **Import sorting**: Use `isort --check-only src/ tests/ --profile=black`
+- **Linting**: Pass `flake8 src/ tests/ --config=.flake8`
+- **GitHub Actions will fail if formatting checks don't pass**
 
 ## Testing Requirements
 
-### **CRITICAL: Full Test Suite Validation**
-**🚨 MANDATORY: Before completing any task, ALL tests must pass. No exceptions.**
+- **All tests must pass before commits**: `pytest -v`
+- **Layered test structure**: unit tests (mocked), local tests (server startup), integration tests (external services)
+- **Never skip tests due to implementation problems** - tests should pass or fail, not skip
+- **Add regression tests when changing data structures or formats**
 
-1. **Final Validation is REQUIRED:**
-   ```bash
-   # Complete test suite - ALL must pass
-   pytest -v
-   ```
+## Environment Setup
 
-2. **Never skip failing tests** - If tests fail, they must be fixed, not removed
-   - Failing tests indicate broken functionality
-   - Only remove tests with explicit approval from user/operator
-   - Document reason for any test removal in commit message
+Supports three environments with consistent functionality:
+- **Local Development** (Windows): Uses `.env` configuration and manual setup
+- **Docker** (Linux): Uses `install_dotnet_adomd.sh --system` for systemwide .NET
+- **Codespaces** (Linux): Uses `install_dotnet_adomd.sh --user` for user-local .NET
 
-3. **Test Execution Order** (layered approach):
-   ```bash
-   # 1. Unit tests (fast, isolated, mocked)
-   pytest tests/unit/ -v
-   
-   # 2. Local tests (require server startup)
-   pytest tests/local/ -v
-   
-   # 3. Integration tests (require external services)
-   pytest tests/integration/ -v
-   ```
-
-### **Test Development Guidelines**
-- Always run `pytest -q` after changes
-- For every new or modified feature, add or update tests to cover the change
-- **Maintain test isolation** - tests must not depend on each other
-- **Use appropriate test markers:**
-  - `@pytest.mark.unit` for unit tests
-  - `@pytest.mark.local` for local server tests  
-  - `@pytest.mark.integration` for integration tests
-
-### **When Tests Fail**
-1. **DO NOT COMMIT** until all tests pass
-2. **DO NOT DELETE** failing tests without approval
-3. **Investigate and fix** the root cause
-4. If unsure about test removal, ask: "Should I remove test X because of reason Y?"
-
-### **Code Quality Integration**
-- **Run formatting checks as part of testing workflow (MANDATORY before commit):**
-  ```bash
-  # Full local validation (same as CI/CD pipeline)
-  black --check --diff src/ tests/ --line-length=120  # ⚠️ MUST PASS - GitHub Actions requirement
-  isort --check-only --diff src/ tests/ --profile=black
-  flake8 src/ tests/ --config=.flake8
-  
-  # Run all test layers
-  pytest tests/unit/ -v --tb=short
-  pytest tests/local/ -v --tb=short  
-  pytest tests/integration/ -v --tb=short
-  ```
-
-## Why This Matters
-- **🚨 CRITICAL: GitHub Actions will fail if code is not properly formatted with black**
-- **Formatting checks are part of CI/CD pipeline and will block merges**
-- Consistent formatting improves code readability and maintainability
-- Following these steps ensures CI/CD pipeline success
-
-## Quick Validation Commands
-```bash
-# Code quality and unit tests (fast) - includes mandatory formatting checks
-black --check --diff src/ tests/ --line-length=120 && isort --check-only src/ tests/ --profile=black && flake8 src/ tests/ --config=.flake8 && pytest tests/unit/ -v && echo "✅ Code quality and unit tests passed!"
-
-# Full validation including all test layers (comprehensive)
-black --check --diff src/ tests/ --line-length=120 && isort --check-only src/ tests/ --profile=black && flake8 src/ tests/ --config=.flake8 && pytest -v && echo "🎉 ALL TESTS PASSED - Ready to commit!"
-
-# Auto-fix formatting if checks fail, then validate again
-black src/ tests/ --line-length=120 && isort src/ tests/ --profile=black && echo "🔧 Formatting fixed - now run validation again"
-```
+All environments use the same installation scripts and `requirements.txt` for consistency.

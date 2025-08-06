@@ -138,11 +138,14 @@ class TestPowerBIIntegration:
             len(tables) >= test_config["TEST_MIN_TABLES_COUNT"]
         ), f"Expected at least {test_config['TEST_MIN_TABLES_COUNT']} tables"
 
-        # Check that table names are strings and not empty
+        # Check that tables are dictionaries with name and description
         for table in tables:
-            assert isinstance(table, str), f"Table name should be string, got {type(table)}"
-            assert len(table) > 0, "Table name should not be empty"
-            assert not table.startswith("$"), "System tables should be filtered out"
+            assert isinstance(table, dict), f"Table should be dict, got {type(table)}"
+            assert "name" in table, "Table should have 'name' field"
+            assert "description" in table, "Table should have 'description' field"
+            assert isinstance(table["name"], str), f"Table name should be string, got {type(table['name'])}"
+            assert len(table["name"]) > 0, "Table name should not be empty"
+            assert not table["name"].startswith("$"), "System tables should be filtered out"
 
     def test_expected_table_exists(self, connector, test_config):
         """Test that expected test table exists in the dataset."""
@@ -151,8 +154,32 @@ class TestPowerBIIntegration:
 
         tables = connector.discover_tables()
         expected_table = test_config["TEST_EXPECTED_TABLE"]
+        table_names = [table["name"] for table in tables]
 
-        assert expected_table in tables, f"Expected table '{expected_table}' not found in tables: {tables}"
+        assert expected_table in table_names, f"Expected table '{expected_table}' not found in tables: {table_names}"
+
+    def test_expected_table_has_description(self, connector, test_config):
+        """Test that expected test table has a real description (not fallback)."""
+        if not test_config["TEST_EXPECTED_TABLE"]:
+            pytest.skip("TEST_EXPECTED_TABLE not configured")
+
+        tables = connector.discover_tables()
+        expected_table = test_config["TEST_EXPECTED_TABLE"]
+
+        # Find the expected table
+        table_found = None
+        for table in tables:
+            if table["name"] == expected_table:
+                table_found = table
+                break
+
+        assert table_found is not None, f"Expected table '{expected_table}' not found"
+
+        # Check that it has a real description, not the fallback
+        assert (
+            table_found["description"] != "No description available"
+        ), f"Table '{expected_table}' should have a real description from the model"
+        assert len(table_found["description"]) > 0, f"Table '{expected_table}' description should not be empty"
 
     def test_get_table_schema(self, connector, test_config):
         """Test retrieving schema information for a table."""
@@ -160,12 +187,13 @@ class TestPowerBIIntegration:
         assert len(tables) > 0, "No tables found to test schema retrieval"
 
         # Test schema for first table
-        table_name = tables[0]
+        table_name = tables[0]["name"]  # Extract name from dictionary
         schema = connector.get_table_schema(table_name)
 
         assert isinstance(schema, dict), "Schema should be returned as dictionary"
         assert "table_name" in schema, "Schema should contain table_name"
         assert "type" in schema, "Schema should contain type"
+        assert "description" in schema, "Schema should contain description"
         assert schema["table_name"] == table_name
 
         if schema["type"] == "data_table":
@@ -175,6 +203,69 @@ class TestPowerBIIntegration:
         elif schema["type"] == "measure_table":
             assert "measures" in schema, "Measure table schema should contain measures"
             assert isinstance(schema["measures"], list), "Measures should be a list"
+
+    def test_expected_table_schema_has_description(self, connector, test_config):
+        """Test that get_table_schema() returns description for expected table."""
+        if not test_config["TEST_EXPECTED_TABLE"]:
+            pytest.skip("TEST_EXPECTED_TABLE not configured")
+
+        table_name = test_config["TEST_EXPECTED_TABLE"]
+        schema = connector.get_table_schema(table_name)
+
+        assert "description" in schema, "Schema should contain description field"
+        assert (
+            schema["description"] != "No description available"
+        ), f"Table '{table_name}' should have a real description in schema"
+        assert len(schema["description"]) > 0, f"Table '{table_name}' schema description should not be empty"
+
+    def test_table_schema_has_column_descriptions(self, connector, test_config):
+        """Test that get_table_schema() returns enhanced columns with descriptions."""
+        if not test_config["TEST_EXPECTED_TABLE"]:
+            pytest.skip("TEST_EXPECTED_TABLE not configured")
+
+        table_name = test_config["TEST_EXPECTED_TABLE"]
+        schema = connector.get_table_schema(table_name)
+
+        assert "columns" in schema, "Schema should contain columns field"
+        assert len(schema["columns"]) > 0, "Schema should have at least one column"
+
+        # Check that columns are enhanced with descriptions
+        for column in schema["columns"]:
+            if isinstance(column, dict):
+                # Enhanced column format with description
+                assert "name" in column, "Enhanced column should have 'name' field"
+                assert "description" in column, "Enhanced column should have 'description' field"
+                assert "data_type" in column, "Enhanced column should have 'data_type' field"
+                assert isinstance(column["name"], str), "Column name should be string"
+                assert isinstance(column["description"], str), "Column description should be string"
+                # At least some columns should have real descriptions (not the fallback)
+            else:
+                # Old string format - should not happen with new implementation
+                pytest.fail(f"Column format should be enhanced dict, got string: {column}")
+
+    def test_some_columns_have_real_descriptions(self, connector, test_config):
+        """Test that at least some columns have real descriptions from the model."""
+        if not test_config["TEST_EXPECTED_TABLE"]:
+            pytest.skip("TEST_EXPECTED_TABLE not configured")
+
+        table_name = test_config["TEST_EXPECTED_TABLE"]
+        schema = connector.get_table_schema(table_name)
+
+        columns_with_descriptions = [
+            col
+            for col in schema["columns"]
+            if col.get("description") and col["description"] != "No description available"
+        ]
+
+        # At least one column should have a real description
+        assert (
+            len(columns_with_descriptions) > 0
+        ), f"Table '{table_name}' should have at least one column with a real description"
+
+        # Check that descriptions are meaningful (more than just the column name)
+        for col in columns_with_descriptions:
+            description = col["description"]
+            assert len(description) > 10, f"Column '{col['name']}' description should be meaningful: {description}"
 
     def test_expected_column_exists(self, connector, test_config):
         """Test that expected column exists in the expected table."""
@@ -188,9 +279,11 @@ class TestPowerBIIntegration:
 
         if schema["type"] == "data_table":
             columns = schema.get("columns", [])
+            # Extract column names from enhanced column dictionaries
+            column_names = [col["name"] if isinstance(col, dict) else col for col in columns]
             assert (
-                expected_column in columns
-            ), f"Expected column '{expected_column}' not found in table '{table_name}'. Available columns: {columns}"
+                expected_column in column_names
+            ), f"Expected column '{expected_column}' not found in table '{table_name}'. Available columns: {column_names}"
 
     def test_execute_simple_dax_query(self, connector):
         """Test executing a simple DAX query."""
@@ -199,14 +292,17 @@ class TestPowerBIIntegration:
 
         # Find a data table to query
         data_table = None
-        for table in tables:
-            schema = connector.get_table_schema(table)
+        for table_info in tables:
+            table_name = table_info["name"]
+            schema = connector.get_table_schema(table_name)
             if schema["type"] == "data_table":
-                data_table = table
+                data_table = table_name
                 break
 
         if not data_table:
-            pytest.skip("No data tables found for DAX query testing")
+            assert (
+                False
+            ), "Test dataset should have at least one data table for DAX query testing. Check test configuration."
 
         # Execute simple query
         dax_query = f"EVALUATE TOPN(1, '{data_table}')"
@@ -236,14 +332,17 @@ class TestPowerBIIntegration:
 
         # Find a data table
         data_table = None
-        for table in tables:
-            schema = connector.get_table_schema(table)
+        for table_info in tables:
+            table_name = table_info["name"]
+            schema = connector.get_table_schema(table_name)
             if schema["type"] == "data_table":
-                data_table = table
+                data_table = table_name
                 break
 
         if not data_table:
-            pytest.skip("No data tables found for sample data testing")
+            assert (
+                False
+            ), "Test dataset should have at least one data table for sample data testing. Check test configuration."
 
         sample_data = connector.get_sample_data(data_table, num_rows=3)
 
@@ -310,19 +409,22 @@ class TestDataAnalyzerIntegration:
         sample_data = {}
 
         # Get schemas for first few tables
-        for table in tables[:3]:
+        for table_info in tables[:3]:
+            table_name = table_info["name"]
             try:
-                schema = connector.get_table_schema(table)
-                schemas[table] = schema
+                schema = connector.get_table_schema(table_name)
+                schemas[table_name] = schema
 
                 if schema["type"] == "data_table":
-                    samples = connector.get_sample_data(table, 2)
-                    sample_data[table] = samples
+                    samples = connector.get_sample_data(table_name, 2)
+                    sample_data[table_name] = samples
             except Exception:
                 # Skip tables that can't be processed
                 continue
 
-        analyzer.set_data_context(tables, schemas, sample_data)
+        # Extract table names for the analyzer
+        table_names = [table_info["name"] for table_info in tables]
+        analyzer.set_data_context(table_names, schemas, sample_data)
 
         return analyzer
 
@@ -425,8 +527,12 @@ class TestMCPServerIntegration:
 
         assert isinstance(result, str), "Tables list result should be a string"
         assert (
-            "Available tables:" in result or "No tables found" in result
+            "Available tables with relationships:" in result or "No tables found" in result
         ), f"Result should contain tables information: {result}"
+
+        # If tables are found, check that relationships info is included
+        if "Available tables with relationships:" in result:
+            assert "Relationships (" in result, "Result should include relationships information"
 
     @pytest.mark.asyncio
     async def test_get_table_info_tool(self, mcp_server, test_config):
@@ -443,19 +549,22 @@ class TestMCPServerIntegration:
 
         # Get first available table
         tables_result = await mcp_server._handle_list_tables()
-        if "No tables found" in tables_result:
-            pytest.skip("No tables available for testing table info")
+        assert "No tables found" not in tables_result, "Test dataset should have tables available"
 
-        # Extract first table name (this is a simple extraction, could be improved)
+        # Extract first table name (parse new format: "📊 **Table Name**")
         lines = tables_result.split("\n")
         table_name = None
         for line in lines:
-            if line.strip().startswith("- "):
-                table_name = line.strip()[2:]
+            line = line.strip()
+            if line.startswith("📊 **") and line.endswith("**"):
+                # Extract table name from format: "📊 **Table Name**"
+                table_name = line[5:-2]  # Remove "📊 **" from start and "**" from end
                 break
 
-        if not table_name:
-            pytest.skip("Could not extract table name from tables list")
+        assert (
+            table_name is not None
+        ), f"Could not extract table name from tables list. Format may have changed. Raw output:\n{tables_result}"
+        assert len(table_name.strip()) > 0, f"Extracted table name is empty. Raw output:\n{tables_result}"
 
         # Test getting table info
         arguments = {"table_name": table_name}
