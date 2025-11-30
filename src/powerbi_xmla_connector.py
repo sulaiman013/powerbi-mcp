@@ -87,14 +87,17 @@ class PowerBIXmlaConnector:
         self.connection = None
         self.workspace_name = None
         self.dataset_name = None
+        self.effective_user: Optional[str] = None  # For RLS impersonation
 
-    def connect(self, workspace_name: str, dataset_name: str) -> bool:
+    def connect(self, workspace_name: str, dataset_name: str, effective_user: Optional[str] = None) -> bool:
         """
         Connect to Power BI dataset via XMLA endpoint
 
         Args:
             workspace_name: Name of the Power BI workspace
             dataset_name: Name of the dataset (semantic model)
+            effective_user: Optional user email to impersonate for RLS.
+                           When specified, queries are filtered by that user's RLS roles.
 
         Returns:
             True if connection successful
@@ -107,6 +110,7 @@ class PowerBIXmlaConnector:
         try:
             self.workspace_name = workspace_name
             self.dataset_name = dataset_name
+            self.effective_user = effective_user
 
             # Build XMLA endpoint URL
             # Format: powerbi://api.powerbi.com/v1.0/myorg/WorkspaceName
@@ -120,6 +124,11 @@ class PowerBIXmlaConnector:
                 f"User ID=app:{self.client_id}@{self.tenant_id};"
                 f"Password={self.client_secret};"
             )
+
+            # Add EffectiveUserName for RLS impersonation if specified
+            if effective_user:
+                self.connection_string += f"EffectiveUserName={effective_user};"
+                logger.info(f"RLS enabled: Impersonating user '{effective_user}'")
 
             logger.info(f"Connecting to XMLA endpoint: {xmla_endpoint}")
             logger.info(f"Dataset: {dataset_name}")
@@ -225,12 +234,6 @@ class PowerBIXmlaConnector:
                             table_type = "TABLE"
 
                     # Filter out system and hidden tables
-                    # Exclude:
-                    # - Tables starting with $ (system tables)
-                    # - DateTableTemplate_ (auto-generated date tables)
-                    # - LocalDateTable_ (auto-generated local date tables)
-                    # - Schema tables: DBSCHEMA_*, MDSCHEMA_*, TMSCHEMA_*, DMSCHEMA_*, DISCOVER_*
-                    # - Hidden tables
                     system_prefixes = ("$", "DateTableTemplate_", "LocalDateTable_",
                                       "DBSCHEMA_", "MDSCHEMA_", "TMSCHEMA_",
                                       "DMSCHEMA_", "DISCOVER_")
@@ -275,8 +278,7 @@ class PowerBIXmlaConnector:
                 adomd_connection = pyadomd_conn.conn
 
                 # Get schema dataset for columns
-                # Pass restrictions to filter by table name
-                restrictions = [None, None, table_name, None]  # [Catalog, Schema, Table, Column]
+                restrictions = [None, None, table_name, None]
 
                 columns_dataset = adomd_connection.GetSchemaDataSet(
                     AdomdSchemaGuid.Columns,
@@ -346,7 +348,7 @@ class PowerBIXmlaConnector:
             "8": "String",
             "11": "Boolean",
             "17": "Decimal",
-            "130": "String",  # WSTR
+            "130": "String",
             "131": "Decimal"
         }
         return type_mapping.get(str(adomd_type), f"Type_{adomd_type}")
@@ -418,8 +420,43 @@ class PowerBIXmlaConnector:
             logger.error(f"Failed to get sample data from '{table_name}': {str(e)}")
             return []
 
+    def set_effective_user(self, user_email: Optional[str]) -> bool:
+        """
+        Set or clear the effective user for RLS impersonation
+
+        Args:
+            user_email: User email to impersonate, or None to clear
+
+        Returns:
+            True if successful
+        """
+        if not self.workspace_name or not self.dataset_name:
+            logger.error("Not connected - cannot set effective user")
+            return False
+
+        return self.connect(
+            self.workspace_name,
+            self.dataset_name,
+            effective_user=user_email
+        )
+
+    def get_rls_status(self) -> Dict[str, Any]:
+        """
+        Get current RLS status
+
+        Returns:
+            Dictionary with RLS status information
+        """
+        return {
+            'rls_active': self.effective_user is not None,
+            'effective_user': self.effective_user,
+            'workspace': self.workspace_name,
+            'dataset': self.dataset_name
+        }
+
     def close(self):
         """Close the connection"""
         self.connection = None
         self.connection_string = None
+        self.effective_user = None
         logger.info("Connection closed")

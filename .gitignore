@@ -44,7 +44,8 @@ env/
 
 # Logs
 *.log
-logs/
+logs/*.log
+!logs/.gitkeep
 mcp-server-powerbi.log
 
 # OS

@@ -1,28 +1,19 @@
-# MCP Framework
-mcp
+# Power BI MCP Server V2 Dependencies
 
-# Power BI Connection
-pyadomd
-pythonnet
+# MCP SDK
+mcp>=1.0.0
 
-# OpenAI Integration
-openai
+# Power BI Cloud connectivity
+msal>=1.24.0
+requests>=2.31.0
+python-dotenv>=1.0.0
 
-# Environment Management
-python-dotenv
+# Power BI Desktop connectivity
+psutil>=5.9.0
 
-# Async Support
-anyio
+# XMLA connectivity (requires ADOMD.NET on Windows)
+pythonnet>=3.0.0
+pyadomd>=0.1.0
 
-# Type Hints
-typing-extensions
-
-# Testing (optional)
-pytest
-pytest-asyncio
-pytest-cov
-
-# Development (optional)
-black
-flake8
-mypy
+# Security features
+pyyaml>=6.0.0
