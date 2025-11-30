@@ -1050,9 +1050,11 @@ class PowerBIPBIPConnector:
         ))
 
         # Pattern 11: PBI_QueryOrder annotation (list of table names in JSON array format)
-        # "TableName" in annotation string -> "NewName"
+        # IMPORTANT: Must be specific to PBI_QueryOrder to avoid matching M-Code entity= references
+        # Format: annotation PBI_QueryOrder = ["Table1","Table2",...]
+        # DO NOT match: {[entity="TableName",version=""]} (M-Code/Power Query source references)
         patterns.append((
-            rf'(\[.*?")({old_name_escaped})(\".*?\])',
+            rf'(PBI_QueryOrder\s*=\s*\[.*?")({old_name_escaped})(".*?\])',
             rf'\1{new_name}\3',
             0
         ))
