@@ -1,0 +1,93 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# Environment Variables - CRITICAL FOR SECURITY
+.env
+.env.local
+.env.*.local
+*.env
+
+# Logs
+*.log
+logs/
+mcp-server-powerbi.log
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Credentials - NEVER COMMIT THESE
+credentials.json
+secrets.json
+*.pem
+*.key
+config.json
+claude_desktop_config.json
+
+# Test Coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Documentation builds
+docs/_build/
+docs/.doctrees/
+
+# Backup files
+*.backup
+*.bak
+server.py.backup
+
+# Power BI specific
+*.pbix
+*.pbit
+connection_strings.txt
+
+# Temporary files
+tmp/
+temp/
+*.tmp

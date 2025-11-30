@@ -1,0 +1,28 @@
+# MCP Framework
+mcp
+
+# Power BI Connection
+pyadomd
+pythonnet
+
+# OpenAI Integration
+openai
+
+# Environment Management
+python-dotenv
+
+# Async Support
+anyio
+
+# Type Hints
+typing-extensions
+
+# Testing (optional)
+pytest
+pytest-asyncio
+pytest-cov
+
+# Development (optional)
+black
+flake8
+mypy
