@@ -981,6 +981,82 @@ class PowerBIPBIPConnector:
             re.MULTILINE
         ))
 
+        # Pattern 8: fromColumn with table prefix (CRITICAL for relationships)
+        # Format: fromColumn: TableName.ColumnName or fromColumn: TableName.'Column Name'
+        # fromColumn: OldTable.Column -> fromColumn: 'NewTable'.Column
+        patterns.append((
+            rf'(fromColumn\s*:\s*){old_name_escaped}\.(\w+)',
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+        # fromColumn: OldTable.'Column Name' -> fromColumn: 'NewTable'.'Column Name'
+        patterns.append((
+            rf"(fromColumn\s*:\s*){old_name_escaped}\.('[^']+')",
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+        # fromColumn: 'OldTable'.Column -> fromColumn: 'NewTable'.Column
+        patterns.append((
+            rf"(fromColumn\s*:\s*)'{old_name_escaped}'\.(\w+)",
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+        # fromColumn: 'OldTable'.'Column Name' -> fromColumn: 'NewTable'.'Column Name'
+        patterns.append((
+            rf"(fromColumn\s*:\s*)'{old_name_escaped}'\.('[^']+')",
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+
+        # Pattern 9: toColumn with table prefix (CRITICAL for relationships)
+        # Same patterns as fromColumn but for toColumn
+        # toColumn: OldTable.Column -> toColumn: 'NewTable'.Column
+        patterns.append((
+            rf'(toColumn\s*:\s*){old_name_escaped}\.(\w+)',
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+        # toColumn: OldTable.'Column Name' -> toColumn: 'NewTable'.'Column Name'
+        patterns.append((
+            rf"(toColumn\s*:\s*){old_name_escaped}\.('[^']+')",
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+        # toColumn: 'OldTable'.Column -> toColumn: 'NewTable'.Column
+        patterns.append((
+            rf"(toColumn\s*:\s*)'{old_name_escaped}'\.(\w+)",
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+        # toColumn: 'OldTable'.'Column Name' -> toColumn: 'NewTable'.'Column Name'
+        patterns.append((
+            rf"(toColumn\s*:\s*)'{old_name_escaped}'\.('[^']+')",
+            rf'\1{new_name_quoted}.\2',
+            re.MULTILINE
+        ))
+
+        # Pattern 10: ref table in model.tmdl
+        # ref table OldName -> ref table 'NewName'
+        patterns.append((
+            rf'^(\s*)ref\s+table\s+{old_name_escaped}\s*$',
+            rf'\1ref table {new_name_quoted}',
+            re.MULTILINE
+        ))
+        # ref table 'OldName' -> ref table 'NewName'
+        patterns.append((
+            rf"^(\s*)ref\s+table\s+'{old_name_escaped}'\s*$",
+            rf'\1ref table {new_name_quoted}',
+            re.MULTILINE
+        ))
+
+        # Pattern 11: PBI_QueryOrder annotation (list of table names in JSON array format)
+        # "TableName" in annotation string -> "NewName"
+        patterns.append((
+            rf'(\[.*?")({old_name_escaped})(\".*?\])',
+            rf'\1{new_name}\3',
+            0
+        ))
+
         for tmdl_file in self.current_project.tmdl_files:
             try:
                 # Cache original content for rollback
@@ -1036,11 +1112,23 @@ class PowerBIPBIPConnector:
             # TMDL column definition: column OldName -> column NewName
             (rf'^(\s*)column\s+{old_escaped}\s*$', rf'\1column {new_name_quoted}', re.MULTILINE),
             (rf"^(\s*)column\s+'{old_escaped}'\s*$", rf'\1column {new_name_quoted}', re.MULTILINE),
-            # fromColumn/toColumn in relationships
-            (rf'(fromColumn\s*:\s*){old_escaped}(?=\s|$)', rf'\1{new_name_quoted}', re.MULTILINE),
-            (rf"(fromColumn\s*:\s*)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
-            (rf'(toColumn\s*:\s*){old_escaped}(?=\s|$)', rf'\1{new_name_quoted}', re.MULTILINE),
-            (rf"(toColumn\s*:\s*)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
+            # fromColumn/toColumn with TableName.ColumnName format (CRITICAL for relationships)
+            # fromColumn: TableName.OldColumn -> fromColumn: TableName.NewColumn
+            (rf'(fromColumn\s*:\s*{table_escaped}\.)({old_escaped})(?=\s|$)', rf'\1{new_name_quoted}', re.MULTILINE),
+            # fromColumn: TableName.'OldColumn' -> fromColumn: TableName.'NewColumn'
+            (rf"(fromColumn\s*:\s*{table_escaped}\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
+            # fromColumn: 'TableName'.OldColumn -> fromColumn: 'TableName'.NewColumn
+            (rf"(fromColumn\s*:\s*'{table_escaped}'\.)({old_escaped})(?=\s|$)", rf'\1{new_name_quoted}', re.MULTILINE),
+            # fromColumn: 'TableName'.'OldColumn' -> fromColumn: 'TableName'.'NewColumn'
+            (rf"(fromColumn\s*:\s*'{table_escaped}'\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
+            # toColumn: TableName.OldColumn -> toColumn: TableName.NewColumn
+            (rf'(toColumn\s*:\s*{table_escaped}\.)({old_escaped})(?=\s|$)', rf'\1{new_name_quoted}', re.MULTILINE),
+            # toColumn: TableName.'OldColumn' -> toColumn: TableName.'NewColumn'
+            (rf"(toColumn\s*:\s*{table_escaped}\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
+            # toColumn: 'TableName'.OldColumn -> toColumn: 'TableName'.NewColumn
+            (rf"(toColumn\s*:\s*'{table_escaped}'\.)({old_escaped})(?=\s|$)", rf'\1{new_name_quoted}', re.MULTILINE),
+            # toColumn: 'TableName'.'OldColumn' -> toColumn: 'TableName'.'NewColumn'
+            (rf"(toColumn\s*:\s*'{table_escaped}'\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
         ]
 
         for tmdl_file in self.current_project.tmdl_files:
