@@ -326,10 +326,10 @@ class PowerBIMCPServer:
                         "required": []
                     }
                 ),
-                # === BATCH/WRITE OPERATIONS (TOM) ===
+                # === BATCH/WRITE OPERATIONS (TOM) - DEPRECATED FOR RENAMING ===
                 Tool(
                     name="batch_rename_tables",
-                    description="Bulk rename multiple tables in the Power BI Desktop model. Requires confirmation before saving.",
+                    description="⚠️ DEPRECATED: Use 'pbip_rename_tables' instead. This TOM-based tool only updates in-memory model and DOES NOT update report visuals. Use PBIP tools for safe renaming.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -356,7 +356,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="batch_rename_columns",
-                    description="Bulk rename multiple columns in the Power BI Desktop model. Requires confirmation before saving.",
+                    description="⚠️ DEPRECATED: Use 'pbip_rename_columns' instead. This TOM-based tool only updates in-memory model and DOES NOT update report visuals. Use PBIP tools for safe renaming.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -384,7 +384,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="batch_rename_measures",
-                    description="Bulk rename multiple measures in the Power BI Desktop model. Requires confirmation before saving.",
+                    description="⚠️ DEPRECATED: Use 'pbip_rename_measures' instead. This TOM-based tool only updates in-memory model and DOES NOT update report visuals. Use PBIP tools for safe renaming.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -526,7 +526,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="pbip_rename_tables",
-                    description="Bulk rename tables in a PBIP project. Updates ALL references including TMDL model files AND report.json visuals. IMPORTANT: This ensures report visuals don't break!",
+                    description="✅ RECOMMENDED: Safely rename tables in a PBIP project. Updates EVERYTHING: TMDL files, DAX references (with proper quoting), report visuals, and Q&A schema. Close Power BI Desktop first, then reopen after.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -548,7 +548,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="pbip_rename_columns",
-                    description="Bulk rename columns in a PBIP project. Updates ALL references including TMDL model files AND report.json visuals.",
+                    description="✅ RECOMMENDED: Safely rename columns in a PBIP project. Updates TMDL files, DAX references, and report visuals. Close Power BI Desktop first, then reopen after.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -571,7 +571,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="pbip_rename_measures",
-                    description="Bulk rename measures in a PBIP project. Updates ALL references including TMDL model files AND report.json visuals.",
+                    description="✅ RECOMMENDED: Safely rename measures in a PBIP project. Updates TMDL files, DAX references, and report visuals. Close Power BI Desktop first, then reopen after.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -1508,8 +1508,11 @@ class PowerBIMCPServer:
             batch_fn = lambda: tom.batch_rename_tables(renames, auto_save=auto_save)
             result = await asyncio.get_event_loop().run_in_executor(None, batch_fn)
 
-            # Build response
-            response = f"=== Batch Rename Tables ===\n\n{result.message}\n\n"
+            # Build response with deprecation warning
+            response = "⚠️ DEPRECATED TOOL - Use 'pbip_rename_tables' instead!\n"
+            response += "This TOM-based rename does NOT update report visuals.\n"
+            response += "=" * 50 + "\n\n"
+            response += f"{result.message}\n\n"
 
             if result.details:
                 response += "--- Rename Results ---\n"
@@ -1636,8 +1639,11 @@ class PowerBIMCPServer:
             batch_fn = lambda: tom.batch_rename_columns(renames, auto_save=auto_save)
             result = await asyncio.get_event_loop().run_in_executor(None, batch_fn)
 
-            # Build response
-            response = f"=== Batch Rename Columns ===\n\n{result.message}\n\n"
+            # Build response with deprecation warning
+            response = "⚠️ DEPRECATED TOOL - Use 'pbip_rename_columns' instead!\n"
+            response += "This TOM-based rename does NOT update report visuals.\n"
+            response += "=" * 50 + "\n\n"
+            response += f"{result.message}\n\n"
 
             if result.details:
                 response += "--- Rename Results ---\n"
@@ -1685,8 +1691,11 @@ class PowerBIMCPServer:
             batch_fn = lambda: tom.batch_rename_measures(renames, auto_save=auto_save)
             result = await asyncio.get_event_loop().run_in_executor(None, batch_fn)
 
-            # Build response
-            response = f"=== Batch Rename Measures ===\n\n{result.message}\n\n"
+            # Build response with deprecation warning
+            response = "⚠️ DEPRECATED TOOL - Use 'pbip_rename_measures' instead!\n"
+            response += "This TOM-based rename does NOT update report visuals.\n"
+            response += "=" * 50 + "\n\n"
+            response += f"{result.message}\n\n"
 
             if result.details:
                 response += "--- Rename Results ---\n"

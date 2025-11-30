@@ -217,24 +217,34 @@ We built a dedicated **PBIP Connector** that:
 | `desktop_rls_status` | Get current RLS status |
 
 ### Model Modification via TOM (7 tools)
+
+> ⚠️ **WARNING: TOM-based rename tools are DEPRECATED for renaming operations!**
+>
+> The `batch_rename_*` TOM tools only update the in-memory model and **DO NOT update report visuals**. This causes broken visuals after rename. **Use PBIP tools instead for all rename operations.**
+
 | Tool | Description |
 |------|-------------|
 | `scan_table_dependencies` | Analyze impact before renaming |
-| `batch_rename_tables` | Bulk rename tables (updates DAX) |
-| `batch_rename_columns` | Bulk rename columns (updates DAX) |
-| `batch_rename_measures` | Bulk rename measures (updates references) |
+| `batch_rename_tables` | ⚠️ DEPRECATED - Use `pbip_rename_tables` instead |
+| `batch_rename_columns` | ⚠️ DEPRECATED - Use `pbip_rename_columns` instead |
+| `batch_rename_measures` | ⚠️ DEPRECATED - Use `pbip_rename_measures` instead |
 | `batch_update_measures` | Bulk update measure expressions |
 | `create_measure` | Create a new DAX measure |
 | `delete_measure` | Delete an existing measure |
 
-### PBIP Safe Editing (5 tools)
+### PBIP Safe Editing (5 tools) ✅ RECOMMENDED
+
+> **This is the correct way to rename tables, columns, and measures!**
+>
+> PBIP tools update everything: TMDL files, DAX expressions (with proper quoting), report visuals, and Q&A schema. **Close Power BI Desktop before using, then reopen after.**
+
 | Tool | Description |
 |------|-------------|
 | `pbip_load_project` | Load a PBIP project for editing |
 | `pbip_get_project_info` | Get project structure information (detects PBIR format) |
-| `pbip_rename_tables` | **Comprehensive rename**: updates TMDL + DAX quoting + visual.json + cultures (all automatic) |
-| `pbip_rename_columns` | Rename columns (model + report layer, both PBIR formats) |
-| `pbip_rename_measures` | Rename measures (model + report layer, both PBIR formats) |
+| `pbip_rename_tables` | ✅ **Comprehensive rename**: updates TMDL + DAX quoting + visual.json + cultures (all automatic) |
+| `pbip_rename_columns` | ✅ Rename columns (model + report layer, both PBIR formats) |
+| `pbip_rename_measures` | ✅ Rename measures (model + report layer, both PBIR formats) |
 
 ### PBIP Diagnostics (4 tools)
 | Tool | Description |
@@ -343,6 +353,16 @@ Restart Claude Desktop to activate.
 
 ## Usage Examples
 
+### ⚠️ IMPORTANT: How to Rename Tables/Columns/Measures
+
+**DO NOT** use TOM-based tools (`batch_rename_tables`, `batch_rename_columns`, `batch_rename_measures`) for renaming. They break report visuals!
+
+**ALWAYS** use PBIP tools:
+1. Close Power BI Desktop (if open)
+2. `pbip_load_project` - Load the .pbip file
+3. `pbip_rename_tables` / `pbip_rename_columns` / `pbip_rename_measures` - Do the rename
+4. Reopen Power BI Desktop to see changes
+
 ### Basic Desktop Workflow
 
 ```
@@ -352,7 +372,7 @@ User: "What tables are in my model?"
 User: "Run DAX: EVALUATE TOPN(10, Sales)"
 ```
 
-### Safe Bulk Rename with PBIP
+### Safe Bulk Rename with PBIP (✅ Correct Way)
 
 ```
 User: "Load PBIP project from C:/Projects/SalesReport"

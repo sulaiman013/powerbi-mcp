@@ -161,6 +161,8 @@ class PBIPProject:
     pbir_definition_folder: Optional[Path] = None  # Report/definition/ folder
     visual_json_files: List[Path] = field(default_factory=list)  # All visual.json files
     cultures_files: List[Path] = field(default_factory=list)  # Linguistic schema files
+    # Additional semantic model files
+    diagram_layout_path: Optional[Path] = None  # diagramLayout.json for model diagram
 
 
 @dataclass
@@ -334,6 +336,7 @@ class PowerBIPBIPConnector:
 
             # Find all TMDL files
             tmdl_files = []
+            diagram_layout_path = None
             if semantic_model_folder:
                 tmdl_files = list(semantic_model_folder.glob("**/*.tmdl"))
                 tmdl_files.extend(semantic_model_folder.glob("**/*.tmd"))
@@ -342,6 +345,12 @@ class PowerBIPBIPConnector:
                 cultures_folder = semantic_model_folder / "definition" / "cultures"
                 if cultures_folder.exists():
                     cultures_files = list(cultures_folder.glob("*.tmdl"))
+
+                # Find diagramLayout.json (model diagram layout)
+                diagram_layout = semantic_model_folder / "diagramLayout.json"
+                if diagram_layout.exists():
+                    diagram_layout_path = diagram_layout
+                    logger.info("Found diagramLayout.json")
 
             return PBIPProject(
                 root_path=root,
@@ -353,7 +362,8 @@ class PowerBIPBIPConnector:
                 is_pbir_enhanced=is_pbir_enhanced,
                 pbir_definition_folder=pbir_definition_folder,
                 visual_json_files=visual_json_files,
-                cultures_files=cultures_files
+                cultures_files=cultures_files,
+                diagram_layout_path=diagram_layout_path
             )
 
         except Exception as e:
@@ -700,7 +710,13 @@ class PowerBIPBIPConnector:
             files_modified.extend(cultures_replacements["files"])
             total_replacements += cultures_replacements["count"]
 
-        # 4. Validate after changes
+        # 4. Update diagramLayout.json (model diagram)
+        if self.current_project.diagram_layout_path:
+            diagram_replacements = self._rename_table_in_diagram_layout(old_name, new_name)
+            files_modified.extend(diagram_replacements["files"])
+            total_replacements += diagram_replacements["count"]
+
+        # 5. Validate after changes
         validation_errors = self.validate_tmdl_syntax()
 
         report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
@@ -949,6 +965,20 @@ class PowerBIPBIPConnector:
             rf"(toTable\s*:\s*)'{old_name_escaped}'",
             rf'\1{new_name_quoted}',
             re.IGNORECASE
+        ))
+
+        # Pattern 7: Partition name (partition OldName = m)
+        # partition OldName -> partition 'New Name'
+        patterns.append((
+            rf'^(\s*)partition\s+{old_name_escaped}\s*=',
+            rf'\1partition {new_name_quoted} =',
+            re.MULTILINE
+        ))
+        # partition 'OldName' -> partition 'New Name'
+        patterns.append((
+            rf"^(\s*)partition\s+'{old_name_escaped}'\s*=",
+            rf'\1partition {new_name_quoted} =',
+            re.MULTILINE
         ))
 
         for tmdl_file in self.current_project.tmdl_files:
@@ -1287,6 +1317,12 @@ class PowerBIPBIPConnector:
             files_modified.extend(result.get("files", []))
             total_count += result.get("count", 0)
 
+        # Also fix diagramLayout.json
+        if self.current_project.diagram_layout_path:
+            result = self._rename_table_in_diagram_layout(old_table_name, new_table_name)
+            files_modified.extend(result.get("files", []))
+            total_count += result.get("count", 0)
+
         return {
             "success": total_count > 0,
             "files_modified": files_modified,
@@ -1299,7 +1335,9 @@ class PowerBIPBIPConnector:
         """
         Rename table references in cultures/linguistic schema files.
 
-        These files contain "ConceptualEntity": "TableName" references used for Q&A.
+        These files contain:
+        - "ConceptualEntity": "TableName" references used for Q&A
+        - JSON keys like "TableName": { for linguistic entities
         """
         if not self.current_project or not self.current_project.cultures_files:
             return {"files": [], "count": 0}
@@ -1317,10 +1355,16 @@ class PowerBIPBIPConnector:
                 original_content = content
                 file_count = 0
 
-                # Pattern: "ConceptualEntity": "TableName"
-                pattern = rf'"ConceptualEntity"\s*:\s*"{re.escape(old_name)}"'
-                replacement = f'"ConceptualEntity": "{new_name}"'
-                content, c = re.subn(pattern, replacement, content)
+                # Pattern 1: "ConceptualEntity": "TableName"
+                pattern1 = rf'"ConceptualEntity"\s*:\s*"{re.escape(old_name)}"'
+                replacement1 = f'"ConceptualEntity": "{new_name}"'
+                content, c = re.subn(pattern1, replacement1, content)
+                file_count += c
+
+                # Pattern 2: JSON key "TableName": { (linguistic entity definition)
+                pattern2 = rf'"{re.escape(old_name)}"\s*:\s*\{{'
+                replacement2 = f'"{new_name}": {{'
+                content, c = re.subn(pattern2, replacement2, content)
                 file_count += c
 
                 if content != original_content:
@@ -1328,10 +1372,50 @@ class PowerBIPBIPConnector:
                         f.write(content)
                     files_modified.append(str(cultures_file))
                     total_count += file_count
-                    logger.info(f"Updated {file_count} ConceptualEntity references in {cultures_file.name}")
+                    logger.info(f"Updated {file_count} linguistic schema references in {cultures_file.name}")
 
             except Exception as e:
                 logger.error(f"Error updating cultures file {cultures_file}: {e}")
+
+        return {"files": files_modified, "count": total_count}
+
+    def _rename_table_in_diagram_layout(self, old_name: str, new_name: str) -> Dict[str, Any]:
+        """
+        Rename table references in diagramLayout.json.
+
+        This file contains nodeIndex properties that reference table names for the model diagram.
+        """
+        if not self.current_project or not self.current_project.diagram_layout_path:
+            return {"files": [], "count": 0}
+
+        files_modified = []
+        total_count = 0
+        diagram_file = self.current_project.diagram_layout_path
+
+        try:
+            self._cache_file_content(diagram_file)
+
+            with open(diagram_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            original_content = content
+            file_count = 0
+
+            # Pattern: "nodeIndex": "TableName"
+            pattern = rf'"nodeIndex"\s*:\s*"{re.escape(old_name)}"'
+            replacement = f'"nodeIndex": "{new_name}"'
+            content, c = re.subn(pattern, replacement, content)
+            file_count += c
+
+            if content != original_content:
+                with open(diagram_file, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                files_modified.append(str(diagram_file))
+                total_count += file_count
+                logger.info(f"Updated {file_count} nodeIndex references in diagramLayout.json")
+
+        except Exception as e:
+            logger.error(f"Error updating diagramLayout.json: {e}")
 
         return {"files": files_modified, "count": total_count}
 
