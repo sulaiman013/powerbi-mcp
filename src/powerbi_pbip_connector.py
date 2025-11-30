@@ -95,6 +95,39 @@ def unquote_tmdl_name(name: str) -> str:
     return name
 
 
+def fix_dax_table_references(dax_expression: str, table_names: List[str]) -> str:
+    """
+    Fix DAX expressions by quoting table names that have spaces or special chars.
+
+    This handles cases like:
+    - SUM(Leads Sales Data[Amount]) -> SUM('Leads Sales Data'[Amount])
+    - CALCULATE(SUM(My Table[Col])) -> CALCULATE(SUM('My Table'[Col]))
+
+    Args:
+        dax_expression: The DAX expression to fix
+        table_names: List of table names in the model (used for context)
+
+    Returns:
+        Fixed DAX expression with proper table name quoting
+    """
+    result = dax_expression
+
+    for table_name in table_names:
+        if needs_tmdl_quoting(table_name):
+            # Find all unquoted references to this table followed by [
+            # Matches: TableName[Column] but not 'TableName'[Column]
+            pattern = rf"(?<!['\w]){re.escape(table_name)}(?=\s*\[)"
+            replacement = quote_tmdl_name(table_name)
+            result = re.sub(pattern, replacement, result)
+
+            # Also fix function call patterns like: RELATED(TableName
+            # but not: RELATED('TableName
+            pattern2 = rf"(?<=[A-Za-z]\()\s*{re.escape(table_name)}(?=\s*[\[\,\)])"
+            result = re.sub(pattern2, replacement, result)
+
+    return result
+
+
 @dataclass
 class PBIPProject:
     """Represents a PBIP project structure"""
@@ -377,6 +410,26 @@ class PowerBIPBIPConnector:
         if not self.current_project or not self.current_project.tmdl_files:
             return errors
 
+        # Build set of table names that need quoting
+        tables_needing_quotes = set()
+        try:
+            for tmdl_file in self.current_project.tmdl_files:
+                with open(tmdl_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                # Find all table declarations (handle both quoted and unquoted names)
+                # Pattern 1: table 'Name With Spaces'
+                for match in re.finditer(r"^table\s+'([^']+)'", content, re.MULTILINE):
+                    table_name = match.group(1).replace("''", "'")  # Unescape quotes
+                    if needs_tmdl_quoting(table_name):
+                        tables_needing_quotes.add(table_name)
+                # Pattern 2: table UnquotedName
+                for match in re.finditer(r"^table\s+(\w+)\s*$", content, re.MULTILINE):
+                    table_name = match.group(1)
+                    if needs_tmdl_quoting(table_name):
+                        tables_needing_quotes.add(table_name)
+        except Exception:
+            pass
+
         for tmdl_file in self.current_project.tmdl_files:
             try:
                 with open(tmdl_file, 'r', encoding='utf-8') as f:
@@ -414,6 +467,21 @@ class PowerBIPBIPConnector:
                                         context=stripped
                                     ))
 
+                    # Check for unquoted table references in DAX (measure/column expressions)
+                    if 'expression:' in stripped or '=' in stripped:
+                        # Check for unquoted table references that need quoting
+                        for table_name in tables_needing_quotes:
+                            # Pattern: unquoted TableName[Column] where table has spaces
+                            if re.search(rf"(?<!['\w]){re.escape(table_name)}(?=\s*\[)", stripped):
+                                errors.append(ValidationError(
+                                    file_path=str(tmdl_file),
+                                    line_number=i,
+                                    error_type="UNQUOTED_TABLE_IN_DAX",
+                                    message=f"Table '{table_name}' in DAX expression must be quoted: use '{quote_tmdl_name(table_name)}' instead of '{table_name}'",
+                                    context=stripped
+                                ))
+                                break  # Only report once per line
+
             except Exception as e:
                 errors.append(ValidationError(
                     file_path=str(tmdl_file),
@@ -424,6 +492,93 @@ class PowerBIPBIPConnector:
                 ))
 
         return errors
+
+    def fix_all_dax_quoting(self) -> Dict[str, Any]:
+        """
+        Fix all DAX expressions in TMDL files by properly quoting table names with spaces.
+
+        This scans all measures and expressions and quotes table names that have spaces
+        but are referenced without quotes.
+
+        Returns:
+            Dict with files_modified, references_fixed count, and validation_errors
+        """
+        if not self.current_project or not self.current_project.tmdl_files:
+            return {"files_modified": [], "count": 0, "errors": []}
+
+        files_modified = []
+        total_fixes = 0
+        errors = []
+
+        # First, collect all table names in the project
+        table_names = set()
+        try:
+            for tmdl_file in self.current_project.tmdl_files:
+                with open(tmdl_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                # Find all table declarations - both quoted and unquoted
+                # Pattern 1: table 'Name With Spaces'
+                for match in re.finditer(r"^(?:\s*)table\s+'([^']+)'", content, re.MULTILINE):
+                    table_name = match.group(1).replace("''", "'")  # Unescape quotes
+                    table_names.add(table_name)
+                # Pattern 2: table UnquotedName
+                for match in re.finditer(r"^(?:\s*)table\s+(\w+)\s*$", content, re.MULTILINE):
+                    table_names.add(match.group(1))
+        except Exception as e:
+            logger.warning(f"Could not extract table names: {e}")
+
+        # Filter to only tables that need quoting
+        tables_needing_quotes = [t for t in table_names if needs_tmdl_quoting(t)]
+
+        if not tables_needing_quotes:
+            return {"files_modified": [], "count": 0, "errors": []}
+
+        # Now process each file and fix DAX expressions
+        for tmdl_file in self.current_project.tmdl_files:
+            try:
+                self._cache_file_content(tmdl_file)
+
+                with open(tmdl_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                original_content = content
+                file_fixes = 0
+
+                # Fix each table that needs quoting
+                for table_name in tables_needing_quotes:
+                    table_quoted = quote_tmdl_name(table_name)
+                    escaped_name = re.escape(table_name)
+
+                    # Pattern 1: TableName[Column] -> 'TableName'[Column]
+                    pattern1 = rf"(?<!['\w]){escaped_name}(?=\s*\[)"
+                    content_before = content
+                    content = re.sub(pattern1, table_quoted, content)
+                    file_fixes += len(re.findall(pattern1, content_before))
+
+                    # Pattern 2: Handle function calls like CALCULATE(SUM(TableName[Col]))
+                    # This pattern matches unquoted table names in DAX contexts
+                    pattern2 = rf"(\()\s*{escaped_name}(?=\s*[\[\,\)])"
+                    content_before = content
+                    content = re.sub(pattern2, rf"\1{table_quoted}", content)
+                    file_fixes += len(re.findall(pattern2, content_before))
+
+                if content != original_content:
+                    with open(tmdl_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    files_modified.append(str(tmdl_file))
+                    total_fixes += file_fixes
+                    logger.info(f"Fixed {file_fixes} DAX quote references in {tmdl_file}")
+
+            except Exception as e:
+                logger.error(f"Error fixing DAX in {tmdl_file}: {e}")
+                errors.append({"file": str(tmdl_file), "error": str(e)})
+
+        return {
+            "files_modified": files_modified,
+            "count": total_fixes,
+            "tables_fixed": tables_needing_quotes,
+            "errors": errors
+        }
 
     # ==================== RENAME OPERATIONS ====================
 
@@ -572,6 +727,7 @@ class PowerBIPBIPConnector:
         1. Table declarations: table OldName -> table 'New Name'
         2. DAX references: 'OldName'[Column] -> 'New Name'[Column]
         3. Relationship refs: fromTable: OldName -> fromTable: 'New Name'
+        4. Relationship names: 'OldName to Table' -> 'New Name to Table'
         """
         files_modified = []
         total_count = 0
@@ -611,9 +767,10 @@ class PowerBIPBIPConnector:
         ))
 
         # Pattern 3: DAX references - unquoted TableName[Column]
+        # IMPORTANT: Always use the properly quoted version for the new name
         patterns.append((
             rf"(?<!['\w]){old_name_escaped}(?=\s*\[)",
-            unquote_tmdl_name(new_name_quoted) if not needs_tmdl_quoting(new_name) else new_name_quoted,
+            new_name_quoted,
             0
         ))
 
@@ -622,6 +779,41 @@ class PowerBIPBIPConnector:
             rf"'{old_name_escaped}'(?=\s*[,\)\]])",
             new_name_quoted,
             0
+        ))
+
+        # Pattern 4b: Unquoted TableName in function calls (e.g., CALCULATE(SUM(OldTable[Col])))
+        # This catches: FUNCTION(OldTable or FUNCTION( OldTable
+        patterns.append((
+            rf"([A-Z]+\s*\(\s*){old_name_escaped}(?=\s*[\[\,])",
+            rf"\1{new_name_quoted}",
+            re.IGNORECASE
+        ))
+
+        # Pattern 4c: Relationship names containing table name (CRITICAL for relationships)
+        # Handle: relationship 'OldName to SomeTable' -> relationship 'NewName to SomeTable'
+        # The entire name is in quotes, so we need to replace just the table name part inside quotes
+        patterns.append((
+            rf"(relationship\s+')({old_name_escaped})(\s+to\s+[^']*)'",
+            rf"\1{new_name}\3'",
+            re.IGNORECASE
+        ))
+        # Handle: relationship 'SomeTable to OldName' -> relationship 'SomeTable to NewName'
+        patterns.append((
+            rf"(relationship\s+')([^']*\s+to\s+)({old_name_escaped})'",
+            rf"\1\2{new_name}'",
+            re.IGNORECASE
+        ))
+        # Handle unquoted: relationship OldName to SomeTable -> relationship 'NewName' to SomeTable
+        patterns.append((
+            rf"(relationship\s+){old_name_escaped}(\s+to\s+)",
+            rf"\1{new_name_quoted}\2",
+            re.IGNORECASE
+        ))
+        # Handle unquoted: relationship SomeTable to OldName -> relationship SomeTable to 'NewName'
+        patterns.append((
+            rf"(relationship\s+)(\S+\s+to\s+){old_name_escaped}(?=\s|$)",
+            rf"\1\2{new_name_quoted}",
+            re.IGNORECASE | re.MULTILINE
         ))
 
         # Pattern 5: fromTable reference (CRITICAL for relationships)
