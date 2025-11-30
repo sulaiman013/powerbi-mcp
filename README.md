@@ -9,7 +9,7 @@
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10+-green?style=flat-square" alt="Python 3.10+"></a>
   <a href="#"><img src="https://img.shields.io/badge/Platform-Windows-lightgrey?style=flat-square" alt="Windows"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT License"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-30-purple?style=flat-square" alt="30 Tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-34-purple?style=flat-square" alt="34 Tools"></a>
 </p>
 
 <p align="center">
@@ -85,17 +85,34 @@ This causes visuals to show errors like *"Can't find column 'OldTableName'[Colum
 
 We researched Microsoft's own approach and discovered that even their tools face this limitation. The solution lies in the **Power BI Project (PBIP)** format—a text-based representation of both the model and report.
 
+**Two Report Formats Supported:**
+
+| Format | Structure | Default |
+|--------|-----------|---------|
+| **PBIR-Legacy** | Single `report.json` | Until Jan 2026 |
+| **PBIR-Enhanced** | Individual `visual.json` files | From Jan 2026 |
+
 ```
 MyReport.pbip
 ├── MyReport.SemanticModel/
 │   ├── definition.tmdl          <- Model definitions (text)
 │   └── definition/
 │       ├── tables/*.tmdl        <- Table definitions
+│       ├── cultures/*.tmdl      <- Linguistic schema (Q&A)
 │       └── relationships.tmdl
 └── MyReport.Report/
-    ├── report.json              <- Visual bindings (JSON)
-    └── definition.pbir
+    ├── report.json              <- PBIR-Legacy: All visuals here
+    ├── definition.pbir
+    └── definition/              <- PBIR-Enhanced structure
+        ├── report.json          <- Report-level settings only
+        └── pages/
+            └── [page_id]/
+                └── visuals/
+                    └── [visual_id]/
+                        └── visual.json  <- Individual visual definition
 ```
+
+**Reference:** [Data Goblins - Programmatically Modify Reports](https://data-goblins.com/power-bi/programmatically-modify-reports)
 
 **Our Implementation:**
 
@@ -134,7 +151,7 @@ We built a dedicated **PBIP Connector** that:
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                    Power BI MCP Server                       │
-│                        (30 Tools)                            │
+│                        (34 Tools)                            │
 ├──────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
 │  │  Security   │  │   Audit     │  │   Access Policies   │  │
@@ -214,10 +231,20 @@ We built a dedicated **PBIP Connector** that:
 | Tool | Description |
 |------|-------------|
 | `pbip_load_project` | Load a PBIP project for editing |
-| `pbip_get_project_info` | Get project structure information |
-| `pbip_rename_tables` | Rename tables (model + report layer) |
-| `pbip_rename_columns` | Rename columns (model + report layer) |
-| `pbip_rename_measures` | Rename measures (model + report layer) |
+| `pbip_get_project_info` | Get project structure information (detects PBIR format) |
+| `pbip_rename_tables` | **Comprehensive rename**: updates TMDL + DAX quoting + visual.json + cultures (all automatic) |
+| `pbip_rename_columns` | Rename columns (model + report layer, both PBIR formats) |
+| `pbip_rename_measures` | Rename measures (model + report layer, both PBIR formats) |
+
+### PBIP Diagnostics (4 tools)
+| Tool | Description |
+|------|-------------|
+| `pbip_fix_broken_visuals` | Fix visual references after TOM/API rename (when rename was done outside PBIP tools) |
+| `pbip_fix_dax_quoting` | Fix any remaining unquoted table names in DAX expressions |
+| `pbip_scan_broken_refs` | Scan project for broken references - compare model vs visuals |
+| `pbip_validate` | Validate TMDL syntax, find quoting issues, invalid references |
+
+> **Note:** DAX quoting and visual updates are now **automatically handled** by `pbip_rename_tables`. The repair tools are only needed when renames were done outside of PBIP (e.g., via TOM API or Power BI Desktop).
 
 ---
 
@@ -329,10 +356,28 @@ User: "Run DAX: EVALUATE TOPN(10, Sales)"
 
 ```
 User: "Load PBIP project from C:/Projects/SalesReport"
-User: "Rename tables: dim_customer to Dim Customer, fact_sales to Fact Sales"
+User: "Rename tables: Salesforce_Data to Leads Sales Data"
 ```
 
-The PBIP tools ensure both model definitions AND report visuals are updated together.
+**What happens automatically:**
+1. Table declaration updated: `table Salesforce_Data` → `table 'Leads Sales Data'`
+2. DAX references quoted: `Salesforce_Data[Amount]` → `'Leads Sales Data'[Amount]`
+3. Function calls fixed: `COUNTROWS(Salesforce_Data)` → `COUNTROWS('Leads Sales Data')`
+4. Visual files updated: All `"Entity": "Salesforce_Data"` → `"Entity": "Leads Sales Data"`
+5. Cultures/Q&A updated: All `"ConceptualEntity"` references fixed
+
+### Diagnose Issues (When Needed)
+
+```
+User: "Load PBIP project from C:/Projects/SalesReport"
+User: "Scan for broken references"
+# Shows: Tables in model vs tables referenced in visuals
+
+User: "Validate project"
+# Shows: Any TMDL syntax errors or quoting issues
+```
+
+Use repair tools only if a rename was done **outside** the MCP server (e.g., via TOM API or Power BI Desktop UI).
 
 ### RLS Testing
 

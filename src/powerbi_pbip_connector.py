@@ -3,6 +3,10 @@ Power BI PBIP (Power BI Project) Connector
 Provides file-based editing for PBIP format to safely rename tables, columns, measures
 without breaking report visuals.
 
+Supports BOTH report formats:
+  - PBIR-Legacy: Single report.json file (older format)
+  - PBIR: Individual visual.json files (new enhanced format, default from Jan 2026)
+
 PBIP Structure:
   project.pbip
   ProjectName.SemanticModel/
@@ -11,10 +15,20 @@ PBIP Structure:
       tables/*.tmdl
       relationships/*.tmdl  <- Individual relationship files
       relationships.tmdl    <- Or single file
+      cultures/*.tmdl       <- Linguistic schema (ConceptualEntity references)
       etc.
   ProjectName.Report/
-    report.json  <- Contains visual field bindings
-    definition.pbir
+    report.json             <- PBIR-Legacy: All visuals in one file
+    definition.pbir         <- Points to semantic model
+    definition/             <- PBIR Enhanced format (new)
+      report.json           <- Report-level settings only
+      pages/
+        pages.json          <- Page listing
+        [page_id]/
+          page.json         <- Page settings
+          visuals/
+            [visual_id]/
+              visual.json   <- Individual visual definition with Entity refs
 
 TMDL Name Quoting Rules (Microsoft Spec):
   - Names with spaces, special chars, or reserved words MUST be quoted with single quotes
@@ -22,6 +36,10 @@ TMDL Name Quoting Rules (Microsoft Spec):
     - table 'Customer Appointments'  (spaces - MUST quote)
     - table Sales                    (no spaces - no quote needed)
     - fromTable: 'My Table'          (spaces in relationship ref)
+
+References:
+  - Data Goblins: https://data-goblins.com/power-bi/programmatically-modify-reports
+  - Microsoft PBIR: https://powerbi.microsoft.com/en-us/blog/power-bi-enhanced-report-format-pbir-in-power-bi-desktop-developer-mode-preview/
 """
 import json
 import logging
@@ -135,9 +153,14 @@ class PBIPProject:
     pbip_file: Path
     semantic_model_folder: Optional[Path]
     report_folder: Optional[Path]
-    report_json_path: Optional[Path]
+    report_json_path: Optional[Path]  # PBIR-Legacy: root report.json
     tmdl_files: List[Path]
     backup_path: Optional[Path] = None
+    # PBIR Enhanced format fields
+    is_pbir_enhanced: bool = False
+    pbir_definition_folder: Optional[Path] = None  # Report/definition/ folder
+    visual_json_files: List[Path] = field(default_factory=list)  # All visual.json files
+    cultures_files: List[Path] = field(default_factory=list)  # Linguistic schema files
 
 
 @dataclass
@@ -264,7 +287,7 @@ class PowerBIPBIPConnector:
 
     @staticmethod
     def _parse_pbip_project(pbip_path: Path) -> Optional[PBIPProject]:
-        """Parse a PBIP project structure"""
+        """Parse a PBIP project structure, detecting both PBIR-Legacy and PBIR Enhanced formats"""
         try:
             root = pbip_path.parent
 
@@ -276,12 +299,38 @@ class PowerBIPBIPConnector:
             report_folders = list(root.glob("*.Report"))
             report_folder = report_folders[0] if report_folders else None
 
-            # Find report.json
+            # Initialize PBIR fields
             report_json_path = None
+            is_pbir_enhanced = False
+            pbir_definition_folder = None
+            visual_json_files = []
+            cultures_files = []
+
             if report_folder:
-                report_json = report_folder / "report.json"
-                if report_json.exists():
-                    report_json_path = report_json
+                # Check for PBIR Enhanced format: Report/definition/pages/ structure
+                definition_folder = report_folder / "definition"
+                pages_folder = definition_folder / "pages"
+
+                if pages_folder.exists():
+                    # This is PBIR Enhanced format
+                    is_pbir_enhanced = True
+                    pbir_definition_folder = definition_folder
+
+                    # Find all visual.json files in pages/[id]/visuals/[id]/
+                    visual_json_files = list(pages_folder.glob("**/visuals/*/visual.json"))
+
+                    # Report.json in definition folder (report-level settings only)
+                    report_json = definition_folder / "report.json"
+                    if report_json.exists():
+                        report_json_path = report_json
+
+                    logger.info(f"Detected PBIR Enhanced format with {len(visual_json_files)} visual files")
+                else:
+                    # Check for PBIR-Legacy: single report.json at root
+                    report_json = report_folder / "report.json"
+                    if report_json.exists():
+                        report_json_path = report_json
+                        logger.info("Detected PBIR-Legacy format (single report.json)")
 
             # Find all TMDL files
             tmdl_files = []
@@ -289,13 +338,22 @@ class PowerBIPBIPConnector:
                 tmdl_files = list(semantic_model_folder.glob("**/*.tmdl"))
                 tmdl_files.extend(semantic_model_folder.glob("**/*.tmd"))
 
+                # Find cultures files (linguistic schema with ConceptualEntity)
+                cultures_folder = semantic_model_folder / "definition" / "cultures"
+                if cultures_folder.exists():
+                    cultures_files = list(cultures_folder.glob("*.tmdl"))
+
             return PBIPProject(
                 root_path=root,
                 pbip_file=pbip_path,
                 semantic_model_folder=semantic_model_folder,
                 report_folder=report_folder,
                 report_json_path=report_json_path,
-                tmdl_files=tmdl_files
+                tmdl_files=tmdl_files,
+                is_pbir_enhanced=is_pbir_enhanced,
+                pbir_definition_folder=pbir_definition_folder,
+                visual_json_files=visual_json_files,
+                cultures_files=cultures_files
             )
 
         except Exception as e:
@@ -332,7 +390,13 @@ class PowerBIPBIPConnector:
             "report_folder": str(self.current_project.report_folder) if self.current_project.report_folder else None,
             "report_json_path": str(self.current_project.report_json_path) if self.current_project.report_json_path else None,
             "tmdl_file_count": len(self.current_project.tmdl_files),
-            "has_report": self.current_project.report_json_path is not None
+            "has_report": self.current_project.report_json_path is not None,
+            # PBIR Enhanced format info
+            "report_format": "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy",
+            "is_pbir_enhanced": self.current_project.is_pbir_enhanced,
+            "visual_json_count": len(self.current_project.visual_json_files),
+            "cultures_file_count": len(self.current_project.cultures_files),
+            "pbir_definition_folder": str(self.current_project.pbir_definition_folder) if self.current_project.pbir_definition_folder else None
         }
 
     # ==================== BACKUP & ROLLBACK ====================
@@ -584,7 +648,15 @@ class PowerBIPBIPConnector:
 
     def rename_table_in_files(self, old_name: str, new_name: str) -> RenameResult:
         """
-        Rename a table across all PBIP files (TMDL + report.json)
+        Rename a table across all PBIP files (TMDL + report visuals)
+
+        This is a COMPREHENSIVE rename that:
+        1. Updates table declarations in TMDL files
+        2. Updates ALL DAX references with proper quoting (if new name has spaces)
+        3. Updates report layer (PBIR-Legacy or PBIR-Enhanced visual.json files)
+        4. Updates cultures files (linguistic schema)
+
+        Supports both PBIR-Legacy (report.json) and PBIR-Enhanced (visual.json files) formats.
 
         Args:
             old_name: Current table name
@@ -604,28 +676,42 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # 1. Update TMDL files
+        # 1. Update TMDL files (semantic model) - auto-quoting is built-in
         tmdl_replacements = self._rename_table_in_tmdl_files(old_name, new_name)
         files_modified.extend(tmdl_replacements["files"])
         total_replacements += tmdl_replacements["count"]
 
-        # 2. Update report.json
-        if self.current_project.report_json_path:
+        # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
+        if self.current_project.is_pbir_enhanced:
+            # PBIR Enhanced: Update individual visual.json files
+            visual_replacements = self._rename_table_in_visual_files(old_name, new_name)
+            files_modified.extend(visual_replacements["files"])
+            total_replacements += visual_replacements["count"]
+        elif self.current_project.report_json_path:
+            # PBIR Legacy: Update single report.json
             report_replacements = self._rename_table_in_report_json(old_name, new_name)
             if report_replacements["count"] > 0:
                 files_modified.append(str(self.current_project.report_json_path))
                 total_replacements += report_replacements["count"]
 
-        # 3. Validate after changes
+        # 3. Update cultures files (linguistic schema)
+        if self.current_project.cultures_files:
+            cultures_replacements = self._rename_table_in_cultures_files(old_name, new_name)
+            files_modified.extend(cultures_replacements["files"])
+            total_replacements += cultures_replacements["count"]
+
+        # 4. Validate after changes
         validation_errors = self.validate_tmdl_syntax()
+
+        report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
 
         return RenameResult(
             success=len(validation_errors) == 0,
-            message=f"Renamed table '{old_name}' to '{new_name}' in {len(files_modified)} file(s)" +
+            message=f"Renamed table '{old_name}' to '{new_name}' in {len(files_modified)} file(s) ({report_format})" +
                     (f" with {len(validation_errors)} validation error(s)" if validation_errors else ""),
             files_modified=files_modified,
             references_updated=total_replacements,
-            details={"old_name": old_name, "new_name": new_name},
+            details={"old_name": old_name, "new_name": new_name, "report_format": report_format},
             validation_errors=validation_errors,
             backup_created=backup_path
         )
@@ -633,6 +719,8 @@ class PowerBIPBIPConnector:
     def rename_column_in_files(self, table_name: str, old_name: str, new_name: str) -> RenameResult:
         """
         Rename a column across all PBIP files
+
+        Supports both PBIR-Legacy and PBIR-Enhanced formats.
 
         Args:
             table_name: Table containing the column
@@ -653,30 +741,40 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # 1. Update TMDL files
+        # 1. Update TMDL files (semantic model)
         tmdl_replacements = self._rename_column_in_tmdl_files(table_name, old_name, new_name)
         files_modified.extend(tmdl_replacements["files"])
         total_replacements += tmdl_replacements["count"]
 
-        # 2. Update report.json
-        if self.current_project.report_json_path:
+        # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
+        if self.current_project.is_pbir_enhanced:
+            # PBIR Enhanced: Update individual visual.json files
+            visual_replacements = self._rename_column_in_visual_files(table_name, old_name, new_name)
+            files_modified.extend(visual_replacements["files"])
+            total_replacements += visual_replacements["count"]
+        elif self.current_project.report_json_path:
+            # PBIR Legacy: Update single report.json
             report_replacements = self._rename_column_in_report_json(table_name, old_name, new_name)
             if report_replacements["count"] > 0:
                 files_modified.append(str(self.current_project.report_json_path))
                 total_replacements += report_replacements["count"]
 
+        report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
+
         return RenameResult(
             success=True,
-            message=f"Renamed column '{table_name}'[{old_name}] to [{new_name}] in {len(files_modified)} file(s)",
+            message=f"Renamed column '{table_name}'[{old_name}] to [{new_name}] in {len(files_modified)} file(s) ({report_format})",
             files_modified=files_modified,
             references_updated=total_replacements,
-            details={"table_name": table_name, "old_name": old_name, "new_name": new_name},
+            details={"table_name": table_name, "old_name": old_name, "new_name": new_name, "report_format": report_format},
             backup_created=backup_path
         )
 
     def rename_measure_in_files(self, old_name: str, new_name: str) -> RenameResult:
         """
         Rename a measure across all PBIP files
+
+        Supports both PBIR-Legacy and PBIR-Enhanced formats.
 
         Args:
             old_name: Current measure name
@@ -696,24 +794,32 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # 1. Update TMDL files
+        # 1. Update TMDL files (semantic model)
         tmdl_replacements = self._rename_measure_in_tmdl_files(old_name, new_name)
         files_modified.extend(tmdl_replacements["files"])
         total_replacements += tmdl_replacements["count"]
 
-        # 2. Update report.json
-        if self.current_project.report_json_path:
+        # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
+        if self.current_project.is_pbir_enhanced:
+            # PBIR Enhanced: Update individual visual.json files
+            visual_replacements = self._rename_measure_in_visual_files(old_name, new_name)
+            files_modified.extend(visual_replacements["files"])
+            total_replacements += visual_replacements["count"]
+        elif self.current_project.report_json_path:
+            # PBIR Legacy: Update single report.json
             report_replacements = self._rename_measure_in_report_json(old_name, new_name)
             if report_replacements["count"] > 0:
                 files_modified.append(str(self.current_project.report_json_path))
                 total_replacements += report_replacements["count"]
 
+        report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
+
         return RenameResult(
             success=True,
-            message=f"Renamed measure '{old_name}' to '{new_name}' in {len(files_modified)} file(s)",
+            message=f"Renamed measure '{old_name}' to '{new_name}' in {len(files_modified)} file(s) ({report_format})",
             files_modified=files_modified,
             references_updated=total_replacements,
-            details={"old_name": old_name, "new_name": new_name},
+            details={"old_name": old_name, "new_name": new_name, "report_format": report_format},
             backup_created=backup_path
         )
 
@@ -781,10 +887,11 @@ class PowerBIPBIPConnector:
             0
         ))
 
-        # Pattern 4b: Unquoted TableName in function calls (e.g., CALCULATE(SUM(OldTable[Col])))
-        # This catches: FUNCTION(OldTable or FUNCTION( OldTable
+        # Pattern 4b: Unquoted TableName in function calls
+        # This catches: FUNCTION(OldTable[, FUNCTION(OldTable,, FUNCTION(OldTable)
+        # Examples: COUNTROWS(TableName), SUM(TableName[Col]), FILTER(TableName, ...)
         patterns.append((
-            rf"([A-Z]+\s*\(\s*){old_name_escaped}(?=\s*[\[\,])",
+            rf"([A-Z]+\s*\(\s*){old_name_escaped}(?=\s*[\[\,\)])",
             rf"\1{new_name_quoted}",
             re.IGNORECASE
         ))
@@ -976,11 +1083,448 @@ class PowerBIPBIPConnector:
 
         return {"files": files_modified, "count": total_count}
 
-    # ==================== REPORT.JSON OPERATIONS ====================
+    # ==================== PBIR VISUAL.JSON OPERATIONS ====================
+
+    def _rename_table_in_visual_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
+        """
+        Rename table references in PBIR Enhanced format visual.json files.
+
+        Each visual.json contains Entity references like:
+        {
+            "SourceRef": {
+                "Entity": "Salesforce_Data"  <- This needs updating
+            }
+        }
+
+        Returns:
+            Dict with files modified and count of updates
+        """
+        if not self.current_project or not self.current_project.visual_json_files:
+            return {"files": [], "count": 0}
+
+        files_modified = []
+        total_count = 0
+
+        for visual_file in self.current_project.visual_json_files:
+            try:
+                self._cache_file_content(visual_file)
+
+                with open(visual_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                original_content = content
+                file_count = 0
+
+                # Pattern 1: "Entity": "OldTableName"
+                pattern1 = rf'"Entity"\s*:\s*"{re.escape(old_name)}"'
+                replacement1 = f'"Entity": "{new_name}"'
+                content, c = re.subn(pattern1, replacement1, content)
+                file_count += c
+
+                # Pattern 2: queryRef patterns like "OldTableName.ColumnName"
+                pattern2 = rf'"queryRef"\s*:\s*"{re.escape(old_name)}\.([^"]+)"'
+                replacement2 = rf'"queryRef": "{new_name}.\1"'
+                content, c = re.subn(pattern2, replacement2, content)
+                file_count += c
+
+                # Pattern 3: nativeQueryRef with table prefix
+                pattern3 = rf'"nativeQueryRef"\s*:\s*"{re.escape(old_name)}\.([^"]+)"'
+                replacement3 = rf'"nativeQueryRef": "{new_name}.\1"'
+                content, c = re.subn(pattern3, replacement3, content)
+                file_count += c
+
+                # Pattern 4: metadata selector patterns
+                pattern4 = rf'"metadata"\s*:\s*"{re.escape(old_name)}\.([^"]+)"'
+                replacement4 = rf'"metadata": "{new_name}.\1"'
+                content, c = re.subn(pattern4, replacement4, content)
+                file_count += c
+
+                if content != original_content:
+                    with open(visual_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    files_modified.append(str(visual_file))
+                    total_count += file_count
+                    logger.info(f"Updated {file_count} Entity references in {visual_file.name}")
+
+            except Exception as e:
+                logger.error(f"Error updating visual file {visual_file}: {e}")
+
+        return {"files": files_modified, "count": total_count}
+
+    def _rename_column_in_visual_files(self, table_name: str, old_name: str, new_name: str) -> Dict[str, Any]:
+        """Rename column references in PBIR Enhanced format visual.json files"""
+        if not self.current_project or not self.current_project.visual_json_files:
+            return {"files": [], "count": 0}
+
+        files_modified = []
+        total_count = 0
+
+        for visual_file in self.current_project.visual_json_files:
+            try:
+                self._cache_file_content(visual_file)
+
+                with open(visual_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                original_content = content
+                file_count = 0
+
+                # Pattern 1: "Property": "ColumnName" (when Entity context is table_name)
+                # This is tricky - we use JSON parsing for accuracy
+                try:
+                    visual_data = json.loads(content)
+                    modified = self._deep_rename_column_in_json(visual_data, table_name, old_name, new_name)
+                    if modified > 0:
+                        content = json.dumps(visual_data, indent=2, ensure_ascii=False)
+                        file_count += modified
+                except json.JSONDecodeError:
+                    pass
+
+                # Pattern 2: queryRef patterns like "TableName.OldColumn"
+                pattern2 = rf'"{re.escape(table_name)}\.{re.escape(old_name)}"'
+                replacement2 = f'"{table_name}.{new_name}"'
+                content, c = re.subn(pattern2, replacement2, content)
+                file_count += c
+
+                if content != original_content:
+                    with open(visual_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    files_modified.append(str(visual_file))
+                    total_count += file_count
+
+            except Exception as e:
+                logger.error(f"Error updating visual file {visual_file}: {e}")
+
+        return {"files": files_modified, "count": total_count}
+
+    def _rename_measure_in_visual_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
+        """Rename measure references in PBIR Enhanced format visual.json files"""
+        if not self.current_project or not self.current_project.visual_json_files:
+            return {"files": [], "count": 0}
+
+        files_modified = []
+        total_count = 0
+
+        for visual_file in self.current_project.visual_json_files:
+            try:
+                self._cache_file_content(visual_file)
+
+                with open(visual_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                original_content = content
+                file_count = 0
+
+                # Pattern 1: "Property": "MeasureName"
+                pattern1 = rf'"Property"\s*:\s*"{re.escape(old_name)}"'
+                replacement1 = f'"Property": "{new_name}"'
+                content, c = re.subn(pattern1, replacement1, content)
+                file_count += c
+
+                # Pattern 2: queryRef ending with measure name
+                pattern2 = rf'\.{re.escape(old_name)}"'
+                replacement2 = f'.{new_name}"'
+                content, c = re.subn(pattern2, replacement2, content)
+                file_count += c
+
+                # Pattern 3: nativeQueryRef with measure name
+                pattern3 = rf'"nativeQueryRef"\s*:\s*"{re.escape(old_name)}"'
+                replacement3 = f'"nativeQueryRef": "{new_name}"'
+                content, c = re.subn(pattern3, replacement3, content)
+                file_count += c
+
+                if content != original_content:
+                    with open(visual_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    files_modified.append(str(visual_file))
+                    total_count += file_count
+
+            except Exception as e:
+                logger.error(f"Error updating visual file {visual_file}: {e}")
+
+        return {"files": files_modified, "count": total_count}
+
+    def fix_broken_visual_references(self, old_table_name: str, new_table_name: str) -> Dict[str, Any]:
+        """
+        Fix broken visual references after a table rename.
+
+        This is a targeted fix for the common scenario where:
+        - TOM/API renamed the table in the semantic model
+        - But report visuals still reference the old table name
+
+        Works with both PBIR-Legacy and PBIR-Enhanced formats.
+
+        Args:
+            old_table_name: The old table name that visuals are still referencing
+            new_table_name: The correct new table name
+
+        Returns:
+            Dict with fix results
+        """
+        if not self.current_project:
+            return {"success": False, "error": "No project loaded"}
+
+        files_modified = []
+        total_count = 0
+        errors = []
+
+        # Fix PBIR-Legacy report.json
+        if self.current_project.report_json_path and not self.current_project.is_pbir_enhanced:
+            result = self._rename_table_in_report_json(old_table_name, new_table_name)
+            if result.get("count", 0) > 0:
+                files_modified.append(str(self.current_project.report_json_path))
+                total_count += result["count"]
+
+        # Fix PBIR-Enhanced visual.json files
+        if self.current_project.is_pbir_enhanced and self.current_project.visual_json_files:
+            result = self._rename_table_in_visual_files(old_table_name, new_table_name)
+            files_modified.extend(result.get("files", []))
+            total_count += result.get("count", 0)
+
+        # Also fix cultures files (linguistic schema)
+        if self.current_project.cultures_files:
+            result = self._rename_table_in_cultures_files(old_table_name, new_table_name)
+            files_modified.extend(result.get("files", []))
+            total_count += result.get("count", 0)
+
+        return {
+            "success": total_count > 0,
+            "files_modified": files_modified,
+            "references_fixed": total_count,
+            "format": "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy",
+            "errors": errors
+        }
+
+    def _rename_table_in_cultures_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
+        """
+        Rename table references in cultures/linguistic schema files.
+
+        These files contain "ConceptualEntity": "TableName" references used for Q&A.
+        """
+        if not self.current_project or not self.current_project.cultures_files:
+            return {"files": [], "count": 0}
+
+        files_modified = []
+        total_count = 0
+
+        for cultures_file in self.current_project.cultures_files:
+            try:
+                self._cache_file_content(cultures_file)
+
+                with open(cultures_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                original_content = content
+                file_count = 0
+
+                # Pattern: "ConceptualEntity": "TableName"
+                pattern = rf'"ConceptualEntity"\s*:\s*"{re.escape(old_name)}"'
+                replacement = f'"ConceptualEntity": "{new_name}"'
+                content, c = re.subn(pattern, replacement, content)
+                file_count += c
+
+                if content != original_content:
+                    with open(cultures_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    files_modified.append(str(cultures_file))
+                    total_count += file_count
+                    logger.info(f"Updated {file_count} ConceptualEntity references in {cultures_file.name}")
+
+            except Exception as e:
+                logger.error(f"Error updating cultures file {cultures_file}: {e}")
+
+        return {"files": files_modified, "count": total_count}
+
+    def scan_broken_references(self) -> Dict[str, Any]:
+        """
+        Scan the project for potentially broken references.
+
+        Compares table names in semantic model vs references in report layer.
+
+        Returns:
+            Dict with broken references found
+        """
+        if not self.current_project:
+            return {"error": "No project loaded"}
+
+        # Get table names from semantic model
+        model_tables = set()
+        for tmdl_file in self.current_project.tmdl_files:
+            try:
+                with open(tmdl_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                # Find table declarations
+                for match in re.finditer(r"^(?:\s*)table\s+'([^']+)'", content, re.MULTILINE):
+                    model_tables.add(match.group(1).replace("''", "'"))
+                for match in re.finditer(r"^(?:\s*)table\s+(\w+)\s*$", content, re.MULTILINE):
+                    model_tables.add(match.group(1))
+            except Exception:
+                pass
+
+        # Get table references from report layer
+        report_tables = set()
+        broken_refs = []
+
+        # Check visual files (PBIR Enhanced)
+        for visual_file in self.current_project.visual_json_files:
+            try:
+                with open(visual_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                for match in re.finditer(r'"Entity"\s*:\s*"([^"]+)"', content):
+                    entity = match.group(1)
+                    report_tables.add(entity)
+                    if entity not in model_tables:
+                        broken_refs.append({
+                            "file": str(visual_file),
+                            "entity": entity,
+                            "type": "visual"
+                        })
+            except Exception:
+                pass
+
+        # Check report.json (PBIR Legacy)
+        if self.current_project.report_json_path:
+            try:
+                with open(self.current_project.report_json_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                for match in re.finditer(r'"Entity"\s*:\s*"([^"]+)"', content):
+                    entity = match.group(1)
+                    report_tables.add(entity)
+                    if entity not in model_tables:
+                        broken_refs.append({
+                            "file": str(self.current_project.report_json_path),
+                            "entity": entity,
+                            "type": "report.json"
+                        })
+            except Exception:
+                pass
+
+        # Find orphaned tables (in report but not in model)
+        orphaned = report_tables - model_tables
+
+        return {
+            "model_tables": list(model_tables),
+            "report_tables": list(report_tables),
+            "broken_references": broken_refs,
+            "orphaned_table_names": list(orphaned),
+            "has_broken_refs": len(broken_refs) > 0
+        }
+
+    def fix_all_dax_quoting(self) -> Dict[str, Any]:
+        """
+        Fix all DAX expressions by properly quoting table names with spaces.
+
+        Scans TMDL files for patterns like:
+            Table Name[Column]  ->  'Table Name'[Column]
+            COUNTROWS(Table Name)  ->  COUNTROWS('Table Name')
+
+        Returns:
+            Dict with count of fixes and files modified
+        """
+        if not self.current_project:
+            return {"count": 0, "files_modified": [], "errors": [], "tables_fixed": []}
+
+        files_modified = []
+        total_count = 0
+        errors = []
+        tables_fixed = set()
+
+        # First, find all table names with spaces
+        tables_with_spaces = set()
+        for tmdl_file in self.current_project.tmdl_files:
+            try:
+                with open(tmdl_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                # Find quoted table declarations: table 'Table Name'
+                for match in re.finditer(r"^(?:\s*)table\s+'([^']+)'", content, re.MULTILINE):
+                    name = match.group(1).replace("''", "'")
+                    if ' ' in name:
+                        tables_with_spaces.add(name)
+            except Exception:
+                pass
+
+        if not tables_with_spaces:
+            return {"count": 0, "files_modified": [], "errors": [], "tables_fixed": [], "message": "No tables with spaces found"}
+
+        # Now fix unquoted references to these tables
+        for tmdl_file in self.current_project.tmdl_files:
+            try:
+                self._cache_file_content(tmdl_file)
+
+                with open(tmdl_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                original_content = content
+                file_count = 0
+
+                for table_name in tables_with_spaces:
+                    # Pattern 1: Unquoted in column reference: Table Name[Column] -> 'Table Name'[Column]
+                    # But NOT already quoted: 'Table Name'[Column]
+                    pattern1 = rf"(?<!')({re.escape(table_name)})\[([^\]]+)\]"
+                    replacement1 = rf"'{table_name}'[\2]"
+                    content, c = re.subn(pattern1, replacement1, content)
+                    if c > 0:
+                        file_count += c
+                        tables_fixed.add(table_name)
+
+                    # Pattern 2: In COUNTROWS/SUMX etc: COUNTROWS(Table Name) -> COUNTROWS('Table Name')
+                    funcs = ["COUNTROWS", "SUMX", "AVERAGEX", "MAXX", "MINX", "FILTER", "ALL", "ALLEXCEPT", "VALUES", "DISTINCT", "RELATEDTABLE"]
+                    for func in funcs:
+                        pattern2 = rf"({func}\s*\(\s*)({re.escape(table_name)})(\s*[,\)])"
+                        replacement2 = rf"\1'{table_name}'\3"
+                        content, c = re.subn(pattern2, replacement2, content, flags=re.IGNORECASE)
+                        if c > 0:
+                            file_count += c
+                            tables_fixed.add(table_name)
+
+                if content != original_content:
+                    with open(tmdl_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    files_modified.append(str(tmdl_file))
+                    total_count += file_count
+                    logger.info(f"Fixed {file_count} quoting issues in {tmdl_file.name}")
+
+            except Exception as e:
+                errors.append({"file": str(tmdl_file), "error": str(e)})
+                logger.error(f"Error fixing DAX quoting in {tmdl_file}: {e}")
+
+        return {
+            "count": total_count,
+            "files_modified": files_modified,
+            "tables_fixed": list(tables_fixed),
+            "errors": errors
+        }
+
+    def _deep_rename_column_in_json(self, obj: Any, table_name: str, old_column: str, new_column: str) -> int:
+        """
+        Recursively traverse JSON to rename column references within a specific table context.
+
+        Returns count of modifications made.
+        """
+        count = 0
+
+        if isinstance(obj, dict):
+            # Check if this is a column reference within our target table
+            if obj.get("Entity") == table_name and obj.get("Property") == old_column:
+                obj["Property"] = new_column
+                count += 1
+
+            # Recurse into dict values
+            for key, value in obj.items():
+                count += self._deep_rename_column_in_json(value, table_name, old_column, new_column)
+
+        elif isinstance(obj, list):
+            for item in obj:
+                count += self._deep_rename_column_in_json(item, table_name, old_column, new_column)
+
+        return count
+
+    # ==================== REPORT.JSON OPERATIONS (PBIR-Legacy) ====================
 
     def _rename_table_in_report_json(self, old_name: str, new_name: str) -> Dict[str, Any]:
         """
-        Rename table references in report.json
+        Rename table references in report.json (PBIR-Legacy format)
 
         report.json contains visual field bindings like:
         - "Entity": "TableName"

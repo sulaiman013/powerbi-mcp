@@ -590,6 +590,52 @@ class PowerBIMCPServer:
                         },
                         "required": ["renames"]
                     }
+                ),
+                # === PBIP REPAIR TOOLS (Fix broken visuals) ===
+                Tool(
+                    name="pbip_fix_broken_visuals",
+                    description="Fix broken visual references after a table rename. Use this when TOM/API renamed a table but visuals still reference the old name. Supports both PBIR-Legacy and PBIR-Enhanced formats.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "old_table_name": {
+                                "type": "string",
+                                "description": "The old table name that visuals are still referencing (broken)"
+                            },
+                            "new_table_name": {
+                                "type": "string",
+                                "description": "The correct new table name in the semantic model"
+                            }
+                        },
+                        "required": ["old_table_name", "new_table_name"]
+                    }
+                ),
+                Tool(
+                    name="pbip_fix_dax_quoting",
+                    description="Fix all DAX expressions by properly quoting table names with spaces. Fixes: Leads Sales Data[Amount] -> 'Leads Sales Data'[Amount]",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="pbip_scan_broken_refs",
+                    description="Scan the PBIP project for broken references. Compares table names in semantic model vs report visuals to find mismatches.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="pbip_validate",
+                    description="Validate TMDL syntax in the loaded PBIP project. Checks for unquoted names with spaces, invalid references, etc.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
                 )
             ]
             return tools
@@ -667,6 +713,15 @@ class PowerBIMCPServer:
                     result = await self._handle_pbip_rename_columns(args)
                 elif name == "pbip_rename_measures":
                     result = await self._handle_pbip_rename_measures(args)
+                # PBIP Repair tools
+                elif name == "pbip_fix_broken_visuals":
+                    result = await self._handle_pbip_fix_broken_visuals(args)
+                elif name == "pbip_fix_dax_quoting":
+                    result = await self._handle_pbip_fix_dax_quoting()
+                elif name == "pbip_scan_broken_refs":
+                    result = await self._handle_pbip_scan_broken_refs()
+                elif name == "pbip_validate":
+                    result = await self._handle_pbip_validate()
                 else:
                     result = f"Unknown tool: {name}"
 
@@ -1962,6 +2017,10 @@ class PowerBIMCPServer:
 
             if result.success:
                 response += "SUCCESS: Column names properly updated. Report visuals should NOT break!\n"
+                response += "\nNext steps:\n"
+                response += "  1. Reopen the .pbip file in Power BI Desktop to see changes\n"
+                response += "  2. Verify the changes look correct\n"
+                response += "  3. Save as .pbix if you want to share the file\n"
 
             return response
 
@@ -2007,11 +2066,227 @@ class PowerBIMCPServer:
 
             if result.success:
                 response += "SUCCESS: Measure names properly updated. Report visuals should NOT break!\n"
+                response += "\nNext steps:\n"
+                response += "  1. Reopen the .pbip file in Power BI Desktop to see changes\n"
+                response += "  2. Verify the changes look correct\n"
+                response += "  3. Save as .pbix if you want to share the file\n"
 
             return response
 
         except Exception as e:
             logger.error(f"PBIP rename measures error: {e}")
+            return f"Error: {str(e)}"
+
+    async def _handle_pbip_fix_broken_visuals(self, args: Dict[str, Any]) -> str:
+        """Fix broken visual references after a table rename"""
+        try:
+            connector = self._get_pbip_connector()
+
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+
+            old_table_name = args.get("old_table_name")
+            new_table_name = args.get("new_table_name")
+
+            if not old_table_name or not new_table_name:
+                return "Error: 'old_table_name' and 'new_table_name' are required"
+
+            # Execute fix
+            fix_fn = lambda: connector.fix_broken_visual_references(old_table_name, new_table_name)
+            result = await asyncio.get_event_loop().run_in_executor(None, fix_fn)
+
+            # Build response
+            response = "=== Fix Broken Visual References ===\n\n"
+
+            response += f"Old table name: {old_table_name}\n"
+            response += f"New table name: {new_table_name}\n"
+            response += f"Report format: {result.get('format', 'Unknown')}\n\n"
+
+            if result.get("success"):
+                response += f"✅ SUCCESS: Fixed {result.get('references_fixed', 0)} references\n\n"
+
+                if result.get("files_modified"):
+                    response += "--- Files Modified ---\n"
+                    for f in result["files_modified"][:15]:
+                        response += f"  - {f}\n"
+                    if len(result["files_modified"]) > 15:
+                        response += f"  ... and {len(result['files_modified']) - 15} more\n"
+                    response += "\nNext step: Reopen the report in Power BI Desktop to see changes.\n"
+            else:
+                response += f"❌ No references found for '{old_table_name}'\n"
+                response += "\nPossible reasons:\n"
+                response += "  - The old table name doesn't exist in visuals\n"
+                response += "  - Visuals may already be updated\n"
+                response += "  - Try using 'pbip_scan_broken_refs' to diagnose\n"
+
+            return response
+
+        except Exception as e:
+            logger.error(f"PBIP fix broken visuals error: {e}")
+            return f"Error: {str(e)}"
+
+    async def _handle_pbip_fix_dax_quoting(self) -> str:
+        """Fix DAX expressions by properly quoting table names with spaces"""
+        try:
+            connector = self._get_pbip_connector()
+
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+
+            # Execute fix
+            fix_fn = lambda: connector.fix_all_dax_quoting()
+            result = await asyncio.get_event_loop().run_in_executor(None, fix_fn)
+
+            # Build response
+            response = "=== Fix DAX Table Name Quoting ===\n\n"
+
+            if result.get("count", 0) > 0:
+                response += f"✅ SUCCESS: Fixed {result['count']} unquoted table references\n\n"
+
+                if result.get("tables_fixed"):
+                    response += "--- Tables That Needed Quoting ---\n"
+                    for table in result["tables_fixed"]:
+                        response += f"  • {table} -> '{table}'\n"
+                    response += "\n"
+
+                if result.get("files_modified"):
+                    response += "--- Files Modified ---\n"
+                    for f in result["files_modified"][:10]:
+                        response += f"  - {f}\n"
+                    if len(result["files_modified"]) > 10:
+                        response += f"  ... and {len(result['files_modified']) - 10} more\n"
+                    response += "\nNext step: Reopen the report in Power BI Desktop to see changes.\n"
+            else:
+                response += "✅ No fixes needed - all table names are properly quoted.\n"
+
+            if result.get("errors"):
+                response += "\n--- Errors ---\n"
+                for err in result["errors"]:
+                    response += f"  ❌ {err['file']}: {err['error']}\n"
+
+            return response
+
+        except Exception as e:
+            logger.error(f"PBIP fix DAX quoting error: {e}")
+            return f"Error: {str(e)}"
+
+    async def _handle_pbip_scan_broken_refs(self) -> str:
+        """Scan for broken references in the PBIP project"""
+        try:
+            connector = self._get_pbip_connector()
+
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+
+            # Execute scan
+            scan_fn = lambda: connector.scan_broken_references()
+            result = await asyncio.get_event_loop().run_in_executor(None, scan_fn)
+
+            # Build response
+            response = "=== Scan for Broken References ===\n\n"
+
+            report_format = "PBIR-Enhanced" if connector.current_project.is_pbir_enhanced else "PBIR-Legacy"
+            response += f"Report format: {report_format}\n\n"
+
+            # Model tables
+            model_tables = result.get("model_tables", [])
+            response += f"--- Tables in Semantic Model ({len(model_tables)}) ---\n"
+            for t in sorted(model_tables)[:20]:
+                response += f"  • {t}\n"
+            if len(model_tables) > 20:
+                response += f"  ... and {len(model_tables) - 20} more\n"
+            response += "\n"
+
+            # Report tables
+            report_tables = result.get("report_tables", [])
+            response += f"--- Tables Referenced in Visuals ({len(report_tables)}) ---\n"
+            for t in sorted(report_tables)[:20]:
+                in_model = "✓" if t in model_tables else "✗ MISSING"
+                response += f"  • {t} [{in_model}]\n"
+            if len(report_tables) > 20:
+                response += f"  ... and {len(report_tables) - 20} more\n"
+            response += "\n"
+
+            # Broken references
+            broken = result.get("broken_references", [])
+            orphaned = result.get("orphaned_table_names", [])
+
+            if broken:
+                response += f"--- ❌ BROKEN REFERENCES ({len(broken)}) ---\n"
+                response += "These visuals reference tables that don't exist in the model:\n\n"
+
+                # Group by entity
+                by_entity = {}
+                for b in broken:
+                    entity = b["entity"]
+                    if entity not in by_entity:
+                        by_entity[entity] = []
+                    by_entity[entity].append(b)
+
+                for entity, refs in by_entity.items():
+                    response += f"  '{entity}' (missing) - {len(refs)} visual(s)\n"
+
+                response += "\n💡 FIX: Use 'pbip_fix_broken_visuals' with:\n"
+                for entity in orphaned:
+                    response += f"   old_table_name='{entity}', new_table_name='<correct_name>'\n"
+            else:
+                response += "✅ No broken references found! All visuals reference valid tables.\n"
+
+            return response
+
+        except Exception as e:
+            logger.error(f"PBIP scan broken refs error: {e}")
+            return f"Error: {str(e)}"
+
+    async def _handle_pbip_validate(self) -> str:
+        """Validate TMDL syntax in the loaded project"""
+        try:
+            connector = self._get_pbip_connector()
+
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+
+            # Execute validation
+            validate_fn = lambda: connector.validate_tmdl_syntax()
+            errors = await asyncio.get_event_loop().run_in_executor(None, validate_fn)
+
+            # Build response
+            response = "=== PBIP Validation Results ===\n\n"
+
+            report_format = "PBIR-Enhanced" if connector.current_project.is_pbir_enhanced else "PBIR-Legacy"
+            response += f"Report format: {report_format}\n"
+            response += f"TMDL files: {len(connector.current_project.tmdl_files)}\n"
+            response += f"Visual files: {len(connector.current_project.visual_json_files)}\n\n"
+
+            if errors:
+                response += f"❌ Found {len(errors)} validation error(s):\n\n"
+
+                # Group errors by type
+                by_type = {}
+                for err in errors:
+                    if err.error_type not in by_type:
+                        by_type[err.error_type] = []
+                    by_type[err.error_type].append(err)
+
+                for error_type, type_errors in by_type.items():
+                    response += f"--- {error_type} ({len(type_errors)}) ---\n"
+                    for err in type_errors[:5]:
+                        response += f"  Line {err.line_number}: {err.message}\n"
+                        if err.context:
+                            ctx = err.context[:60] + "..." if len(err.context) > 60 else err.context
+                            response += f"    Context: {ctx}\n"
+                    if len(type_errors) > 5:
+                        response += f"  ... and {len(type_errors) - 5} more\n"
+                    response += "\n"
+
+                response += "💡 FIX: Use 'pbip_fix_dax_quoting' to automatically fix quoting issues.\n"
+            else:
+                response += "✅ No validation errors found! TMDL syntax is valid.\n"
+
+            return response
+
+        except Exception as e:
+            logger.error(f"PBIP validate error: {e}")
             return f"Error: {str(e)}"
 
     async def run(self):
