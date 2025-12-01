@@ -113,6 +113,53 @@ def unquote_tmdl_name(name: str) -> str:
     return name
 
 
+def extract_mcode_blocks(content: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Extract M-Code/Power Query blocks from TMDL content and replace with placeholders.
+
+    M-Code blocks are inside partition definitions and should NEVER be modified
+    during rename operations. They contain source references that point to:
+    - External dataflows (entity="TableName")
+    - Other tables/queries in the model (Source = TableName)
+    - Power Query transformations
+
+    Format in TMDL:
+        partition PartitionName = m
+            mode: import
+            source =
+                let
+                    ...
+                in
+                    ...
+
+    Returns:
+        Tuple of (content_with_placeholders, {placeholder: original_mcode})
+    """
+    mcode_blocks = {}
+    placeholder_counter = [0]
+
+    def replace_mcode(match):
+        placeholder = f"__MCODE_BLOCK_{placeholder_counter[0]}__"
+        placeholder_counter[0] += 1
+        mcode_blocks[placeholder] = match.group(0)
+        return placeholder
+
+    # Pattern to match M-Code blocks: source = let ... in ... (multiline)
+    # Captures from "source =" through the "in" result line
+    mcode_pattern = r'(source\s*=\s*\n[\t ]*let\b[\s\S]*?\n[\t ]*in\s*\n[\t ]*[^\n]+)'
+
+    content_with_placeholders = re.sub(mcode_pattern, replace_mcode, content)
+
+    return content_with_placeholders, mcode_blocks
+
+
+def restore_mcode_blocks(content: str, mcode_blocks: Dict[str, str]) -> str:
+    """Restore M-Code blocks from placeholders (unchanged)"""
+    for placeholder, original in mcode_blocks.items():
+        content = content.replace(placeholder, original)
+    return content
+
+
 def fix_dax_table_references(dax_expression: str, table_names: List[str]) -> str:
     """
     Fix DAX expressions by quoting table names that have spaces or special chars.
@@ -1070,9 +1117,16 @@ class PowerBIPBIPConnector:
                 original_content = content
                 file_count = 0
 
+                # CRITICAL: Extract M-Code blocks BEFORE applying any patterns
+                # M-Code (Power Query) must NEVER be modified - it contains source references
+                content, mcode_blocks = extract_mcode_blocks(content)
+
                 for pattern, replacement, flags in patterns:
                     content, count = re.subn(pattern, replacement, content, flags=flags)
                     file_count += count
+
+                # Restore M-Code blocks AFTER patterns (completely unchanged)
+                content = restore_mcode_blocks(content, mcode_blocks)
 
                 if content != original_content:
                     with open(tmdl_file, 'w', encoding='utf-8') as f:
@@ -1143,9 +1197,16 @@ class PowerBIPBIPConnector:
                 original_content = content
                 file_count = 0
 
+                # CRITICAL: Extract M-Code blocks BEFORE applying any patterns
+                # M-Code (Power Query) must NEVER be modified
+                content, mcode_blocks = extract_mcode_blocks(content)
+
                 for pattern, replacement, flags in patterns:
                     content, count = re.subn(pattern, replacement, content, flags=flags)
                     file_count += count
+
+                # Restore M-Code blocks AFTER patterns (completely unchanged)
+                content = restore_mcode_blocks(content, mcode_blocks)
 
                 if content != original_content:
                     with open(tmdl_file, 'w', encoding='utf-8') as f:
@@ -1188,9 +1249,16 @@ class PowerBIPBIPConnector:
                 original_content = content
                 file_count = 0
 
+                # CRITICAL: Extract M-Code blocks BEFORE applying any patterns
+                # M-Code (Power Query) must NEVER be modified
+                content, mcode_blocks = extract_mcode_blocks(content)
+
                 for pattern, replacement, flags in patterns:
                     content, count = re.subn(pattern, replacement, content, flags=flags)
                     file_count += count
+
+                # Restore M-Code blocks AFTER patterns (completely unchanged)
+                content = restore_mcode_blocks(content, mcode_blocks)
 
                 if content != original_content:
                     with open(tmdl_file, 'w', encoding='utf-8') as f:
