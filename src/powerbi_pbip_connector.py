@@ -113,49 +113,56 @@ def unquote_tmdl_name(name: str) -> str:
     return name
 
 
-def extract_mcode_blocks(content: str) -> Tuple[str, Dict[str, str]]:
+def quote_mcode_name(name: str) -> str:
     """
-    Extract M-Code/Power Query blocks from TMDL content and replace with placeholders.
+    Quote a name for M-Code/Power Query if needed.
 
-    M-Code blocks are inside partition definitions and should NEVER be modified
-    during rename operations. They contain source references that point to:
-    - External dataflows (entity="TableName")
-    - Other tables/queries in the model (Source = TableName)
-    - Power Query transformations
+    M-Code uses #"..." format for names with spaces or special characters.
+    Names without spaces can be used directly.
 
-    Format in TMDL:
-        partition PartitionName = m
-            mode: import
-            source =
-                let
-                    ...
-                in
-                    ...
+    Examples:
+        - Salesforce_Data -> Salesforce_Data (no quotes needed)
+        - Leads Sales Data -> #"Leads Sales Data" (quotes required)
+    """
+    # Check if name needs quoting (has spaces or special chars)
+    if ' ' in name or any(c in name for c in '!"#$%&\'()*+,-./:;<=>?@[\\]^`{|}~'):
+        return f'#"{name}"'
+    return name
+
+
+def extract_external_refs(content: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Extract ONLY external dataflow references from M-Code and replace with placeholders.
+
+    External references like {[entity="TableName",version=""]} point to external
+    data sources and should NEVER be modified during renames.
+
+    Internal table references like Source = TableName SHOULD be modified.
 
     Returns:
-        Tuple of (content_with_placeholders, {placeholder: original_mcode})
+        Tuple of (content_with_placeholders, {placeholder: original_ref})
     """
-    mcode_blocks = {}
+    external_refs = {}
     placeholder_counter = [0]
 
-    def replace_mcode(match):
-        placeholder = f"__MCODE_BLOCK_{placeholder_counter[0]}__"
+    def replace_external(match):
+        placeholder = f"__EXTERNAL_REF_{placeholder_counter[0]}__"
         placeholder_counter[0] += 1
-        mcode_blocks[placeholder] = match.group(0)
+        external_refs[placeholder] = match.group(0)
         return placeholder
 
-    # Pattern to match M-Code blocks: source = let ... in ... (multiline)
-    # Captures from "source =" through the "in" result line
-    mcode_pattern = r'(source\s*=\s*\n[\t ]*let\b[\s\S]*?\n[\t ]*in\s*\n[\t ]*[^\n]+)'
+    # Pattern to match external dataflow references: {[entity="...",version="..."]}[Data]
+    # This captures the entire external source reference pattern
+    external_pattern = r'\{\[entity="[^"]+",version="[^"]*"\]\}\[Data\]'
 
-    content_with_placeholders = re.sub(mcode_pattern, replace_mcode, content)
+    content_with_placeholders = re.sub(external_pattern, replace_external, content)
 
-    return content_with_placeholders, mcode_blocks
+    return content_with_placeholders, external_refs
 
 
-def restore_mcode_blocks(content: str, mcode_blocks: Dict[str, str]) -> str:
-    """Restore M-Code blocks from placeholders (unchanged)"""
-    for placeholder, original in mcode_blocks.items():
+def restore_external_refs(content: str, external_refs: Dict[str, str]) -> str:
+    """Restore external dataflow references from placeholders (unchanged)"""
+    for placeholder, original in external_refs.items():
         content = content.replace(placeholder, original)
     return content
 
@@ -1106,6 +1113,37 @@ class PowerBIPBIPConnector:
             0
         ))
 
+        # Pattern 12: M-Code internal table references
+        # These are references to other tables in the same model within Power Query
+        # Format: VariableName = TableName, (inside let ... in blocks)
+        # Uses #"..." quoting for names with spaces
+        new_name_mcode = quote_mcode_name(new_name)
+
+        # = OldName, (assignment with comma - most common in let blocks)
+        patterns.append((
+            rf'(=\s*){old_name_escaped}(\s*,)',
+            rf'\1{new_name_mcode}\2',
+            0
+        ))
+        # = #"OldName", (quoted assignment with comma)
+        patterns.append((
+            rf'(=\s*)#"{old_name_escaped}"(\s*,)',
+            rf'\1{new_name_mcode}\2',
+            0
+        ))
+        # = OldName at end of line (no comma - last line in let block or simple query)
+        patterns.append((
+            rf'(=\s*){old_name_escaped}(\s*)$',
+            rf'\1{new_name_mcode}\2',
+            re.MULTILINE
+        ))
+        # = #"OldName" at end of line
+        patterns.append((
+            rf'(=\s*)#"{old_name_escaped}"(\s*)$',
+            rf'\1{new_name_mcode}\2',
+            re.MULTILINE
+        ))
+
         for tmdl_file in self.current_project.tmdl_files:
             try:
                 # Cache original content for rollback
@@ -1117,16 +1155,17 @@ class PowerBIPBIPConnector:
                 original_content = content
                 file_count = 0
 
-                # CRITICAL: Extract M-Code blocks BEFORE applying any patterns
-                # M-Code (Power Query) must NEVER be modified - it contains source references
-                content, mcode_blocks = extract_mcode_blocks(content)
+                # CRITICAL: Extract ONLY external dataflow references
+                # External refs like {[entity="...",version=""]}[Data] must NEVER change
+                # Internal table refs like Source = TableName SHOULD change
+                content, external_refs = extract_external_refs(content)
 
                 for pattern, replacement, flags in patterns:
                     content, count = re.subn(pattern, replacement, content, flags=flags)
                     file_count += count
 
-                # Restore M-Code blocks AFTER patterns (completely unchanged)
-                content = restore_mcode_blocks(content, mcode_blocks)
+                # Restore external references (unchanged)
+                content = restore_external_refs(content, external_refs)
 
                 if content != original_content:
                     with open(tmdl_file, 'w', encoding='utf-8') as f:
@@ -1197,16 +1236,11 @@ class PowerBIPBIPConnector:
                 original_content = content
                 file_count = 0
 
-                # CRITICAL: Extract M-Code blocks BEFORE applying any patterns
-                # M-Code (Power Query) must NEVER be modified
-                content, mcode_blocks = extract_mcode_blocks(content)
-
+                # Column rename patterns are specific to DAX/TMDL syntax
+                # They won't accidentally match M-Code patterns
                 for pattern, replacement, flags in patterns:
                     content, count = re.subn(pattern, replacement, content, flags=flags)
                     file_count += count
-
-                # Restore M-Code blocks AFTER patterns (completely unchanged)
-                content = restore_mcode_blocks(content, mcode_blocks)
 
                 if content != original_content:
                     with open(tmdl_file, 'w', encoding='utf-8') as f:
@@ -1249,16 +1283,11 @@ class PowerBIPBIPConnector:
                 original_content = content
                 file_count = 0
 
-                # CRITICAL: Extract M-Code blocks BEFORE applying any patterns
-                # M-Code (Power Query) must NEVER be modified
-                content, mcode_blocks = extract_mcode_blocks(content)
-
+                # Measure rename patterns are specific to DAX/TMDL syntax
+                # They won't accidentally match M-Code patterns
                 for pattern, replacement, flags in patterns:
                     content, count = re.subn(pattern, replacement, content, flags=flags)
                     file_count += count
-
-                # Restore M-Code blocks AFTER patterns (completely unchanged)
-                content = restore_mcode_blocks(content, mcode_blocks)
 
                 if content != original_content:
                     with open(tmdl_file, 'w', encoding='utf-8') as f:
