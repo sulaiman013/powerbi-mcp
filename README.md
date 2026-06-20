@@ -9,7 +9,7 @@
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10+-green?style=flat-square" alt="Python 3.10+"></a>
   <a href="#"><img src="https://img.shields.io/badge/Platform-Windows-lightgrey?style=flat-square" alt="Windows"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT License"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-34-purple?style=flat-square" alt="34 Tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-45-purple?style=flat-square" alt="45 Tools"></a>
 </p>
 
 <p align="center">
@@ -36,6 +36,41 @@ Power BI MCP Server bridges the gap between AI assistants and Microsoft Power BI
 | **Security First** | PII detection, audit logging, and configurable access policies |
 | **RLS Testing** | Test Row-Level Security roles during development |
 | **Safe Refactoring** | PBIP-based editing preserves report visual integrity |
+| **DAX Safety Loop** | Validate DAX before committing; impact analysis; atomic transactions |
+| **Model Quality** | Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage analysis |
+| **Modern MCP** | Tool annotations, structured output, resources, prompts, and completion |
+
+---
+
+## What's New: 2026 Agentic Enhancements
+
+Microsoft now ships official Power BI MCP servers. This project leans into what they
+**don't** do and modernizes the whole surface:
+
+- **DAX safety loop** - `validate_dax` checks a query/measure against the live model
+  before anything is written; `create_measure` / `batch_update_measures` validate
+  automatically; `scan_measure_dependencies` (INFO.CALCDEPENDENCY) shows impact
+  before a change.
+- **Atomic transactions** - `tom_begin_transaction` / `tom_commit_transaction` /
+  `tom_rollback_transaction` make bulk model edits all-or-nothing.
+- **Model quality + performance** - `run_bpa` (Best Practice Analyzer),
+  `audit_ai_readiness` (Copilot/agent-readiness score), `analyze_model_storage`
+  (VertiPaq-style), and `analyze_query_performance`.
+- **Relationship management** - `create_relationship` / `delete_relationship`.
+- **Hardened safe rename** - the PBIP rename cascade is now transactional (auto
+  rollback on failure) with atomic, BOM/CRLF-faithful writes.
+- **Real governance** - column-level access policies now actually enforce at runtime
+  (BLOCK / MASK / HASH / REDACT), and secrets are redacted from logs and errors.
+- **First-class MCP** - every tool carries safety annotations
+  (`readOnlyHint` / `destructiveHint`); key tools return typed structured output;
+  the server exposes **resources** (`powerbi://...`), **prompts**, and **completion**.
+
+**Positioning vs Microsoft's official Power BI MCP:** the official *remote* server is
+best for cloud chat-with-data and the official *local modeling* MCP for raw model
+authoring. This server is complementary: it adds **report-layer-aware safe renames**
+(which the official local MCP explicitly cannot do), a **governance/PII layer**, **RLS
+testing**, model-quality tooling, and an **offline PBIP-first** workflow that needs no
+Fabric capacity. See [AGENTS.md](AGENTS.md) for the agent playbook.
 
 ---
 
@@ -151,7 +186,7 @@ We built a dedicated **PBIP Connector** that:
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                    Power BI MCP Server                       │
-│                        (34 Tools)                            │
+│                  (45 Tools + Resources/Prompts)              │
 ├──────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
 │  │  Security   │  │   Audit     │  │   Access Policies   │  │
@@ -256,6 +291,43 @@ We built a dedicated **PBIP Connector** that:
 
 > **Note:** DAX quoting and visual updates are now **automatically handled** by `pbip_rename_tables`. The repair tools are only needed when renames were done outside of PBIP (e.g., via TOM API or Power BI Desktop).
 
+### DAX Safety Loop & Transactions (5 tools) ✅ NEW
+
+| Tool | Description |
+|------|-------------|
+| `validate_dax` | Validate a DAX query or scalar measure expression against the live model **without committing** |
+| `scan_measure_dependencies` | Upstream/downstream impact analysis via `INFO.CALCDEPENDENCY` before renaming/deleting |
+| `tom_begin_transaction` | Start an atomic write transaction (defers saves) |
+| `tom_commit_transaction` | Commit all pending model edits |
+| `tom_rollback_transaction` | Roll back all pending model edits |
+
+> `create_measure` and `batch_update_measures` now **validate expressions before committing** and **honor open transactions**.
+
+### Model Quality & Performance (4 tools) ✅ NEW
+
+| Tool | Description |
+|------|-------------|
+| `run_bpa` | Best Practice Analyzer (Performance / DAX / Naming / Formatting / Maintenance / Error-Prevention) with severity and fix hints |
+| `audit_ai_readiness` | Score Copilot/agent-readiness (description & format coverage) 0-100 with recommendations |
+| `analyze_model_storage` | VertiPaq-style per-table row counts (exact) + sizes, ranked |
+| `analyze_query_performance` | Time a DAX query and return optimization hints |
+
+### Relationship Management (2 tools) ✅ NEW
+
+| Tool | Description |
+|------|-------------|
+| `create_relationship` | Create a relationship (cardinality + cross-filter), transaction-aware |
+| `delete_relationship` | Delete a relationship by name or by from/to table[/column] |
+
+### MCP Resources, Prompts & Completion ✅ NEW
+
+Beyond tools, the server is a first-class MCP citizen:
+
+- **Resources:** `powerbi://desktop/schema`, `.../measures`, `.../bpa`, `.../ai-readiness`, and the template `powerbi://cloud/{workspace}/{dataset}/schema` - attach model context without spending a tool call.
+- **Prompts:** `optimize_measure`, `explain_measure`, `audit_model`, `document_model`, `plan_safe_rename` - ready-made, tool-orchestrated playbooks.
+- **Completion:** grounds prompt/template arguments in real table/measure names from the connected model.
+- **Tool annotations + structured output:** every tool declares `readOnlyHint`/`destructiveHint`; `validate_dax`, `run_bpa`, and `audit_ai_readiness` return typed `structuredContent` for chainable workflows.
+
 ---
 
 ## Security Features
@@ -338,9 +410,9 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
   "mcpServers": {
     "powerbi": {
       "command": "python",
-      "args": ["C:/path/to/powerbi-mcp-v2/src/server.py"],
+      "args": ["C:/path/to/powerbi-mcp/src/server.py"],
       "env": {
-        "PYTHONPATH": "C:/path/to/powerbi-mcp-v2/src"
+        "PYTHONPATH": "C:/path/to/powerbi-mcp/src"
       }
     }
   }
@@ -348,6 +420,19 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 ```
 
 Restart Claude Desktop to activate.
+
+### Run with Docker (cross-platform, offline subset)
+
+The Docker image runs the platform-independent tools (PBIP/TMDL/PBIR editing, Best
+Practice Analyzer, AI-readiness, model analysis, security, resources/prompts) on any
+OS with no .NET. Live Power BI Desktop / XMLA / TOM connectivity still requires
+Windows + ADOMD.NET.
+
+```bash
+docker build -t powerbi-mcp .
+# stdio MCP server; mount your PBIP project at /work
+docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
+```
 
 ---
 
@@ -413,23 +498,25 @@ User: "Clear RLS role"
 ## Project Structure
 
 ```
-powerbi-mcp-v2/
+powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server (30 tools)
+│   ├── server.py                    # MCP server (45 tools + resources/prompts/completion)
 │   ├── powerbi_desktop_connector.py # Desktop + RLS
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
 │   ├── powerbi_rest_connector.py    # REST API
-│   ├── powerbi_tom_connector.py     # TOM write operations
-│   ├── powerbi_pbip_connector.py    # PBIP file editing
+│   ├── powerbi_tom_connector.py     # TOM write operations + relationships
+│   ├── powerbi_pbip_connector.py    # PBIP file editing (transactional)
+│   ├── model_analysis.py            # BPA + AI-readiness engine (pure Python)
 │   └── security/
 │       ├── pii_detector.py          # PII detection
 │       ├── audit_logger.py          # Audit logging
-│       ├── access_policy.py         # Policy engine
+│       ├── access_policy.py         # Policy engine (enforced)
 │       └── security_layer.py        # Unified security
 ├── config/
 │   └── policies.yaml                # Access policies
-├── logs/
-│   └── audit.log                    # Query audit log
+├── test_*.py                        # Assert-based tests (run without Power BI)
+├── AGENTS.md / CLAUDE.md            # Agent guidance
+├── Dockerfile / requirements-core.txt  # Cross-platform offline image
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -441,9 +528,10 @@ powerbi-mcp-v2/
 
 | Limitation | Workaround |
 |------------|------------|
-| Windows only | Required for ADOMD.NET and Power BI Desktop |
-| TOM renames break visuals | Use PBIP tools for safe bulk renames |
-| Cloud requires Premium | XMLA endpoints need PPU/Premium workspace |
+| Live connectivity is Windows only | ADOMD.NET / TOM require Windows. The **offline subset** (PBIP editing, BPA, AI-readiness, analysis, security) runs cross-platform via Docker. |
+| TOM renames break visuals | Use the PBIP tools for safe bulk renames (they update the report layer too) |
+| Cloud requires Premium | XMLA endpoints need a PPU/Premium workspace |
+| Deep server timings | `analyze_query_performance` gives duration + hints; use DAX Studio for storage-engine vs formula-engine breakdown |
 
 ---
 
@@ -457,15 +545,22 @@ powerbi-mcp-v2/
 - [x] TOM write operations
 - [x] PBIP safe editing
 
-### Planned (V3)
-- [ ] **Open Source LLM Support** - Integration with Ollama, LM Studio, and other local LLMs
-- [ ] **Air-Gapped Deployment** - Full offline capability for secure enterprise environments
-- [ ] **Docker Containerization** - One-command deployment with `docker-compose`
-- [ ] **Self-Hosted Architecture** - Run entirely on-premise without external dependencies
-- [ ] Relationship management (create/delete)
-- [ ] VertiPaq Analyzer integration
-- [ ] Auto-generated model documentation
-- [ ] Cross-platform support exploration
+### Completed (V3 - 2026 agentic enhancements)
+- [x] DAX validate-before-commit loop + impact analysis
+- [x] Atomic TOM transactions (begin/commit/rollback)
+- [x] Best Practice Analyzer + AI-readiness scoring
+- [x] VertiPaq-style storage + query performance analysis
+- [x] Relationship management (create/delete)
+- [x] Transactional, atomic, encoding-faithful PBIP renames
+- [x] Enforced column-level access policies + secret redaction
+- [x] Modern MCP surface (annotations, structured output, resources, prompts, completion)
+- [x] Docker image for the cross-platform offline subset
+
+### Planned (V4)
+- [ ] Remote HTTP transport with Microsoft Entra OAuth (today: use the official remote Power BI MCP server for cloud auth)
+- [ ] Open-source / local LLM integration (Ollama, LM Studio)
+- [ ] BPA auto-fix and custom team rule packs (YAML)
+- [ ] Deeper VertiPaq (per-column cardinality) and server-timings capture
 
 ---
 
