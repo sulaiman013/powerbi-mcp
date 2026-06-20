@@ -80,8 +80,9 @@ from powerbi_desktop_connector import PowerBIDesktopConnector
 from powerbi_tom_connector import PowerBITOMConnector
 from powerbi_pbip_connector import PowerBIPBIPConnector
 
-# Pure-Python model analysis (BPA + AI-readiness)
+# Pure-Python model analysis (BPA + AI-readiness) and refresh diagnostics
 import model_analysis
+import refresh_diagnostics
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -123,6 +124,14 @@ class PowerBIMCPServer:
         self._tool_dispatch = self._build_tool_dispatch()
         self._tool_annotations = self._build_tool_annotations()
         self._prompts = self._build_prompts()
+
+        # Read-only / lockdown mode: when POWERBI_MCP_READONLY=true, every write tool is
+        # refused. Write tools = destructive ops plus the non-destructive creates/commit.
+        self._read_only = os.getenv("POWERBI_MCP_READONLY", "false").lower() == "true"
+        self._write_tools = (
+            {n for n, a in self._tool_annotations.items() if a.destructiveHint}
+            | {"create_measure", "create_relationship", "tom_commit_transaction"}
+        )
 
         self._setup_handlers()
 
@@ -1180,6 +1189,12 @@ class PowerBIMCPServer:
                 if handler is None:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
+                if self._read_only and name in self._write_tools:
+                    return [TextContent(type="text", text=(
+                        f"Refused: '{name}' is a write operation and the server is running in "
+                        "READ-ONLY mode. Unset POWERBI_MCP_READONLY to allow model/report changes."
+                    ))]
+
                 result = await handler(args)
                 # Handlers return either a plain string (text only) or a
                 # (text, structured_dict) tuple for tools that declare an outputSchema.
@@ -1213,6 +1228,14 @@ class PowerBIMCPServer:
                 Resource(uri="powerbi://desktop/ai-readiness", name="desktop_ai_readiness",
                          title="AI-readiness report",
                          description="AI-readiness score and metrics for the connected Desktop model",
+                         mimeType="application/json"),
+                Resource(uri="powerbi://reference/bpa-rules", name="bpa_rules",
+                         title="Best Practice Analyzer rules",
+                         description="The built-in BPA rule catalog (id, category, severity, name)",
+                         mimeType="application/json"),
+                Resource(uri="powerbi://reference/refresh-errors", name="refresh_errors",
+                         title="Refresh error remediation map",
+                         description="Known refresh failure causes and their fixes (used by refresh_doctor)",
                          mimeType="application/json"),
             ]
 
@@ -3011,6 +3034,19 @@ class PowerBIMCPServer:
             parts = [unquote(p) for p in rest.split("/") if p != ""]
             if not parts:
                 return json.dumps({"error": f"unrecognized resource uri: {uri}"})
+
+            if parts[0] == "reference":
+                what = parts[1] if len(parts) > 1 else ""
+                if what == "bpa-rules":
+                    rules = [{"id": r["id"], "category": r["category"], "severity": r["severity"], "name": r["name"]}
+                             for r in model_analysis.DEFAULT_BPA_RULES]
+                    return json.dumps(rules, indent=2)
+                if what == "refresh-errors":
+                    return json.dumps({
+                        "consecutive_failure_disable_threshold": refresh_diagnostics.CONSECUTIVE_FAILURE_DISABLE_THRESHOLD,
+                        "rules": refresh_diagnostics.REFRESH_ERROR_RULES,
+                    }, indent=2)
+                return json.dumps({"error": f"unknown reference resource '{what}'"})
 
             if parts[0] == "desktop":
                 kind = parts[1] if len(parts) > 1 else "schema"
