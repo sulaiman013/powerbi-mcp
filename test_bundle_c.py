@@ -67,7 +67,7 @@ def test_resources():
 def test_prompts():
     print("\n== prompts ==")
     srv = make_server()
-    check("5 prompts registered", len(srv._prompts) == 5, str(list(srv._prompts)))
+    check("prompts registered", len(srv._prompts) >= 5 and "plan_safe_rename" in srv._prompts, str(list(srv._prompts)))
     rendered = srv._prompts["plan_safe_rename"]["render"]({"old_name": "OldT", "new_name": "NewT"})
     check("rename prompt includes names", "OldT" in rendered and "NewT" in rendered)
     check("rename prompt steers to PBIP", "pbip_rename" in rendered.lower() and "deprecated" in rendered.lower())

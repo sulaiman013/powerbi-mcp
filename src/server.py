@@ -175,6 +175,19 @@ class PowerBIMCPServer:
                     "relationships, and any best-practice issues from run_bpa."
                 ),
             },
+            "pre_deploy_review": {
+                "title": "Pre-deploy quality gate",
+                "description": "Run a full quality gate before shipping a model/report",
+                "arguments": [],
+                "render": lambda a: (
+                    "Run a pre-deployment quality gate on the connected model and report the verdict:\n"
+                    "1) run_bpa (fail the gate on any error-severity findings).\n"
+                    "2) audit_ai_readiness (warn if score < 70).\n"
+                    "3) export_data_dictionary (so docs ship with the release).\n"
+                    "4) If a .pbip project is loaded: pbip_validate + pbip_scan_broken_refs.\n"
+                    "Summarize PASS/FAIL with the blocking issues and a remediation checklist."
+                ),
+            },
             "plan_safe_rename": {
                 "title": "Plan a safe rename",
                 "description": "Plan a rename that won't break visuals or downstream measures",
@@ -249,6 +262,7 @@ class PowerBIMCPServer:
             "audit_ai_readiness": lambda a: self._handle_audit_ai_readiness(a),
             "analyze_model_storage": lambda a: self._handle_analyze_model_storage(a),
             "analyze_query_performance": lambda a: self._handle_analyze_query_performance(a),
+            "export_data_dictionary": lambda a: self._handle_export_data_dictionary(a),
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
@@ -322,6 +336,7 @@ class PowerBIMCPServer:
             "audit_ai_readiness": local_read,
             "analyze_model_storage": local_read,
             "analyze_query_performance": local_read,
+            "export_data_dictionary": ann(False, destructive=False, idempotent=True, open_world=False),
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
@@ -1059,6 +1074,22 @@ class PowerBIMCPServer:
                             "to_table": {"type": "string"},
                             "to_column": {"type": "string"},
                             "name": {"type": "string", "description": "Relationship name (alternative to from/to)"}
+                        },
+                        "required": []
+                    }
+                ),
+                # === DOCUMENTATION (Wave 1) ===
+                Tool(
+                    name="export_data_dictionary",
+                    description="Generate a portable data dictionary (tables, columns, measures with DAX, relationships) for the connected model, with a documentation-coverage score. Returns Markdown or HTML; optionally writes to a file. Re-runnable in CI so docs never go stale.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "format": {"type": "string", "enum": ["markdown", "html"], "default": "markdown"},
+                            "output_path": {"type": "string", "description": "Optional file path to write the dictionary to; if omitted, the content is returned"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
                         },
                         "required": []
                     }
@@ -2792,6 +2823,37 @@ class PowerBIMCPServer:
             return out
         except Exception as e:
             return f"Error analyzing query performance: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_export_data_dictionary(self, args: Dict[str, Any]) -> str:
+        """Generate a portable data dictionary (Markdown/HTML) with a documentation-coverage score."""
+        try:
+            source = args.get("source") or "desktop"
+            model, err = await self._gather_model_metadata(
+                source, args.get("workspace_name"), args.get("dataset_name")
+            )
+            if err:
+                return f"Error: {err}"
+            fmt = (args.get("format") or "markdown").lower()
+            doc = model_analysis.render_data_dictionary(model, fmt=fmt)
+
+            # Live INFO.VIEW can blank measure expressions for non-admin/live connections.
+            note = ""
+            if source.lower() != "cloud":
+                note = ("\n\n(Note: over a live Desktop connection, measure expressions read via "
+                        "INFO.VIEW can be blank for non-admin users. For guaranteed expressions, "
+                        "generate from a loaded PBIP/TMDL project or connect with model-admin rights.)")
+
+            output_path = args.get("output_path")
+            if output_path:
+                try:
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        f.write(doc)
+                    return f"Data dictionary ({fmt}) written to {output_path} ({len(doc)} chars).{note}"
+                except Exception as e:
+                    return f"Error writing to {output_path}: {redact_secrets(str(e), [self.client_secret])}"
+            return doc + note
+        except Exception as e:
+            return f"Error exporting data dictionary: {redact_secrets(str(e), [self.client_secret])}"
 
     # ==================== MCP RESOURCES & COMPLETION (Bundle C) ====================
 
