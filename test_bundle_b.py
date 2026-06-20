@@ -59,18 +59,20 @@ def run(coro):
 
 def test_run_bpa():
     print("\n== run_bpa (wired) ==")
-    out = run(make_server()._handle_run_bpa({}))
+    out, structured = run(make_server()._handle_run_bpa({}))
     check("header present", "Best Practice Analyzer" in out, out[:60])
     check("float column found", "Sales[Amount]" in out and "float" in out.lower())
     check("no-format measure found", "Sales[Total]" in out)
     check("rel type mismatch found", "different data types" in out.lower())
+    check("structured findings present", isinstance(structured.get("findings"), list) and structured["findings"], "no structured findings")
 
 
 def test_ai_readiness():
     print("\n== audit_ai_readiness (wired) ==")
-    out = run(make_server()._handle_audit_ai_readiness({}))
+    out, structured = run(make_server()._handle_audit_ai_readiness({}))
     check("score present", "Score:" in out and "Grade" in out, out[:60])
     check("metrics present", "Measures with descriptions" in out)
+    check("structured score present", isinstance(structured.get("score"), (int, float)), str(structured)[:60])
 
 
 def test_storage():
