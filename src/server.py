@@ -74,6 +74,9 @@ from powerbi_desktop_connector import PowerBIDesktopConnector
 from powerbi_tom_connector import PowerBITOMConnector
 from powerbi_pbip_connector import PowerBIPBIPConnector
 
+# Pure-Python model analysis (BPA + AI-readiness)
+import model_analysis
+
 # Import security layer
 from security import SecurityLayer, get_security_layer
 from security.access_policy import AccessPolicyEngine
@@ -168,6 +171,11 @@ class PowerBIMCPServer:
             "tom_begin_transaction": lambda a: self._handle_tom_begin_transaction(),
             "tom_commit_transaction": lambda a: self._handle_tom_commit_transaction(),
             "tom_rollback_transaction": lambda a: self._handle_tom_rollback_transaction(),
+            # Model quality & performance (Bundle B)
+            "run_bpa": lambda a: self._handle_run_bpa(a),
+            "audit_ai_readiness": lambda a: self._handle_audit_ai_readiness(a),
+            "analyze_model_storage": lambda a: self._handle_analyze_model_storage(a),
+            "analyze_query_performance": lambda a: self._handle_analyze_query_performance(a),
         }
 
     def _build_tool_annotations(self):
@@ -233,6 +241,11 @@ class PowerBIMCPServer:
             "tom_begin_transaction": ann(False, destructive=False, idempotent=False),
             "tom_commit_transaction": ann(False, destructive=False, idempotent=False),
             "tom_rollback_transaction": ann(False, destructive=False, idempotent=True),
+            # Model quality & performance (Bundle B) - all read-only analysis
+            "run_bpa": local_read,
+            "audit_ai_readiness": local_read,
+            "analyze_model_storage": local_read,
+            "analyze_query_performance": local_read,
         }
 
     def _setup_handlers(self):
@@ -857,6 +870,62 @@ class PowerBIMCPServer:
                     name="tom_rollback_transaction",
                     description="Roll back (UndoLocalChanges) all pending TOM model edits made since tom_begin_transaction and close the transaction.",
                     inputSchema={"type": "object", "properties": {}, "required": []}
+                ),
+                # === MODEL QUALITY & PERFORMANCE (Bundle B) ===
+                Tool(
+                    name="run_bpa",
+                    description="Run a Best Practice Analyzer over the connected semantic model (performance, DAX, naming, formatting, maintenance, error-prevention rules). Returns findings with severity, the offending object, and a fix hint.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "categories": {"type": "array", "items": {"type": "string"}, "description": "Optional category filter, e.g. ['Performance','DAX','Naming','Formatting','Maintenance','Error Prevention']"},
+                            "min_severity": {"type": "string", "enum": ["info", "warning", "error"], "default": "info", "description": "Only return findings at or above this severity"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="audit_ai_readiness",
+                    description="Score how AI-ready (Copilot/agent-ready) the model is: coverage of descriptions and format strings on measures, columns, and tables. Returns a 0-100 score, metrics, and concrete recommendations.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="analyze_model_storage",
+                    description="VertiPaq-style storage analysis: per-table row counts (exact via DAX COUNTROWS), column counts, and best-effort sizes, ranked to find the biggest/most expensive tables for optimization.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="analyze_query_performance",
+                    description="Execute a DAX query and report duration, row count, and heuristic optimization hints. For storage-engine vs formula-engine server timings use DAX Studio.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "dax": {"type": "string", "description": "The DAX query to time"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": ["dax"]
+                    }
                 )
             ]
             # Attach MCP safety/behavior hints from the annotations registry.
@@ -2220,6 +2289,249 @@ class PowerBIMCPServer:
         if getattr(result, "success", False):
             return f"Transaction rolled back. {getattr(result, 'message', '')}".strip()
         return f"Rollback failed: {getattr(result, 'message', 'unknown error')}"
+
+    # ==================== MODEL ANALYSIS (Bundle B) ====================
+
+    async def _get_query_runner(self, source: str, workspace=None, dataset=None):
+        """Return (run, error): a synchronous DAX executor for the chosen source.
+
+        run(query_str) -> list[dict]. Used by analysis tools that issue INFO/DMV/DAX queries.
+        """
+        loop = asyncio.get_event_loop()
+        if (source or "desktop").lower() == "cloud":
+            if not (workspace and dataset):
+                return None, "workspace_name and dataset_name are required for cloud"
+            connector = await loop.run_in_executor(None, self._get_xmla_connector, workspace, dataset)
+            if not connector:
+                return None, f"could not connect to dataset '{dataset}'"
+            return (lambda q: connector.execute_dax(q)), None
+        desktop = self._get_desktop_connector()
+        if not desktop.current_port:
+            return None, "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+        return (lambda q: desktop.execute_dax(q, 100000)), None
+
+    async def _gather_model_metadata(self, source: str, workspace=None, dataset=None):
+        """Build a normalized model dict (for BPA / AI-readiness) via INFO.VIEW.* DAX.
+
+        Returns (model_dict, error).
+        """
+        run, err = await self._get_query_runner(source, workspace, dataset)
+        if err:
+            return None, err
+        loop = asyncio.get_event_loop()
+        g = self._row_get
+
+        async def q(query):
+            return await loop.run_in_executor(None, run, query)
+
+        try:
+            tables_rows = await q("EVALUATE INFO.VIEW.TABLES()")
+            cols_rows = await q("EVALUATE INFO.VIEW.COLUMNS()")
+            meas_rows = await q("EVALUATE INFO.VIEW.MEASURES()")
+        except Exception as e:
+            return None, (f"could not read model metadata via INFO.VIEW: {e}. "
+                          "INFO.VIEW.* requires a recent Analysis Services engine.")
+        try:
+            rel_rows = await q("EVALUATE INFO.VIEW.RELATIONSHIPS()")
+        except Exception:
+            rel_rows = []
+
+        tmap: Dict[str, Any] = {}
+        for r in tables_rows:
+            nm = g(r, "Name")
+            if nm is None:
+                continue
+            tmap[nm] = {"name": nm, "is_hidden": g(r, "IsHidden"),
+                        "description": g(r, "Description") or "", "columns": [], "measures": []}
+        for r in cols_rows:
+            tn = g(r, "Table")
+            tmap.setdefault(tn, {"name": tn, "is_hidden": False, "description": "", "columns": [], "measures": []})
+            ctype = str(g(r, "ColumnType") or "").lower()
+            tmap[tn]["columns"].append({
+                "name": g(r, "Name"), "table": tn, "data_type": g(r, "DataType"),
+                "is_hidden": g(r, "IsHidden"), "is_key": g(r, "IsKey"),
+                "summarize_by": g(r, "SummarizeBy"), "sort_by": g(r, "SortByColumn"),
+                "description": g(r, "Description") or "", "display_folder": g(r, "DisplayFolder"),
+                "data_category": g(r, "DataCategory"), "is_calculated": ctype == "calculated",
+                "expression": g(r, "Expression"),
+            })
+        for r in meas_rows:
+            tn = g(r, "Table")
+            tmap.setdefault(tn, {"name": tn, "is_hidden": False, "description": "", "columns": [], "measures": []})
+            tmap[tn]["measures"].append({
+                "name": g(r, "Name"), "table": tn, "expression": g(r, "Expression"),
+                "format_string": g(r, "FormatString"), "description": g(r, "Description") or "",
+                "display_folder": g(r, "DisplayFolder"), "is_hidden": g(r, "IsHidden"),
+                "data_type": g(r, "DataType"),
+            })
+        rels = []
+        for r in rel_rows:
+            rels.append({
+                "from_table": g(r, "FromTable"), "from_column": g(r, "FromColumn"),
+                "to_table": g(r, "ToTable"), "to_column": g(r, "ToColumn"),
+                "is_active": g(r, "IsActive"),
+                "cross_filter": g(r, "CrossFilteringBehavior", "CrossFilterDirection"),
+                "from_cardinality": g(r, "FromCardinality"), "to_cardinality": g(r, "ToCardinality"),
+            })
+        return {"tables": list(tmap.values()), "relationships": rels}, None
+
+    async def _handle_run_bpa(self, args: Dict[str, Any]) -> str:
+        """Run the Best Practice Analyzer over the connected model."""
+        try:
+            model, err = await self._gather_model_metadata(
+                args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name")
+            )
+            if err:
+                return f"Error: {err}"
+            result = model_analysis.run_bpa(
+                model, categories=args.get("categories"),
+                min_severity=(args.get("min_severity") or "info"),
+            )
+            s = result["summary"]
+            out = "=== Best Practice Analyzer ===\n\n"
+            out += f"Findings: {s['total']}  (errors: {s['by_severity'].get('error', 0)}, "
+            out += f"warnings: {s['by_severity'].get('warning', 0)}, info: {s['by_severity'].get('info', 0)})\n"
+            if s["by_category"]:
+                out += "By category: " + ", ".join(f"{k}={v}" for k, v in s["by_category"].items()) + "\n"
+            out += "\n"
+            current_rule = None
+            for f in result["findings"][:200]:
+                if f["rule_id"] != current_rule:
+                    current_rule = f["rule_id"]
+                    out += f"--- [{f['severity'].upper()}] {f['name']} ({f['category']}) ---\n"
+                out += f"  - {f['object']}: {f['detail']}\n"
+            if s["total"] > 200:
+                out += f"\n... and {s['total'] - 200} more findings (filter by category or min_severity).\n"
+            if s["total"] == 0:
+                out += "No issues found for the selected rules.\n"
+            return out
+        except Exception as e:
+            return f"Error running BPA: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_audit_ai_readiness(self, args: Dict[str, Any]) -> str:
+        """Score how AI-ready (Copilot/agent-ready) the connected model is."""
+        try:
+            model, err = await self._gather_model_metadata(
+                args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name")
+            )
+            if err:
+                return f"Error: {err}"
+            r = model_analysis.audit_ai_readiness(model)
+            m = r["metrics"]
+            out = "=== AI-Readiness Audit ===\n\n"
+            out += f"Score: {r['score']}/100  (Grade {r['grade']})\n\n"
+            out += "--- Metrics ---\n"
+            out += f"  Measures with descriptions: {m['measures_with_description_pct']}% of {m['measures_total']}\n"
+            out += f"  Measures with format string: {m['measures_with_format_pct']}%\n"
+            out += f"  Visible columns with descriptions: {m['columns_with_description_pct']}% of {m['visible_columns_total']}\n"
+            out += f"  Tables with descriptions: {m['tables_with_description_pct']}% of {m['tables_total']}\n\n"
+            out += "--- Recommendations ---\n"
+            for rec in r["recommendations"]:
+                out += f"  - {rec}\n"
+            return out
+        except Exception as e:
+            return f"Error auditing AI-readiness: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
+        """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus
+        best-effort sizes, to find the biggest/most expensive tables."""
+        try:
+            source = args.get("source") or "desktop"
+            run, err = await self._get_query_runner(source, args.get("workspace_name"), args.get("dataset_name"))
+            if err:
+                return f"Error: {err}"
+            loop = asyncio.get_event_loop()
+
+            # Table list (+ column counts) from metadata
+            model, merr = await self._gather_model_metadata(source, args.get("workspace_name"), args.get("dataset_name"))
+            if merr:
+                return f"Error: {merr}"
+            tables = [t for t in model["tables"] if not model_analysis._truthy(t.get("is_hidden"))]
+
+            # Reliable row counts via DAX COUNTROWS per table
+            rows_by_table = {}
+            for t in tables:
+                name = t["name"]
+                q = f"EVALUATE ROW(\"r\", COUNTROWS('{name}'))"
+                try:
+                    res = await loop.run_in_executor(None, run, q)
+                    val = None
+                    if res:
+                        val = next(iter(res[0].values()), None)
+                    rows_by_table[name] = int(val) if val is not None else None
+                except Exception:
+                    rows_by_table[name] = None
+
+            # Best-effort VertiPaq sizes (desktop only)
+            sizes = {}
+            if source.lower() != "cloud":
+                try:
+                    desktop = self._get_desktop_connector()
+                    stats = await loop.run_in_executor(None, desktop.get_vertipaq_stats)
+                    for t in stats.get("tables", []):
+                        sizes[t.get("name")] = t.get("size", 0)
+                except Exception:
+                    pass
+
+            ranked = sorted(
+                tables, key=lambda t: (rows_by_table.get(t["name"]) or 0), reverse=True
+            )
+            out = "=== Model Storage Analysis ===\n\n"
+            total_rows = sum(v for v in rows_by_table.values() if v)
+            out += f"Tables: {len(tables)}   Total rows (visible tables): {total_rows:,}\n\n"
+            out += f"{'Table':<35} {'Rows':>14} {'Cols':>6} {'Size(KB)':>10}\n"
+            out += "-" * 68 + "\n"
+            for t in ranked[:50]:
+                nm = t["name"]
+                rc = rows_by_table.get(nm)
+                rc_s = f"{rc:,}" if rc is not None else "n/a"
+                sz = sizes.get(nm)
+                sz_s = f"{round(sz/1024):,}" if sz else "-"
+                out += f"{nm[:34]:<35} {rc_s:>14} {len(t.get('columns', [])):>6} {sz_s:>10}\n"
+            out += "\nNotes: row counts via DAX COUNTROWS (exact). Sizes are best-effort from\n"
+            out += "$SYSTEM DMVs (desktop only); for full VertiPaq detail use DAX Studio / Tabular Editor.\n"
+            return out
+        except Exception as e:
+            return f"Error analyzing storage: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_analyze_query_performance(self, args: Dict[str, Any]) -> str:
+        """Time a DAX query and return duration, row count, and heuristic optimization hints."""
+        try:
+            dax = args.get("dax")
+            if not dax:
+                return "Error: dax is required"
+            source = args.get("source") or "desktop"
+            run, err = await self._get_query_runner(source, args.get("workspace_name"), args.get("dataset_name"))
+            if err:
+                return f"Error: {err}"
+            loop = asyncio.get_event_loop()
+            start = time.time()
+            rows = await loop.run_in_executor(None, run, dax)
+            duration_ms = (time.time() - start) * 1000
+            row_count = len(rows) if isinstance(rows, list) else 0
+
+            hints = []
+            up = dax.upper()
+            if duration_ms > 2000:
+                hints.append(f"Slow ({duration_ms:.0f} ms). Check relationship cardinality and avoid row-by-row iterators over large fact tables.")
+            if row_count > 10000:
+                hints.append(f"Large result ({row_count:,} rows). Add TOPN / SUMMARIZECOLUMNS filters.")
+            if up.count("FILTER(") >= 3:
+                hints.append("Multiple FILTER() calls; prefer CALCULATE with boolean filters or KEEPFILTERS where possible.")
+            if "ADDCOLUMNS(" in up and "SUMMARIZE(" in up:
+                hints.append("SUMMARIZE+ADDCOLUMNS pattern; SUMMARIZECOLUMNS is usually faster and safer.")
+            if not hints:
+                hints.append("No obvious red flags. For storage-engine vs formula-engine timings, use DAX Studio Server Timings.")
+
+            out = "=== Query Performance ===\n\n"
+            out += f"Duration: {duration_ms:.0f} ms\n"
+            out += f"Rows returned: {row_count:,}\n\n"
+            out += "--- Hints ---\n"
+            for h in hints:
+                out += f"  - {h}\n"
+            return out
+        except Exception as e:
+            return f"Error analyzing query performance: {redact_secrets(str(e), [self.client_secret])}"
 
     # ==================== PBIP HANDLERS (File-based editing) ====================
 
