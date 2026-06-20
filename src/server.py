@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from mcp.server import Server, NotificationOptions
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ToolAnnotations
 from mcp.server.models import InitializationOptions
 
 # Load environment variables
@@ -29,6 +30,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("powerbi-mcp-v2")
 
+
+def redact_secrets(text: Any, extra_secrets: Optional[List[str]] = None) -> str:
+    """Redact connection-string secrets and known secret values before logging or returning to the client.
+
+    Power BI cloud connectors embed the service-principal client secret directly in the
+    ADOMD/MSOLAP connection string (Password=...). Exception messages and verbose argument
+    logs can therefore leak credentials. This masks the common vectors.
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    # Connection-string / URL style secrets
+    s = re.sub(r"(?i)(password\s*=\s*)[^;]+", r"\1***", s)
+    s = re.sub(r"(?i)(client_secret\s*=\s*)[^;&\s]+", r"\1***", s)
+    s = re.sub(r"(?i)(\bsecret\s*=\s*)[^;&\s]+", r"\1***", s)
+    # Known literal secret values (e.g. the configured client secret)
+    for sec in (extra_secrets or []):
+        if sec and len(sec) >= 6:
+            s = s.replace(sec, "***")
+    return s
+
+
 # Import connectors
 from powerbi_rest_connector import PowerBIRestConnector
 from powerbi_xmla_connector import PowerBIXmlaConnector
@@ -38,6 +61,7 @@ from powerbi_pbip_connector import PowerBIPBIPConnector
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
+from security.access_policy import AccessPolicyEngine
 
 
 class PowerBIMCPServer:
@@ -67,7 +91,119 @@ class PowerBIMCPServer:
             enable_policies=os.getenv("ENABLE_POLICIES", "true").lower() == "true"
         )
 
+        # Single source of truth for call routing and MCP safety hints. New tools
+        # register here (dispatch + annotations) in addition to handle_list_tools.
+        self._tool_dispatch = self._build_tool_dispatch()
+        self._tool_annotations = self._build_tool_annotations()
+
         self._setup_handlers()
+
+    def _build_tool_dispatch(self):
+        """Map tool name -> coroutine handler. Every entry accepts the args dict
+        (handlers that take no arguments simply ignore it). Replaces the former
+        34-branch if/elif chain so list_tools and call_tool cannot drift apart."""
+        return {
+            # Desktop
+            "desktop_discover_instances": lambda a: self._handle_desktop_discover(),
+            "desktop_connect": lambda a: self._handle_desktop_connect(a),
+            "desktop_list_tables": lambda a: self._handle_desktop_list_tables(),
+            "desktop_list_columns": lambda a: self._handle_desktop_list_columns(a),
+            "desktop_list_measures": lambda a: self._handle_desktop_list_measures(),
+            "desktop_execute_dax": lambda a: self._handle_desktop_execute_dax(a),
+            "desktop_get_model_info": lambda a: self._handle_desktop_get_model_info(),
+            # Cloud
+            "list_workspaces": lambda a: self._handle_list_workspaces(),
+            "list_datasets": lambda a: self._handle_list_datasets(a),
+            "list_tables": lambda a: self._handle_list_tables(a),
+            "list_columns": lambda a: self._handle_list_columns(a),
+            "execute_dax": lambda a: self._handle_execute_dax(a),
+            "get_model_info": lambda a: self._handle_get_model_info(a),
+            # Security
+            "security_status": lambda a: self._handle_security_status(),
+            "security_audit_log": lambda a: self._handle_security_audit_log(a),
+            # RLS
+            "desktop_list_rls_roles": lambda a: self._handle_desktop_list_rls_roles(),
+            "desktop_set_rls_role": lambda a: self._handle_desktop_set_rls_role(a),
+            "desktop_rls_status": lambda a: self._handle_desktop_rls_status(),
+            # TOM write operations
+            "batch_rename_tables": lambda a: self._handle_batch_rename_tables(a),
+            "batch_rename_columns": lambda a: self._handle_batch_rename_columns(a),
+            "batch_rename_measures": lambda a: self._handle_batch_rename_measures(a),
+            "batch_update_measures": lambda a: self._handle_batch_update_measures(a),
+            "create_measure": lambda a: self._handle_create_measure(a),
+            "delete_measure": lambda a: self._handle_delete_measure(a),
+            "scan_table_dependencies": lambda a: self._handle_scan_table_dependencies(a),
+            # PBIP file-based editing
+            "pbip_load_project": lambda a: self._handle_pbip_load_project(a),
+            "pbip_get_project_info": lambda a: self._handle_pbip_get_project_info(),
+            "pbip_rename_tables": lambda a: self._handle_pbip_rename_tables(a),
+            "pbip_rename_columns": lambda a: self._handle_pbip_rename_columns(a),
+            "pbip_rename_measures": lambda a: self._handle_pbip_rename_measures(a),
+            # PBIP repair
+            "pbip_fix_broken_visuals": lambda a: self._handle_pbip_fix_broken_visuals(a),
+            "pbip_fix_dax_quoting": lambda a: self._handle_pbip_fix_dax_quoting(),
+            "pbip_scan_broken_refs": lambda a: self._handle_pbip_scan_broken_refs(),
+            "pbip_validate": lambda a: self._handle_pbip_validate(),
+        }
+
+    def _build_tool_annotations(self):
+        """Map tool name -> ToolAnnotations. Hints let MCP clients auto-approve safe
+        reads and require confirmation for destructive writes (the spec's primary safe-agent
+        lever, since destructive-op guards are not otherwise standardized)."""
+        def ann(read_only, destructive=False, idempotent=False, open_world=False):
+            return ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=destructive,
+                idempotentHint=idempotent,
+                openWorldHint=open_world,
+            )
+
+        local_read = ann(True, open_world=False)
+        cloud_read = ann(True, open_world=True)
+        local_state = ann(False, destructive=False, idempotent=True, open_world=False)
+        local_destructive = ann(False, destructive=True, open_world=False)
+        return {
+            # Desktop reads (local)
+            "desktop_discover_instances": local_read,
+            "desktop_connect": local_state,
+            "desktop_list_tables": local_read,
+            "desktop_list_columns": local_read,
+            "desktop_list_measures": local_read,
+            "desktop_execute_dax": local_read,  # DAX EVALUATE is a query, not a mutation
+            "desktop_get_model_info": local_read,
+            # Cloud reads (open world / network)
+            "list_workspaces": cloud_read,
+            "list_datasets": cloud_read,
+            "list_tables": cloud_read,
+            "list_columns": cloud_read,
+            "execute_dax": cloud_read,
+            "get_model_info": cloud_read,
+            # Security (local reads)
+            "security_status": local_read,
+            "security_audit_log": local_read,
+            # RLS
+            "desktop_list_rls_roles": local_read,
+            "desktop_set_rls_role": local_state,  # changes session RLS context, not data
+            "desktop_rls_status": local_read,
+            # TOM writes (mutate the live model)
+            "scan_table_dependencies": local_read,
+            "batch_rename_tables": local_destructive,
+            "batch_rename_columns": local_destructive,
+            "batch_rename_measures": local_destructive,
+            "batch_update_measures": local_destructive,
+            "create_measure": ann(False, destructive=False, idempotent=False, open_world=False),
+            "delete_measure": local_destructive,
+            # PBIP (file edits)
+            "pbip_load_project": ann(True, open_world=False),  # reads project files
+            "pbip_get_project_info": local_read,
+            "pbip_rename_tables": local_destructive,
+            "pbip_rename_columns": local_destructive,
+            "pbip_rename_measures": local_destructive,
+            "pbip_fix_broken_visuals": local_destructive,
+            "pbip_fix_dax_quoting": local_destructive,
+            "pbip_scan_broken_refs": local_read,
+            "pbip_validate": local_read,
+        }
 
     def _setup_handlers(self):
         """Set up MCP tool handlers"""
@@ -638,99 +774,37 @@ class PowerBIMCPServer:
                     }
                 )
             ]
+            # Attach MCP safety/behavior hints from the annotations registry.
+            for t in tools:
+                annotations = self._tool_annotations.get(t.name)
+                if annotations is not None:
+                    t.annotations = annotations
             return tools
 
         @self.server.call_tool()
         async def handle_call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> List[TextContent]:
             """Handle tool calls"""
             try:
-                logger.info(f"Tool called: {name} with args: {arguments}")
                 args = arguments or {}
+                logger.info(f"Tool called: {name}")
+                # Arguments can carry DAX (with PII literals) or secrets; only log at DEBUG, redacted.
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"Tool args ({name}): "
+                        f"{redact_secrets(json.dumps(args, default=str), [self.client_secret])}"
+                    )
 
-                # Desktop tools
-                if name == "desktop_discover_instances":
-                    result = await self._handle_desktop_discover()
-                elif name == "desktop_connect":
-                    result = await self._handle_desktop_connect(args)
-                elif name == "desktop_list_tables":
-                    result = await self._handle_desktop_list_tables()
-                elif name == "desktop_list_columns":
-                    result = await self._handle_desktop_list_columns(args)
-                elif name == "desktop_list_measures":
-                    result = await self._handle_desktop_list_measures()
-                elif name == "desktop_execute_dax":
-                    result = await self._handle_desktop_execute_dax(args)
-                elif name == "desktop_get_model_info":
-                    result = await self._handle_desktop_get_model_info()
-                # Cloud tools
-                elif name == "list_workspaces":
-                    result = await self._handle_list_workspaces()
-                elif name == "list_datasets":
-                    result = await self._handle_list_datasets(args)
-                elif name == "list_tables":
-                    result = await self._handle_list_tables(args)
-                elif name == "list_columns":
-                    result = await self._handle_list_columns(args)
-                elif name == "execute_dax":
-                    result = await self._handle_execute_dax(args)
-                elif name == "get_model_info":
-                    result = await self._handle_get_model_info(args)
-                # Security tools
-                elif name == "security_status":
-                    result = await self._handle_security_status()
-                elif name == "security_audit_log":
-                    result = await self._handle_security_audit_log(args)
-                # RLS tools
-                elif name == "desktop_list_rls_roles":
-                    result = await self._handle_desktop_list_rls_roles()
-                elif name == "desktop_set_rls_role":
-                    result = await self._handle_desktop_set_rls_role(args)
-                elif name == "desktop_rls_status":
-                    result = await self._handle_desktop_rls_status()
-                # Batch/Write operations (TOM)
-                elif name == "batch_rename_tables":
-                    result = await self._handle_batch_rename_tables(args)
-                elif name == "batch_rename_columns":
-                    result = await self._handle_batch_rename_columns(args)
-                elif name == "batch_rename_measures":
-                    result = await self._handle_batch_rename_measures(args)
-                elif name == "batch_update_measures":
-                    result = await self._handle_batch_update_measures(args)
-                elif name == "create_measure":
-                    result = await self._handle_create_measure(args)
-                elif name == "delete_measure":
-                    result = await self._handle_delete_measure(args)
-                elif name == "scan_table_dependencies":
-                    result = await self._handle_scan_table_dependencies(args)
-                # PBIP tools (file-based editing)
-                elif name == "pbip_load_project":
-                    result = await self._handle_pbip_load_project(args)
-                elif name == "pbip_get_project_info":
-                    result = await self._handle_pbip_get_project_info()
-                elif name == "pbip_rename_tables":
-                    result = await self._handle_pbip_rename_tables(args)
-                elif name == "pbip_rename_columns":
-                    result = await self._handle_pbip_rename_columns(args)
-                elif name == "pbip_rename_measures":
-                    result = await self._handle_pbip_rename_measures(args)
-                # PBIP Repair tools
-                elif name == "pbip_fix_broken_visuals":
-                    result = await self._handle_pbip_fix_broken_visuals(args)
-                elif name == "pbip_fix_dax_quoting":
-                    result = await self._handle_pbip_fix_dax_quoting()
-                elif name == "pbip_scan_broken_refs":
-                    result = await self._handle_pbip_scan_broken_refs()
-                elif name == "pbip_validate":
-                    result = await self._handle_pbip_validate()
-                else:
-                    result = f"Unknown tool: {name}"
+                handler = self._tool_dispatch.get(name)
+                if handler is None:
+                    return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
+                result = await handler(args)
                 return [TextContent(type="text", text=result)]
 
             except Exception as e:
-                error_msg = f"Error executing {name}: {str(e)}"
-                logger.error(error_msg, exc_info=True)
-                return [TextContent(type="text", text=error_msg)]
+                safe_err = redact_secrets(str(e), [self.client_secret])
+                logger.error(f"Error executing {name}: {safe_err}", exc_info=True)
+                return [TextContent(type="text", text=f"Error executing {name}: {safe_err}")]
 
     # ==================== DESKTOP HANDLERS ====================
 
@@ -891,8 +965,11 @@ class PowerBIMCPServer:
             if not dax_query:
                 return "Error: dax_query is required"
 
-            # Pre-query security check
-            policy_check = self.security.pre_query_check(dax_query)
+            # Pre-query security check (resolve referenced tables/columns so column policies fire)
+            ref_tables, ref_columns = AccessPolicyEngine.extract_references(dax_query)
+            policy_check = self.security.pre_query_check(
+                dax_query, tables=ref_tables, columns=ref_columns
+            )
             if not policy_check.allowed:
                 self.security.log_policy_violation(
                     policy_name="query_policy",
@@ -1153,8 +1230,11 @@ class PowerBIMCPServer:
             if not all([workspace_name, dataset_name, dax_query]):
                 return "Error: workspace_name, dataset_name, and dax_query are required"
 
-            # Pre-query security check
-            policy_check = self.security.pre_query_check(dax_query)
+            # Pre-query security check (resolve referenced tables/columns so column policies fire)
+            ref_tables, ref_columns = AccessPolicyEngine.extract_references(dax_query)
+            policy_check = self.security.pre_query_check(
+                dax_query, tables=ref_tables, columns=ref_columns
+            )
             if not policy_check.allowed:
                 self.security.log_policy_violation(
                     policy_name="query_policy",
@@ -1162,6 +1242,13 @@ class PowerBIMCPServer:
                     query=dax_query
                 )
                 return f"Query blocked by security policy: {policy_check.reason}"
+
+            # Determine a row cap (cloud execute_dax is otherwise unbounded). Honor an explicit
+            # max_rows, clamp to policy, and enforce an absolute ceiling to protect memory.
+            cap = policy_check.max_rows or 10000
+            requested = args.get("max_rows")
+            max_rows = min(requested, cap) if requested else cap
+            max_rows = min(max_rows, 100000)
 
             connector = await asyncio.get_event_loop().run_in_executor(
                 None, self._get_xmla_connector, workspace_name, dataset_name
@@ -1176,6 +1263,12 @@ class PowerBIMCPServer:
                 None, connector.execute_dax, dax_query
             )
             duration_ms = (time.time() - start_time) * 1000
+
+            # Enforce the row cap (XMLA connector does not cap internally)
+            truncated = False
+            if isinstance(rows, list) and len(rows) > max_rows:
+                rows = rows[:max_rows]
+                truncated = True
 
             # Process results through security layer
             safe_rows, security_report = self.security.process_results(
@@ -1196,6 +1289,9 @@ class PowerBIMCPServer:
 
             if security_report.get('columns_blocked'):
                 result += f"\n🚫 Blocked columns: {', '.join(security_report['columns_blocked'])}"
+
+            if truncated:
+                result += f"\n(Note: result truncated to the first {max_rows} rows)"
 
             result += "\n\n"
             result += json.dumps(safe_rows, indent=2, default=str)

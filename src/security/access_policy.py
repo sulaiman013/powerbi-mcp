@@ -2,6 +2,7 @@
 Data Access Policy Engine
 Enforces data access rules on queries and results
 """
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -11,6 +12,43 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# DAX result columns arrive as keys like "Sales[Amount]", "'Sales Data'[Amt]" or "[Total Sales]".
+_COL_KEY_RE = re.compile(r"^\s*'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*$")
+_MEASURE_KEY_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+# Table/column references inside a DAX query body.
+_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][\w ]*?))\s*\[([^\]]+)\]")
+_BARE_MEASURE_RE = re.compile(r"(?<![\w'\]])\[([^\]]+)\]")
+
+
+def parse_column_key(key: str) -> Tuple[Optional[str], str]:
+    """Parse a DAX result column key into (table, column).
+
+    "Sales[Amount]"      -> ("Sales", "Amount")
+    "'Sales Data'[Amt]"  -> ("Sales Data", "Amt")
+    "[Total Sales]"      -> (None, "Total Sales")   # measure / unqualified
+    "Amount"             -> (None, "Amount")
+    """
+    if not isinstance(key, str):
+        return None, str(key)
+    m = _COL_KEY_RE.match(key)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m2 = _MEASURE_KEY_RE.match(key)
+    if m2:
+        return None, m2.group(1).strip()
+    return None, key.strip()
+
+
+def mask_value(value: Any) -> Any:
+    """Partial mask used when a policy explicitly requests MASK (independent of PII detection)."""
+    if value is None:
+        return None
+    s = str(value)
+    if len(s) <= 4:
+        return "*" * len(s)
+    return "*" * (len(s) - 4) + s[-4:]
 
 
 class PolicyAction(Enum):
@@ -257,6 +295,61 @@ class AccessPolicyEngine:
         """Get policy for a table"""
         return self.table_policies.get(table_name.lower().strip('[]\''))
 
+    @staticmethod
+    def extract_references(query: str) -> Tuple[List[str], List[str]]:
+        """Best-effort extraction of referenced tables and columns/measures from a DAX query.
+
+        Used so that pre-query policy checks can see which tables/columns a query touches
+        even though DAX is not fully parsed. Over-approximates rather than misses.
+        """
+        tables: Set[str] = set()
+        columns: Set[str] = set()
+        if not query:
+            return [], []
+        for m in _REF_RE.finditer(query):
+            tbl = m.group(1) or m.group(2)
+            if tbl and tbl.strip():
+                tables.add(tbl.strip())
+            columns.add(m.group(3).strip())
+        for m in _BARE_MEASURE_RE.finditer(query):
+            columns.add(m.group(1).strip())
+        return sorted(tables), sorted(columns)
+
+    # Restrictiveness ordering so the strongest policy wins when several match a column.
+    _ACTION_RANK = {
+        PolicyAction.ALLOW: 0,
+        PolicyAction.AGGREGATE_ONLY: 1,
+        PolicyAction.MASK: 1,
+        PolicyAction.REDACT: 2,
+        PolicyAction.HASH: 2,
+        PolicyAction.BLOCK: 3,
+    }
+
+    def resolve_column_policy(self, table: Optional[str], column: str) -> ColumnPolicy:
+        """Resolve the effective column policy, consulting the specific table AND the '*' wildcard
+        table, and falling back to scanning all tables when the owning table is unknown.
+
+        Returns the most restrictive matching policy (wildcard-aware via TablePolicy.get_column_policy).
+        """
+        candidates: List[TablePolicy] = []
+        if table:
+            tp = self.get_table_policy(table)
+            if tp:
+                candidates.append(tp)
+        else:
+            # Owning table unknown (e.g. a measure): consider every concrete table policy.
+            candidates.extend(tp for k, tp in self.table_policies.items() if k != '*')
+        wildcard = self.table_policies.get('*')
+        if wildcard:
+            candidates.append(wildcard)
+
+        best = ColumnPolicy(name=column, action=self.global_policy.default_action)
+        for tp in candidates:
+            cp = tp.get_column_policy(column)
+            if self._ACTION_RANK.get(cp.action, 0) > self._ACTION_RANK.get(best.action, 0):
+                best = cp
+        return best
+
     def check_query(
         self,
         query: str,
@@ -315,27 +408,26 @@ class AccessPolicyEngine:
                         if 'FILTER' not in query.upper() and 'WHERE' not in query.upper():
                             warnings.append(f"Table '{table}' requires a filter clause")
 
-        # Check column policies
+        # Check column policies (wildcard-aware; consults concrete tables + the '*' policy)
         if columns:
             for column in columns:
-                # Try to find table for this column
-                for table_name, table_policy in self.table_policies.items():
-                    col_policy = table_policy.get_column_policy(column)
+                col_policy = self.resolve_column_policy(None, column)
 
-                    if col_policy.action == PolicyAction.BLOCK:
+                if col_policy.action == PolicyAction.BLOCK:
+                    if column not in columns_to_block:
                         columns_to_block.append(column)
-                        msg = col_policy.reason or f"Column '{column}' access blocked by policy"
-                        violations.append({
-                            'type': 'column_blocked',
-                            'column': column,
-                            'table': table_name,
-                            'reason': msg,
-                            'message': msg
-                        })
+                    msg = col_policy.reason or f"Column '{column}' access blocked by policy"
+                    violations.append({
+                        'type': 'column_blocked',
+                        'column': column,
+                        'reason': msg,
+                        'message': msg
+                    })
 
-                    elif col_policy.action in (PolicyAction.MASK, PolicyAction.HASH, PolicyAction.REDACT):
+                elif col_policy.action in (PolicyAction.MASK, PolicyAction.HASH, PolicyAction.REDACT):
+                    if column not in columns_to_mask:
                         columns_to_mask.append(column)
-                        warnings.append(f"Column '{column}' will be masked")
+                        warnings.append(f"Column '{column}' will be masked/redacted")
 
         # Determine final result
         allowed = len(violations) == 0
@@ -374,24 +466,21 @@ class AccessPolicyEngine:
         blocked_columns = set()
         masked_columns = set()
 
-        table_policy = self.get_table_policy(table_name) if table_name else None
+        # Resolve the effective policy once per distinct column key (rows share the same schema).
+        policy_cache: Dict[str, ColumnPolicy] = {}
 
         for row in results:
             processed_row = {}
 
             for col_name, value in row.items():
-                col_clean = col_name.lower().strip('[]')
-
-                # Get column policy
-                if table_policy:
-                    col_policy = table_policy.get_column_policy(col_name)
-                else:
-                    # Check all table policies for this column
-                    col_policy = ColumnPolicy(name=col_name, action=self.global_policy.default_action)
-                    for tp in self.table_policies.values():
-                        if col_clean in tp.columns:
-                            col_policy = tp.columns[col_clean]
-                            break
+                col_policy = policy_cache.get(col_name)
+                if col_policy is None:
+                    # DAX result keys look like "Table[Column]" or "[Measure]"; resolve the owning
+                    # table from the key, falling back to the caller-provided primary table.
+                    parsed_table, parsed_col = parse_column_key(col_name)
+                    lookup_table = parsed_table or table_name
+                    col_policy = self.resolve_column_policy(lookup_table, parsed_col)
+                    policy_cache[col_name] = col_policy
 
                 # Apply action
                 if col_policy.action == PolicyAction.BLOCK:
@@ -403,7 +492,6 @@ class AccessPolicyEngine:
                     masked_columns.add(col_name)
 
                 elif col_policy.action == PolicyAction.HASH:
-                    import hashlib
                     if value is not None:
                         hash_val = hashlib.sha256(str(value).encode()).hexdigest()[:12]
                         processed_row[col_name] = f"[HASH:{hash_val}]"
@@ -412,8 +500,7 @@ class AccessPolicyEngine:
                     masked_columns.add(col_name)
 
                 elif col_policy.action == PolicyAction.MASK:
-                    # Mark for PII detector to handle
-                    processed_row[col_name] = value
+                    processed_row[col_name] = mask_value(value)
                     masked_columns.add(col_name)
 
                 else:
