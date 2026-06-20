@@ -319,13 +319,13 @@ tables:
 ```bash
 # Clone the repository
 git clone https://github.com/sulaiman013/powerbi-mcp.git
-cd powerbi-mcp-v2
+cd powerbi-mcp
 
 # Install dependencies
 pip install -r requirements.txt
 
-# (Optional) Configure cloud credentials
-cp .env.example .env
+# (Optional) Configure cloud credentials  (Windows)
+copy .env.example .env
 # Edit .env with your Azure AD credentials
 ```
 
