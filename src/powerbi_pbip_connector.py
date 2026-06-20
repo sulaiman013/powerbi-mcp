@@ -260,6 +260,7 @@ class PowerBIPBIPConnector:
         self.current_project: Optional[PBIPProject] = None
         self.auto_backup = auto_backup
         self._original_files: Dict[str, str] = {}  # For rollback
+        self._file_encodings: Dict[str, str] = {}  # Remember utf-8 vs utf-8-sig (BOM) per file
 
     @staticmethod
     def find_pbip_project_from_model_name(model_name: str, search_paths: Optional[List[str]] = None) -> Optional[PBIPProject]:
@@ -491,18 +492,39 @@ class PowerBIPBIPConnector:
             logger.error(f"Failed to create backup: {e}")
             return None
 
+    def _read_text(self, file_path) -> str:
+        """Read a text file, remembering its encoding (utf-8 vs utf-8-sig/BOM) so it can be
+        written back faithfully. Returns text with any BOM stripped."""
+        with open(file_path, 'rb') as f:
+            raw = f.read()
+        if raw.startswith(b'\xef\xbb\xbf'):
+            self._file_encodings[str(file_path)] = 'utf-8-sig'
+            return raw.decode('utf-8-sig')
+        self._file_encodings[str(file_path)] = 'utf-8'
+        return raw.decode('utf-8')
+
+    def _write_text(self, file_path, content: str) -> None:
+        """Atomically write text (temp file + os.replace) using the file's remembered
+        encoding and without translating newlines, so a crash mid-write cannot corrupt
+        the original and CRLF/LF and BOM are preserved."""
+        encoding = self._file_encodings.get(str(file_path), 'utf-8')
+        path = Path(file_path)
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w', encoding=encoding, newline='') as f:
+            f.write(content)
+        os.replace(tmp, path)
+
     def _cache_file_content(self, file_path: Path) -> None:
-        """Cache original file content for potential rollback"""
+        """Cache original file content for potential rollback (records encoding too)"""
         if str(file_path) not in self._original_files:
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    self._original_files[str(file_path)] = f.read()
+                self._original_files[str(file_path)] = self._read_text(file_path)
             except Exception as e:
                 logger.warning(f"Could not cache file {file_path}: {e}")
 
     def rollback_changes(self) -> bool:
         """
-        Rollback all changes made in this session
+        Rollback all changes made in this session (atomic, encoding-preserving)
 
         Returns:
             True if rollback successful
@@ -513,8 +535,7 @@ class PowerBIPBIPConnector:
 
         try:
             for file_path, content in self._original_files.items():
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
+                self._write_text(file_path, content)
 
             logger.info(f"Rolled back {len(self._original_files)} file(s)")
             self._original_files = {}
@@ -740,38 +761,51 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # 1. Update TMDL files (semantic model) - auto-quoting is built-in
-        tmdl_replacements = self._rename_table_in_tmdl_files(old_name, new_name)
-        files_modified.extend(tmdl_replacements["files"])
-        total_replacements += tmdl_replacements["count"]
+        # Transactional cascade: if any step fails, roll every file back so the model
+        # and report can never be left half-renamed (inconsistent).
+        try:
+            # 1. Update TMDL files (semantic model) - auto-quoting is built-in
+            tmdl_replacements = self._rename_table_in_tmdl_files(old_name, new_name)
+            files_modified.extend(tmdl_replacements["files"])
+            total_replacements += tmdl_replacements["count"]
 
-        # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
-        if self.current_project.is_pbir_enhanced:
-            # PBIR Enhanced: Update individual visual.json files
-            visual_replacements = self._rename_table_in_visual_files(old_name, new_name)
-            files_modified.extend(visual_replacements["files"])
-            total_replacements += visual_replacements["count"]
-        elif self.current_project.report_json_path:
-            # PBIR Legacy: Update single report.json
-            report_replacements = self._rename_table_in_report_json(old_name, new_name)
-            if report_replacements["count"] > 0:
-                files_modified.append(str(self.current_project.report_json_path))
-                total_replacements += report_replacements["count"]
+            # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
+            if self.current_project.is_pbir_enhanced:
+                # PBIR Enhanced: Update individual visual.json files
+                visual_replacements = self._rename_table_in_visual_files(old_name, new_name)
+                files_modified.extend(visual_replacements["files"])
+                total_replacements += visual_replacements["count"]
+            elif self.current_project.report_json_path:
+                # PBIR Legacy: Update single report.json
+                report_replacements = self._rename_table_in_report_json(old_name, new_name)
+                if report_replacements["count"] > 0:
+                    files_modified.append(str(self.current_project.report_json_path))
+                    total_replacements += report_replacements["count"]
 
-        # 3. Update cultures files (linguistic schema)
-        if self.current_project.cultures_files:
-            cultures_replacements = self._rename_table_in_cultures_files(old_name, new_name)
-            files_modified.extend(cultures_replacements["files"])
-            total_replacements += cultures_replacements["count"]
+            # 3. Update cultures files (linguistic schema)
+            if self.current_project.cultures_files:
+                cultures_replacements = self._rename_table_in_cultures_files(old_name, new_name)
+                files_modified.extend(cultures_replacements["files"])
+                total_replacements += cultures_replacements["count"]
 
-        # 4. Update diagramLayout.json (model diagram)
-        if self.current_project.diagram_layout_path:
-            diagram_replacements = self._rename_table_in_diagram_layout(old_name, new_name)
-            files_modified.extend(diagram_replacements["files"])
-            total_replacements += diagram_replacements["count"]
+            # 4. Update diagramLayout.json (model diagram)
+            if self.current_project.diagram_layout_path:
+                diagram_replacements = self._rename_table_in_diagram_layout(old_name, new_name)
+                files_modified.extend(diagram_replacements["files"])
+                total_replacements += diagram_replacements["count"]
 
-        # 5. Validate after changes
-        validation_errors = self.validate_tmdl_syntax()
+            # 5. Validate after changes
+            validation_errors = self.validate_tmdl_syntax()
+        except Exception as e:
+            logger.error(f"Table rename cascade failed, rolling back: {e}")
+            self.rollback_changes()
+            return RenameResult(
+                False,
+                f"Rename of table '{old_name}' failed and all changes were rolled back: {e}",
+                [], 0,
+                details={"old_name": old_name, "new_name": new_name, "rolled_back": True},
+                backup_created=backup_path,
+            )
 
         report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
 
@@ -811,23 +845,35 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # 1. Update TMDL files (semantic model)
-        tmdl_replacements = self._rename_column_in_tmdl_files(table_name, old_name, new_name)
-        files_modified.extend(tmdl_replacements["files"])
-        total_replacements += tmdl_replacements["count"]
+        # Transactional cascade: roll back every file if any step fails.
+        try:
+            # 1. Update TMDL files (semantic model)
+            tmdl_replacements = self._rename_column_in_tmdl_files(table_name, old_name, new_name)
+            files_modified.extend(tmdl_replacements["files"])
+            total_replacements += tmdl_replacements["count"]
 
-        # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
-        if self.current_project.is_pbir_enhanced:
-            # PBIR Enhanced: Update individual visual.json files
-            visual_replacements = self._rename_column_in_visual_files(table_name, old_name, new_name)
-            files_modified.extend(visual_replacements["files"])
-            total_replacements += visual_replacements["count"]
-        elif self.current_project.report_json_path:
-            # PBIR Legacy: Update single report.json
-            report_replacements = self._rename_column_in_report_json(table_name, old_name, new_name)
-            if report_replacements["count"] > 0:
-                files_modified.append(str(self.current_project.report_json_path))
-                total_replacements += report_replacements["count"]
+            # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
+            if self.current_project.is_pbir_enhanced:
+                # PBIR Enhanced: Update individual visual.json files
+                visual_replacements = self._rename_column_in_visual_files(table_name, old_name, new_name)
+                files_modified.extend(visual_replacements["files"])
+                total_replacements += visual_replacements["count"]
+            elif self.current_project.report_json_path:
+                # PBIR Legacy: Update single report.json
+                report_replacements = self._rename_column_in_report_json(table_name, old_name, new_name)
+                if report_replacements["count"] > 0:
+                    files_modified.append(str(self.current_project.report_json_path))
+                    total_replacements += report_replacements["count"]
+        except Exception as e:
+            logger.error(f"Column rename cascade failed, rolling back: {e}")
+            self.rollback_changes()
+            return RenameResult(
+                False,
+                f"Rename of column '{table_name}'[{old_name}] failed and all changes were rolled back: {e}",
+                [], 0,
+                details={"table_name": table_name, "old_name": old_name, "new_name": new_name, "rolled_back": True},
+                backup_created=backup_path,
+            )
 
         report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
 
@@ -864,23 +910,35 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # 1. Update TMDL files (semantic model)
-        tmdl_replacements = self._rename_measure_in_tmdl_files(old_name, new_name)
-        files_modified.extend(tmdl_replacements["files"])
-        total_replacements += tmdl_replacements["count"]
+        # Transactional cascade: roll back every file if any step fails.
+        try:
+            # 1. Update TMDL files (semantic model)
+            tmdl_replacements = self._rename_measure_in_tmdl_files(old_name, new_name)
+            files_modified.extend(tmdl_replacements["files"])
+            total_replacements += tmdl_replacements["count"]
 
-        # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
-        if self.current_project.is_pbir_enhanced:
-            # PBIR Enhanced: Update individual visual.json files
-            visual_replacements = self._rename_measure_in_visual_files(old_name, new_name)
-            files_modified.extend(visual_replacements["files"])
-            total_replacements += visual_replacements["count"]
-        elif self.current_project.report_json_path:
-            # PBIR Legacy: Update single report.json
-            report_replacements = self._rename_measure_in_report_json(old_name, new_name)
-            if report_replacements["count"] > 0:
-                files_modified.append(str(self.current_project.report_json_path))
-                total_replacements += report_replacements["count"]
+            # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
+            if self.current_project.is_pbir_enhanced:
+                # PBIR Enhanced: Update individual visual.json files
+                visual_replacements = self._rename_measure_in_visual_files(old_name, new_name)
+                files_modified.extend(visual_replacements["files"])
+                total_replacements += visual_replacements["count"]
+            elif self.current_project.report_json_path:
+                # PBIR Legacy: Update single report.json
+                report_replacements = self._rename_measure_in_report_json(old_name, new_name)
+                if report_replacements["count"] > 0:
+                    files_modified.append(str(self.current_project.report_json_path))
+                    total_replacements += report_replacements["count"]
+        except Exception as e:
+            logger.error(f"Measure rename cascade failed, rolling back: {e}")
+            self.rollback_changes()
+            return RenameResult(
+                False,
+                f"Rename of measure '{old_name}' failed and all changes were rolled back: {e}",
+                [], 0,
+                details={"old_name": old_name, "new_name": new_name, "rolled_back": True},
+                backup_created=backup_path,
+            )
 
         report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
 
