@@ -7,7 +7,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from model_analysis import run_bpa, audit_ai_readiness  # noqa: E402
+from model_analysis import run_bpa, audit_ai_readiness, render_data_dictionary  # noqa: E402
 
 _failures = []
 
@@ -99,12 +99,25 @@ def test_ai_readiness():
     check("documented model scores higher", audit_ai_readiness(good)["score"] > r["score"])
 
 
+def test_data_dictionary():
+    print("\n== render_data_dictionary ==")
+    md = render_data_dictionary(MODEL, fmt="markdown")
+    check("has title", md.startswith("# Data Dictionary"))
+    check("includes a table heading", "## Sales" in md)
+    check("includes measures section", "### Measures" in md and "Total Sales" in md)
+    check("includes coverage score", "AI-readiness score" in md)
+    check("includes relationships", "## Relationships" in md and "DateKey" in md)
+    html = render_data_dictionary(MODEL, fmt="html")
+    check("html wrapper", html.startswith("<!doctype html>"))
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  MODEL ANALYSIS (BPA + AI-READINESS) TESTS")
     print("=" * 70)
     test_bpa()
     test_ai_readiness()
+    test_data_dictionary()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

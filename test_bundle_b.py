@@ -89,6 +89,15 @@ def test_query_perf():
     check("rows reported", "Rows returned: 2" in out, out)
 
 
+def test_data_dictionary():
+    print("\n== export_data_dictionary (wired) ==")
+    out = run(make_server()._handle_export_data_dictionary({}))
+    check("dictionary header", "# Data Dictionary" in out)
+    check("includes Sales table", "## Sales" in out)
+    check("includes Total measure", "Total" in out)
+    check("coverage note about live expressions", "INFO.VIEW" in out)
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  BUNDLE B (QUALITY & PERFORMANCE) WIRING TESTS")
@@ -97,6 +106,7 @@ if __name__ == "__main__":
     test_ai_readiness()
     test_storage()
     test_query_perf()
+    test_data_dictionary()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

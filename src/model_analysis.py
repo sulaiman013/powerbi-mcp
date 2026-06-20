@@ -313,3 +313,75 @@ def audit_ai_readiness(model: Dict[str, Any]) -> Dict[str, Any]:
 
     grade = "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D" if score >= 40 else "F"
     return {"score": score, "grade": grade, "metrics": metrics, "recommendations": recs}
+
+
+def _md_escape(s) -> str:
+    """Escape a value for a Markdown table cell."""
+    if s is None:
+        return ""
+    return str(s).replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
+
+
+def render_data_dictionary(model: Dict[str, Any], fmt: str = "markdown") -> str:
+    """Render a portable data dictionary (tables, columns, measures, relationships) from a
+    normalized model dict, with a documentation-coverage summary. Pure function (no I/O)."""
+    ai = audit_ai_readiness(model)
+    tables = model.get("tables", [])
+    rels = model.get("relationships", [])
+    total_measures = sum(len(t.get("measures", [])) for t in tables)
+    total_columns = sum(len(t.get("columns", [])) for t in tables)
+
+    lines = []
+    lines.append("# Data Dictionary")
+    lines.append("")
+    lines.append(f"- Tables: **{len(tables)}**  |  Columns: **{total_columns}**  |  "
+                 f"Measures: **{total_measures}**  |  Relationships: **{len(rels)}**")
+    lines.append(f"- Documentation / AI-readiness score: **{ai['score']}/100 (grade {ai['grade']})**")
+    lines.append("")
+
+    for t in sorted(tables, key=lambda x: str(x.get("name", "")).lower()):
+        tname = t.get("name", "")
+        hidden = " _(hidden)_" if _truthy(t.get("is_hidden")) else ""
+        lines.append(f"## {tname}{hidden}")
+        if t.get("description"):
+            lines.append(f"_{t['description']}_")
+        lines.append("")
+        cols = t.get("columns", [])
+        if cols:
+            lines.append("### Columns")
+            lines.append("| Column | Type | Hidden | Description |")
+            lines.append("|---|---|---|---|")
+            for c in cols:
+                lines.append(f"| {_md_escape(c.get('name'))} | {_md_escape(c.get('data_type'))} | "
+                             f"{'yes' if _truthy(c.get('is_hidden')) else ''} | {_md_escape(c.get('description'))} |")
+            lines.append("")
+        measures = t.get("measures", [])
+        if measures:
+            lines.append("### Measures")
+            lines.append("| Measure | Format | Description | Expression |")
+            lines.append("|---|---|---|---|")
+            for m in measures:
+                expr = m.get("expression")
+                expr_cell = f"`{_md_escape(expr)}`" if expr else "_(unavailable)_"
+                lines.append(f"| {_md_escape(m.get('name'))} | {_md_escape(m.get('format_string'))} | "
+                             f"{_md_escape(m.get('description'))} | {expr_cell} |")
+            lines.append("")
+
+    if rels:
+        lines.append("## Relationships")
+        lines.append("| From | To | Active | Cross-filter |")
+        lines.append("|---|---|---|---|")
+        for r in rels:
+            frm = f"{r.get('from_table')}[{r.get('from_column')}]"
+            to = f"{r.get('to_table')}[{r.get('to_column')}]"
+            active = "" if (str(r.get("is_active")).lower() in ("false", "0")) else "yes"
+            lines.append(f"| {_md_escape(frm)} | {_md_escape(to)} | {active} | {_md_escape(r.get('cross_filter'))} |")
+        lines.append("")
+
+    md = "\n".join(lines)
+    if fmt == "html":
+        # Minimal, dependency-free HTML wrapper (no markdown lib needed).
+        body = (md.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        return ("<!doctype html><meta charset='utf-8'><title>Data Dictionary</title>"
+                "<pre style='font-family:Consolas,monospace;font-size:13px'>" + body + "</pre>")
+    return md
