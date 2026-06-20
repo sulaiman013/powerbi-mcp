@@ -1053,6 +1053,97 @@ class PowerBITOMConnector:
             logger.error(f"Failed to delete measure: {e}")
             return OperationResult(False, f"Failed to delete measure: {e}")
 
+    # ==================== RELATIONSHIPS ====================
+
+    def create_relationship(self, from_table: str, from_column: str, to_table: str, to_column: str,
+                            cardinality: str = "many_to_one", cross_filter: str = "single",
+                            is_active: bool = True) -> OperationResult:
+        """Create a relationship between two columns.
+
+        cardinality: many_to_one | one_to_many | one_to_one | many_to_many
+        cross_filter: single | both
+        """
+        if not self._ensure_connected():
+            return OperationResult(False, "Not connected")
+        try:
+            ft = self.model.Tables.Find(from_table)
+            tt = self.model.Tables.Find(to_table)
+            if not ft:
+                return OperationResult(False, f"From table '{from_table}' not found")
+            if not tt:
+                return OperationResult(False, f"To table '{to_table}' not found")
+            fc = ft.Columns.Find(from_column)
+            tc = tt.Columns.Find(to_column)
+            if not fc:
+                return OperationResult(False, f"Column '{from_table}'[{from_column}] not found")
+            if not tc:
+                return OperationResult(False, f"Column '{to_table}'[{to_column}] not found")
+
+            rel = TOM.SingleColumnRelationship()
+            rel.FromColumn = fc
+            rel.ToColumn = tc
+
+            card = (cardinality or "many_to_one").lower()
+            Many = TOM.RelationshipEndCardinality.Many
+            One = TOM.RelationshipEndCardinality.One
+            if card in ("one_to_many", "1:*", "1:m"):
+                rel.FromCardinality, rel.ToCardinality = One, Many
+            elif card in ("one_to_one", "1:1"):
+                rel.FromCardinality, rel.ToCardinality = One, One
+            elif card in ("many_to_many", "m:m", "*:*"):
+                rel.FromCardinality, rel.ToCardinality = Many, Many
+            else:  # many_to_one (default)
+                rel.FromCardinality, rel.ToCardinality = Many, One
+
+            cf = (cross_filter or "single").lower()
+            if cf in ("both", "bidirectional", "both_directions"):
+                rel.CrossFilteringBehavior = TOM.CrossFilteringBehavior.BothDirections
+            else:
+                rel.CrossFilteringBehavior = TOM.CrossFilteringBehavior.OneDirection
+            rel.IsActive = bool(is_active)
+
+            self.model.Relationships.Add(rel)
+            self._changes_pending = True
+            logger.info(f"Created relationship {from_table}[{from_column}] -> {to_table}[{to_column}]")
+            return OperationResult(
+                True,
+                f"Created relationship {from_table}[{from_column}] -> {to_table}[{to_column}] ({card}, {cf})",
+            )
+        except Exception as e:
+            logger.error(f"Failed to create relationship: {e}")
+            return OperationResult(False, f"Failed to create relationship: {e}")
+
+    def delete_relationship(self, from_table: Optional[str] = None, from_column: Optional[str] = None,
+                            to_table: Optional[str] = None, to_column: Optional[str] = None,
+                            name: Optional[str] = None) -> OperationResult:
+        """Delete a relationship, identified by name or by from/to table[/column]."""
+        if not self._ensure_connected():
+            return OperationResult(False, "Not connected")
+        try:
+            target = None
+            for rel in self.model.Relationships:
+                if name and getattr(rel, "Name", None) == name:
+                    target = rel
+                    break
+                try:
+                    if (from_table and to_table
+                            and rel.FromTable.Name == from_table and rel.ToTable.Name == to_table
+                            and (not from_column or rel.FromColumn.Name == from_column)
+                            and (not to_column or rel.ToColumn.Name == to_column)):
+                        target = rel
+                        break
+                except Exception:
+                    continue
+            if not target:
+                return OperationResult(False, "Relationship not found")
+            self.model.Relationships.Remove(target)
+            self._changes_pending = True
+            logger.info("Deleted relationship")
+            return OperationResult(True, "Deleted relationship")
+        except Exception as e:
+            logger.error(f"Failed to delete relationship: {e}")
+            return OperationResult(False, f"Failed to delete relationship: {e}")
+
     # ==================== UTILITY METHODS ====================
 
     def get_model_summary(self) -> Dict[str, Any]:

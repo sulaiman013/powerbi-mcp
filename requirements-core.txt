@@ -1,0 +1,14 @@
+# Core (cross-platform) dependencies for the offline + analysis subset of the server:
+#   PBIP/TMDL/PBIR editing, Best Practice Analyzer, AI-readiness, model analysis,
+#   security layer, and the MCP resources/prompts surface.
+#
+# These do NOT include pythonnet / pyadomd (the Windows-only .NET libraries needed
+# for live Power BI Desktop / XMLA / TOM connectivity). The server imports and runs
+# fine without them; the live-connection tools simply report that they are unavailable.
+# For full connectivity install requirements.txt on Windows instead.
+
+mcp>=1.0.0
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+msal>=1.24.0

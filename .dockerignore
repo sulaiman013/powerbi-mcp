@@ -1,0 +1,14 @@
+.git
+.gitignore
+logs/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+test_*.py
+*.pbip
+*.pbix
+*.pbit
+.env
+README.md
+*.md

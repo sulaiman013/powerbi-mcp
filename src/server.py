@@ -249,6 +249,9 @@ class PowerBIMCPServer:
             "audit_ai_readiness": lambda a: self._handle_audit_ai_readiness(a),
             "analyze_model_storage": lambda a: self._handle_analyze_model_storage(a),
             "analyze_query_performance": lambda a: self._handle_analyze_query_performance(a),
+            # Relationship management (Bundle D)
+            "create_relationship": lambda a: self._handle_create_relationship(a),
+            "delete_relationship": lambda a: self._handle_delete_relationship(a),
         }
 
     def _build_tool_annotations(self):
@@ -319,6 +322,9 @@ class PowerBIMCPServer:
             "audit_ai_readiness": local_read,
             "analyze_model_storage": local_read,
             "analyze_query_performance": local_read,
+            # Relationship management (Bundle D) - mutate the live model
+            "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
+            "delete_relationship": local_destructive,
         }
 
     def _setup_handlers(self):
@@ -1022,6 +1028,39 @@ class PowerBIMCPServer:
                             "dataset_name": {"type": "string"}
                         },
                         "required": ["dax"]
+                    }
+                ),
+                # === RELATIONSHIP MANAGEMENT (Bundle D) ===
+                Tool(
+                    name="create_relationship",
+                    description="Create a relationship between two columns in the connected Power BI Desktop model (TOM). Honors an open tom transaction.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "from_table": {"type": "string", "description": "Many-side table (the fact table, typically)"},
+                            "from_column": {"type": "string", "description": "Many-side column"},
+                            "to_table": {"type": "string", "description": "One-side table (the dimension, typically)"},
+                            "to_column": {"type": "string", "description": "One-side column (usually the key)"},
+                            "cardinality": {"type": "string", "enum": ["many_to_one", "one_to_many", "one_to_one", "many_to_many"], "default": "many_to_one"},
+                            "cross_filter": {"type": "string", "enum": ["single", "both"], "default": "single"},
+                            "is_active": {"type": "boolean", "default": True}
+                        },
+                        "required": ["from_table", "from_column", "to_table", "to_column"]
+                    }
+                ),
+                Tool(
+                    name="delete_relationship",
+                    description="Delete a relationship in the connected Power BI Desktop model (TOM), identified by name or by from/to table (and optionally column). Honors an open tom transaction.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "from_table": {"type": "string"},
+                            "from_column": {"type": "string"},
+                            "to_table": {"type": "string"},
+                            "to_column": {"type": "string"},
+                            "name": {"type": "string", "description": "Relationship name (alternative to from/to)"}
+                        },
+                        "required": []
                     }
                 )
             ]
@@ -2284,6 +2323,59 @@ class PowerBIMCPServer:
         except Exception as e:
             logger.error(f"Delete measure error: {e}")
             return f"Error: {str(e)}"
+
+    # ==================== RELATIONSHIPS (Bundle D) ====================
+
+    async def _handle_create_relationship(self, args: Dict[str, Any]) -> str:
+        """Create a relationship between two columns (TOM)."""
+        try:
+            error = await self._ensure_tom_connected()
+            if error:
+                return error
+            ft, fc = args.get("from_table"), args.get("from_column")
+            tt, tc = args.get("to_table"), args.get("to_column")
+            if not all([ft, fc, tt, tc]):
+                return "Error: from_table, from_column, to_table, and to_column are required"
+            tom = self._get_tom_connector()
+            loop = asyncio.get_event_loop()
+            fn = lambda: tom.create_relationship(
+                ft, fc, tt, tc,
+                cardinality=args.get("cardinality", "many_to_one"),
+                cross_filter=args.get("cross_filter", "single"),
+                is_active=args.get("is_active", True),
+            )
+            result = await loop.run_in_executor(None, fn)
+            if not result.success:
+                return f"Failed to create relationship: {result.message}"
+            if self._tom_transaction_active:
+                return f"{result.message} (PENDING - run tom_commit_transaction to save)."
+            save = await loop.run_in_executor(None, tom.save_changes)
+            return result.message + ("" if getattr(save, "success", False) else f" (save failed: {save.message})")
+        except Exception as e:
+            return f"Error creating relationship: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_delete_relationship(self, args: Dict[str, Any]) -> str:
+        """Delete a relationship by name or by from/to table[/column] (TOM)."""
+        try:
+            error = await self._ensure_tom_connected()
+            if error:
+                return error
+            tom = self._get_tom_connector()
+            loop = asyncio.get_event_loop()
+            fn = lambda: tom.delete_relationship(
+                from_table=args.get("from_table"), from_column=args.get("from_column"),
+                to_table=args.get("to_table"), to_column=args.get("to_column"),
+                name=args.get("name"),
+            )
+            result = await loop.run_in_executor(None, fn)
+            if not result.success:
+                return f"Failed to delete relationship: {result.message}"
+            if self._tom_transaction_active:
+                return f"{result.message} (PENDING - run tom_commit_transaction to save)."
+            save = await loop.run_in_executor(None, tom.save_changes)
+            return result.message + ("" if getattr(save, "success", False) else f" (save failed: {save.message})")
+        except Exception as e:
+            return f"Error deleting relationship: {redact_secrets(str(e), [self.client_secret])}"
 
     # ==================== DAX SAFETY LOOP & TRANSACTIONS (Bundle A) ====================
 
