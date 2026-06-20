@@ -98,6 +98,25 @@ def test_data_dictionary():
     check("coverage note about live expressions", "INFO.VIEW" in out)
 
 
+def test_snapshot_diff_gate():
+    print("\n== model_snapshot / model_diff / pre_deploy_gate (wired) ==")
+    import json
+    import tempfile
+    srv = make_server()
+    snap = run(srv._handle_model_snapshot({}))
+    check("snapshot returns JSON", snap.strip().startswith("{") and '"tables"' in snap)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "base.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(snap)
+        diff = run(srv._handle_model_diff({"baseline_path": p}))
+        check("diff vs identical live -> no changes", "No semantic changes" in diff, diff[:80])
+    # pre_deploy_gate returns (text, structured)
+    text, structured = run(srv._handle_pre_deploy_gate({}))
+    check("gate returns verdict text", text.startswith("[PASS]") or text.startswith("[FAIL]"), text[:40])
+    check("gate structured has passed", isinstance(structured.get("passed"), bool), str(structured)[:80])
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  BUNDLE B (QUALITY & PERFORMANCE) WIRING TESTS")
@@ -107,6 +126,7 @@ if __name__ == "__main__":
     test_storage()
     test_query_perf()
     test_data_dictionary()
+    test_snapshot_diff_gate()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

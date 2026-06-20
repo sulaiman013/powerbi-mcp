@@ -263,6 +263,9 @@ class PowerBIMCPServer:
             "analyze_model_storage": lambda a: self._handle_analyze_model_storage(a),
             "analyze_query_performance": lambda a: self._handle_analyze_query_performance(a),
             "export_data_dictionary": lambda a: self._handle_export_data_dictionary(a),
+            "model_snapshot": lambda a: self._handle_model_snapshot(a),
+            "model_diff": lambda a: self._handle_model_diff(a),
+            "pre_deploy_gate": lambda a: self._handle_pre_deploy_gate(a),
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
@@ -337,6 +340,9 @@ class PowerBIMCPServer:
             "analyze_model_storage": local_read,
             "analyze_query_performance": local_read,
             "export_data_dictionary": ann(False, destructive=False, idempotent=True, open_world=False),
+            "model_snapshot": ann(False, destructive=False, idempotent=True, open_world=False),
+            "model_diff": local_read,
+            "pre_deploy_gate": local_read,
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
@@ -1092,6 +1098,61 @@ class PowerBIMCPServer:
                             "dataset_name": {"type": "string"}
                         },
                         "required": []
+                    }
+                ),
+                # === SNAPSHOT / DIFF / QUALITY GATE (Wave 1) ===
+                Tool(
+                    name="model_snapshot",
+                    description="Capture the connected model's metadata (tables/columns/measures/relationships) to a JSON snapshot file for later comparison with model_diff. Run before a change to establish a baseline.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "output_path": {"type": "string", "description": "File path to write the JSON snapshot; if omitted, the JSON is returned"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="model_diff",
+                    description="Produce a human-readable semantic diff (added/removed/changed tables, columns, measures, relationships) between a baseline snapshot and either another snapshot or the live model. Ideal for PR review and pre-deploy 'what changed'.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "baseline_path": {"type": "string", "description": "Path to the baseline JSON snapshot (from model_snapshot)"},
+                            "compare_path": {"type": "string", "description": "Optional path to a second snapshot to compare against; if omitted, compares against the live model"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": ["baseline_path"]
+                    }
+                ),
+                Tool(
+                    name="pre_deploy_gate",
+                    description="CI/pre-deploy quality gate: runs the Best Practice Analyzer and AI-readiness audit and returns a machine PASS/FAIL verdict with blocking issues. Fails on any BPA error (and optionally warnings) or AI score below min_ai_score.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "min_ai_score": {"type": "number", "description": "Minimum AI-readiness score to pass (default 60)", "default": 60},
+                            "block_on_warnings": {"type": "boolean", "description": "Also fail on BPA warnings (default false)", "default": False},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "passed": {"type": "boolean"},
+                            "bpa_errors": {"type": "integer"},
+                            "bpa_warnings": {"type": "integer"},
+                            "ai_score": {"type": "number"},
+                            "blocking": {"type": "array"}
+                        }
                     }
                 )
             ]
@@ -2854,6 +2915,92 @@ class PowerBIMCPServer:
             return doc + note
         except Exception as e:
             return f"Error exporting data dictionary: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_model_snapshot(self, args: Dict[str, Any]) -> str:
+        """Capture the connected model's metadata to a JSON snapshot (for later model_diff)."""
+        try:
+            model, err = await self._gather_model_metadata(
+                args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name")
+            )
+            if err:
+                return f"Error: {err}"
+            payload = json.dumps(model, default=str, indent=2)
+            output_path = args.get("output_path")
+            if output_path:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                tcount = len(model.get("tables", []))
+                return f"Snapshot of {tcount} table(s) written to {output_path} ({len(payload)} chars)."
+            return payload
+        except Exception as e:
+            return f"Error creating snapshot: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_model_diff(self, args: Dict[str, Any]) -> str:
+        """Semantic diff between a baseline snapshot and another snapshot or the live model."""
+        try:
+            baseline_path = args.get("baseline_path")
+            if not baseline_path:
+                return "Error: baseline_path is required (a JSON snapshot from model_snapshot)"
+            try:
+                with open(baseline_path, "r", encoding="utf-8") as f:
+                    before = json.load(f)
+            except Exception as e:
+                return f"Error reading baseline snapshot: {e}"
+
+            compare_path = args.get("compare_path")
+            if compare_path:
+                try:
+                    with open(compare_path, "r", encoding="utf-8") as f:
+                        after = json.load(f)
+                except Exception as e:
+                    return f"Error reading compare snapshot: {e}"
+            else:
+                after, err = await self._gather_model_metadata(
+                    args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name")
+                )
+                if err:
+                    return f"Error reading live model to compare: {err}"
+
+            return model_analysis.diff_models(before, after)["markdown"]
+        except Exception as e:
+            return f"Error diffing models: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_pre_deploy_gate(self, args: Dict[str, Any]):
+        """CI quality gate: run BPA + AI-readiness and return a machine PASS/FAIL verdict."""
+        try:
+            model, err = await self._gather_model_metadata(
+                args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name")
+            )
+            if err:
+                return (f"Error: {err}", {"passed": False, "error": err})
+            bpa = model_analysis.run_bpa(model)
+            ai = model_analysis.audit_ai_readiness(model)
+            errors = [f for f in bpa["findings"] if f["severity"] == "error"]
+            warnings = [f for f in bpa["findings"] if f["severity"] == "warning"]
+            min_ai = args.get("min_ai_score", 60)
+            block_on_warnings = bool(args.get("block_on_warnings", False))
+            passed = (len(errors) == 0 and ai["score"] >= min_ai
+                      and (not block_on_warnings or len(warnings) == 0))
+
+            structured = {
+                "passed": passed,
+                "bpa_errors": len(errors),
+                "bpa_warnings": len(warnings),
+                "ai_score": ai["score"],
+                "blocking": [f"{f['rule_id']}: {f['object']}" for f in errors],
+            }
+            verdict = "PASS" if passed else "FAIL"
+            text = f"[{verdict}] Pre-deploy quality gate\n\n"
+            text += f"  BPA errors: {len(errors)}  warnings: {len(warnings)}\n"
+            text += f"  AI-readiness: {ai['score']}/100 (min {min_ai})\n"
+            if errors:
+                text += "\nBlocking errors:\n"
+                for f in errors[:50]:
+                    text += f"  - {f['rule_id']}: {f['object']} ({f['detail']})\n"
+            return (text, structured)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error running pre-deploy gate: {msg}", {"passed": False, "error": msg})
 
     # ==================== MCP RESOURCES & COMPLETION (Bundle C) ====================
 
