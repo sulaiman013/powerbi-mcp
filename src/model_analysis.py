@@ -315,6 +315,86 @@ def audit_ai_readiness(model: Dict[str, Any]) -> Dict[str, Any]:
     return {"score": score, "grade": grade, "metrics": metrics, "recommendations": recs}
 
 
+def diff_models(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute a human-readable semantic diff between two normalized model dicts.
+
+    Returns {"has_changes", "total_changes", "summary" (dict of counts), "markdown"}.
+    Pure function - used for PR/CI 'what changed' summaries and pre-deploy review.
+    """
+    def tindex(m):
+        return {t.get("name"): t for t in m.get("tables", []) if t.get("name")}
+
+    def idx(items):
+        return {x.get("name"): x for x in items if x.get("name")}
+
+    def relkey(r):
+        return f"{r.get('from_table')}[{r.get('from_column')}] -> {r.get('to_table')}[{r.get('to_column')}]"
+
+    tb, ta = tindex(before), tindex(after)
+    added_tables = sorted(set(ta) - set(tb))
+    removed_tables = sorted(set(tb) - set(ta))
+
+    cols = {"added": [], "removed": [], "changed": []}
+    measures = {"added": [], "removed": [], "changed": []}
+
+    for name in sorted(set(tb) & set(ta)):
+        cb, ca = idx(tb[name].get("columns", [])), idx(ta[name].get("columns", []))
+        cols["added"] += [f"{name}[{c}]" for c in sorted(set(ca) - set(cb))]
+        cols["removed"] += [f"{name}[{c}]" for c in sorted(set(cb) - set(ca))]
+        for c in sorted(set(cb) & set(ca)):
+            if (cb[c].get('data_type') != ca[c].get('data_type')
+                    or (cb[c].get('description') or '') != (ca[c].get('description') or '')):
+                cols["changed"].append(f"{name}[{c}]")
+        mb, ma = idx(tb[name].get("measures", [])), idx(ta[name].get("measures", []))
+        measures["added"] += [f"{name}[{m}]" for m in sorted(set(ma) - set(mb))]
+        measures["removed"] += [f"{name}[{m}]" for m in sorted(set(mb) - set(ma))]
+        for m in sorted(set(mb) & set(ma)):
+            if ((mb[m].get('expression') or '') != (ma[m].get('expression') or '')
+                    or (mb[m].get('format_string') or '') != (ma[m].get('format_string') or '')
+                    or (mb[m].get('description') or '') != (ma[m].get('description') or '')):
+                measures["changed"].append(f"{name}[{m}]")
+
+    rb = {relkey(r) for r in before.get("relationships", [])}
+    ra = {relkey(r) for r in after.get("relationships", [])}
+    rel_added = sorted(ra - rb)
+    rel_removed = sorted(rb - ra)
+
+    summary = {
+        "tables_added": len(added_tables), "tables_removed": len(removed_tables),
+        "columns_added": len(cols["added"]), "columns_removed": len(cols["removed"]), "columns_changed": len(cols["changed"]),
+        "measures_added": len(measures["added"]), "measures_removed": len(measures["removed"]), "measures_changed": len(measures["changed"]),
+        "relationships_added": len(rel_added), "relationships_removed": len(rel_removed),
+    }
+    total = sum(summary.values())
+
+    lines = ["# Model Diff", ""]
+    if total == 0:
+        lines.append("No semantic changes detected.")
+    else:
+        lines.append(f"**{total} change(s)**")
+        lines.append("")
+
+        def section(title, items, prefix):
+            if items:
+                lines.append(f"## {title} ({len(items)})")
+                for it in items:
+                    lines.append(f"- {prefix} {it}")
+                lines.append("")
+
+        section("Tables added", added_tables, "+")
+        section("Tables removed", removed_tables, "-")
+        section("Measures added", measures["added"], "+")
+        section("Measures removed", measures["removed"], "-")
+        section("Measures changed", measures["changed"], "~")
+        section("Columns added", cols["added"], "+")
+        section("Columns removed", cols["removed"], "-")
+        section("Columns changed", cols["changed"], "~")
+        section("Relationships added", rel_added, "+")
+        section("Relationships removed", rel_removed, "-")
+
+    return {"has_changes": total > 0, "total_changes": total, "summary": summary, "markdown": "\n".join(lines)}
+
+
 def _md_escape(s) -> str:
     """Escape a value for a Markdown table cell."""
     if s is None:

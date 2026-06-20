@@ -7,7 +7,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from model_analysis import run_bpa, audit_ai_readiness, render_data_dictionary  # noqa: E402
+from model_analysis import run_bpa, audit_ai_readiness, render_data_dictionary, diff_models  # noqa: E402
 
 _failures = []
 
@@ -111,6 +111,25 @@ def test_data_dictionary():
     check("html wrapper", html.startswith("<!doctype html>"))
 
 
+def test_diff_models():
+    print("\n== diff_models ==")
+    same = diff_models(MODEL, MODEL)
+    check("identical -> no changes", same["has_changes"] is False and same["total_changes"] == 0)
+    check("identical markdown says so", "No semantic changes" in same["markdown"])
+
+    import copy
+    after = copy.deepcopy(MODEL)
+    # add a measure, remove a column, change a measure expression
+    after["tables"][0]["measures"].append({"name": "New Measure", "expression": "1", "is_hidden": False})
+    after["tables"][0]["columns"] = [c for c in after["tables"][0]["columns"] if c["name"] != "Qty"]
+    after["tables"][0]["measures"][0]["expression"] = "SUM(Sales[Amount]) * 2"
+    d = diff_models(MODEL, after)
+    check("detects changes", d["has_changes"] is True)
+    check("measure added", "Sales[New Measure]" in d["markdown"])
+    check("column removed", "Sales[Qty]" in d["markdown"])
+    check("measure changed", d["summary"]["measures_changed"] >= 1, str(d["summary"]))
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  MODEL ANALYSIS (BPA + AI-READINESS) TESTS")
@@ -118,6 +137,7 @@ if __name__ == "__main__":
     test_bpa()
     test_ai_readiness()
     test_data_dictionary()
+    test_diff_models()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")
