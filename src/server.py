@@ -52,6 +52,21 @@ def redact_secrets(text: Any, extra_secrets: Optional[List[str]] = None) -> str:
     return s
 
 
+def build_validation_probe(dax: str, as_measure: bool = False) -> str:
+    """Wrap a DAX expression/query into an executable probe used to validate it.
+
+    A full query (starts with EVALUATE/DEFINE) is run as-is; a scalar measure
+    expression is wrapped in EVALUATE ROW(...) so the engine parses and evaluates it.
+    Executing the probe with a tiny row cap surfaces syntax/semantic errors without
+    materializing real data.
+    """
+    stripped = (dax or "").strip()
+    upper = stripped.upper()
+    if not as_measure and (upper.startswith("EVALUATE") or upper.startswith("DEFINE")):
+        return stripped
+    return f'EVALUATE ROW("validation", {stripped})'
+
+
 # Import connectors
 from powerbi_rest_connector import PowerBIRestConnector
 from powerbi_xmla_connector import PowerBIXmlaConnector
@@ -81,6 +96,9 @@ class PowerBIMCPServer:
         self.desktop_connector: Optional[PowerBIDesktopConnector] = None
         self.tom_connector: Optional[PowerBITOMConnector] = None
         self.pbip_connector: Optional[PowerBIPBIPConnector] = None
+
+        # When a TOM transaction is open, write tools defer SaveChanges until commit.
+        self._tom_transaction_active = False
 
         # Initialize security layer
         config_path = Path(__file__).parent.parent / "config" / "policies.yaml"
@@ -144,6 +162,12 @@ class PowerBIMCPServer:
             "pbip_fix_dax_quoting": lambda a: self._handle_pbip_fix_dax_quoting(),
             "pbip_scan_broken_refs": lambda a: self._handle_pbip_scan_broken_refs(),
             "pbip_validate": lambda a: self._handle_pbip_validate(),
+            # DAX safety loop + transactions (Bundle A)
+            "validate_dax": lambda a: self._handle_validate_dax(a),
+            "scan_measure_dependencies": lambda a: self._handle_scan_measure_dependencies(a),
+            "tom_begin_transaction": lambda a: self._handle_tom_begin_transaction(),
+            "tom_commit_transaction": lambda a: self._handle_tom_commit_transaction(),
+            "tom_rollback_transaction": lambda a: self._handle_tom_rollback_transaction(),
         }
 
     def _build_tool_annotations(self):
@@ -203,6 +227,12 @@ class PowerBIMCPServer:
             "pbip_fix_dax_quoting": local_destructive,
             "pbip_scan_broken_refs": local_read,
             "pbip_validate": local_read,
+            # DAX safety loop + transactions (Bundle A)
+            "validate_dax": ann(True, open_world=False),
+            "scan_measure_dependencies": local_read,
+            "tom_begin_transaction": ann(False, destructive=False, idempotent=False),
+            "tom_commit_transaction": ann(False, destructive=False, idempotent=False),
+            "tom_rollback_transaction": ann(False, destructive=False, idempotent=True),
         }
 
     def _setup_handlers(self):
@@ -567,8 +597,12 @@ class PowerBIMCPServer:
                             },
                             "auto_save": {
                                 "type": "boolean",
-                                "description": "Whether to automatically save changes (default: true)",
-                                "default": True
+                                "description": "Whether to automatically save changes (default: true, or false inside an open transaction)"
+                            },
+                            "skip_validation": {
+                                "type": "boolean",
+                                "description": "Skip validating each new expression against the model before committing (default: false)",
+                                "default": False
                             }
                         },
                         "required": ["updates"]
@@ -599,6 +633,11 @@ class PowerBIMCPServer:
                             "description": {
                                 "type": "string",
                                 "description": "Optional description for the measure"
+                            },
+                            "skip_validation": {
+                                "type": "boolean",
+                                "description": "Skip validating the expression against the model before creating (default: false)",
+                                "default": False
                             }
                         },
                         "required": ["table_name", "measure_name", "expression"]
@@ -772,6 +811,52 @@ class PowerBIMCPServer:
                         "properties": {},
                         "required": []
                     }
+                ),
+                # === DAX SAFETY LOOP & TRANSACTIONS (Bundle A) ===
+                Tool(
+                    name="validate_dax",
+                    description="Validate a DAX query or scalar measure expression against the connected model WITHOUT committing anything. Executes a minimal probe and returns syntax/semantic errors so an agent can self-correct before writing a measure.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "dax": {"type": "string", "description": "A full DAX query (EVALUATE/DEFINE...) or a scalar measure expression to validate"},
+                            "as_measure": {"type": "boolean", "description": "Treat 'dax' as a scalar measure expression (wraps it in EVALUATE ROW for validation). Default false.", "default": False},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "description": "Validate against Desktop (local) or cloud. Default 'desktop'.", "default": "desktop"},
+                            "workspace_name": {"type": "string", "description": "Cloud only: workspace name"},
+                            "dataset_name": {"type": "string", "description": "Cloud only: dataset name"}
+                        },
+                        "required": ["dax"]
+                    }
+                ),
+                Tool(
+                    name="scan_measure_dependencies",
+                    description="Analyze the dependency graph of a measure or column using INFO.CALCDEPENDENCY: upstream (what it depends on) and downstream (what depends on it). Use before renaming or deleting to see what would break.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "measure_name": {"type": "string", "description": "Name of the measure or column to analyze"},
+                            "direction": {"type": "string", "enum": ["upstream", "downstream", "both"], "description": "upstream = dependencies; downstream = dependents. Default 'both'.", "default": "both"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "description": "Desktop (local) or cloud. Default 'desktop'.", "default": "desktop"},
+                            "workspace_name": {"type": "string", "description": "Cloud only: workspace name"},
+                            "dataset_name": {"type": "string", "description": "Cloud only: dataset name"}
+                        },
+                        "required": ["measure_name"]
+                    }
+                ),
+                Tool(
+                    name="tom_begin_transaction",
+                    description="Begin a TOM write transaction. While open, model write tools (create_measure, delete_measure, batch_update_measures) defer saving until tom_commit_transaction, so a batch of edits is atomic and can be rolled back.",
+                    inputSchema={"type": "object", "properties": {}, "required": []}
+                ),
+                Tool(
+                    name="tom_commit_transaction",
+                    description="Commit (SaveChanges) all pending TOM model edits made since tom_begin_transaction and close the transaction.",
+                    inputSchema={"type": "object", "properties": {}, "required": []}
+                ),
+                Tool(
+                    name="tom_rollback_transaction",
+                    description="Roll back (UndoLocalChanges) all pending TOM model edits made since tom_begin_transaction and close the transaction.",
+                    inputSchema={"type": "object", "properties": {}, "required": []}
                 )
             ]
             # Attach MCP safety/behavior hints from the annotations registry.
@@ -1827,10 +1912,28 @@ class PowerBIMCPServer:
                 return error
 
             updates = args.get("updates", [])
-            auto_save = args.get("auto_save", True)
 
             if not updates:
                 return "Error: 'updates' array is required"
+
+            # Validate-before-commit: probe every new expression first.
+            if not bool(args.get("skip_validation", False)):
+                invalid = []
+                for u in updates:
+                    expr = u.get("expression")
+                    if expr:
+                        status, verr = await self._validate_via_desktop(expr, as_measure=True)
+                        if status is False:
+                            invalid.append((u.get("measure_name", "?"), redact_secrets(verr, [self.client_secret])))
+                if invalid:
+                    detail = "\n".join(f"  - {n}: {e}" for n, e in invalid)
+                    return (
+                        f"[INVALID] No measures updated - {len(invalid)} expression(s) failed validation:\n"
+                        f"{detail}\n\n(pass skip_validation=true to override)"
+                    )
+
+            # Inside an explicit transaction, defer the save until commit.
+            auto_save = args.get("auto_save", not self._tom_transaction_active)
 
             tom = self._get_tom_connector()
 
@@ -1872,6 +1975,16 @@ class PowerBIMCPServer:
             if not all([table_name, measure_name, expression]):
                 return "Error: table_name, measure_name, and expression are required"
 
+            # Validate-before-commit: probe the expression against the live model first.
+            if not bool(args.get("skip_validation", False)):
+                status, verr = await self._validate_via_desktop(expression, as_measure=True)
+                if status is False:
+                    return (
+                        f"[INVALID] Measure '{measure_name}' was NOT created - the expression failed validation.\n\n"
+                        f"Error: {redact_secrets(verr, [self.client_secret])}\n\n"
+                        "Fix the DAX and retry (or pass skip_validation=true to override)."
+                    )
+
             tom = self._get_tom_connector()
 
             # Create measure
@@ -1883,6 +1996,11 @@ class PowerBIMCPServer:
             result = await asyncio.get_event_loop().run_in_executor(None, create_fn)
 
             if result.success:
+                if self._tom_transaction_active:
+                    return (
+                        f"Measure '{measure_name}' created in table '{table_name}' (PENDING - "
+                        "run tom_commit_transaction to save).\n\nExpression: {expr}".format(expr=expression)
+                    )
                 # Auto-save
                 save_fn = lambda: tom.save_changes()
                 save_result = await asyncio.get_event_loop().run_in_executor(None, save_fn)
@@ -1918,6 +2036,8 @@ class PowerBIMCPServer:
             result = await asyncio.get_event_loop().run_in_executor(None, delete_fn)
 
             if result.success:
+                if self._tom_transaction_active:
+                    return f"Measure '{measure_name}' deleted (PENDING - run tom_commit_transaction to save)."
                 # Auto-save
                 save_fn = lambda: tom.save_changes()
                 save_result = await asyncio.get_event_loop().run_in_executor(None, save_fn)
@@ -1932,6 +2052,174 @@ class PowerBIMCPServer:
         except Exception as e:
             logger.error(f"Delete measure error: {e}")
             return f"Error: {str(e)}"
+
+    # ==================== DAX SAFETY LOOP & TRANSACTIONS (Bundle A) ====================
+
+    async def _validate_via_desktop(self, dax: str, as_measure: bool = True):
+        """Validate a DAX expression against the connected Desktop model.
+
+        Returns (status, error) where status is True (valid), False (invalid),
+        or None (could not validate, e.g. Desktop not connected -> caller skips).
+        """
+        desktop = self._get_desktop_connector()
+        if not desktop.current_port:
+            return None, "Desktop not connected"
+        probe = build_validation_probe(dax, as_measure)
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, desktop.execute_dax, probe, 1
+            )
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    async def _handle_validate_dax(self, args: Dict[str, Any]) -> str:
+        """Validate DAX (query or scalar measure expression) without committing."""
+        try:
+            dax = args.get("dax")
+            if not dax:
+                return "Error: dax is required"
+            as_measure = bool(args.get("as_measure", False))
+            source = (args.get("source") or "desktop").lower()
+            probe = build_validation_probe(dax, as_measure)
+            loop = asyncio.get_event_loop()
+
+            if source == "cloud":
+                workspace = args.get("workspace_name")
+                dataset = args.get("dataset_name")
+                if not (workspace and dataset):
+                    return "Error: workspace_name and dataset_name are required for cloud validation"
+                connector = await loop.run_in_executor(
+                    None, self._get_xmla_connector, workspace, dataset
+                )
+                if not connector:
+                    return f"Error: could not connect to dataset '{dataset}'"
+                await loop.run_in_executor(None, connector.execute_dax, probe)
+            else:
+                desktop = self._get_desktop_connector()
+                if not desktop.current_port:
+                    return "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+                await loop.run_in_executor(None, desktop.execute_dax, probe, 1)
+
+            return f"[VALID] DAX validated successfully against the model.\n\nProbe executed:\n{probe}"
+
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (
+                "[INVALID] DAX failed validation.\n\n"
+                f"Error:\n{msg}\n\nProbe:\n{build_validation_probe(args.get('dax', ''), bool(args.get('as_measure', False)))}"
+            )
+
+    @staticmethod
+    def _row_get(row: Dict[str, Any], *names):
+        """Read a field from an INFO.* result row tolerating bracketed/cased key variants."""
+        for n in names:
+            for k in (n, f"[{n}]", n.lower(), f"[{n.lower()}]", n.upper(), f"[{n.upper()}]"):
+                if k in row:
+                    return row[k]
+        return None
+
+    async def _handle_scan_measure_dependencies(self, args: Dict[str, Any]) -> str:
+        """Dependency/impact analysis via INFO.CALCDEPENDENCY."""
+        try:
+            name = args.get("measure_name") or args.get("object_name")
+            if not name:
+                return "Error: measure_name is required"
+            direction = (args.get("direction") or "both").lower()
+            source = (args.get("source") or "desktop").lower()
+            esc = str(name).replace('"', '""')
+            loop = asyncio.get_event_loop()
+
+            # Resolve an executor callable for the chosen source
+            if source == "cloud":
+                workspace = args.get("workspace_name")
+                dataset = args.get("dataset_name")
+                if not (workspace and dataset):
+                    return "Error: workspace_name and dataset_name are required for cloud"
+                connector = await loop.run_in_executor(
+                    None, self._get_xmla_connector, workspace, dataset
+                )
+                if not connector:
+                    return f"Error: could not connect to dataset '{dataset}'"
+                run = lambda q: connector.execute_dax(q)
+            else:
+                desktop = self._get_desktop_connector()
+                if not desktop.current_port:
+                    return "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+                run = lambda q: desktop.execute_dax(q, 5000)
+
+            response = f"=== Dependency analysis for '{name}' ===\n\n"
+
+            if direction in ("upstream", "both"):
+                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), [OBJECT] = "{esc}")'
+                rows = await loop.run_in_executor(None, run, q)
+                response += f"--- Upstream (what '{name}' depends on): {len(rows)} ---\n"
+                for r in rows[:50]:
+                    rtype = self._row_get(r, "REFERENCED_OBJECT_TYPE") or "?"
+                    rtable = self._row_get(r, "REFERENCED_TABLE") or ""
+                    robj = self._row_get(r, "REFERENCED_OBJECT") or ""
+                    response += f"  -> [{rtype}] {rtable}{('[' + robj + ']') if robj else ''}\n"
+                response += "\n"
+
+            if direction in ("downstream", "both"):
+                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), [REFERENCED_OBJECT] = "{esc}")'
+                rows = await loop.run_in_executor(None, run, q)
+                response += f"--- Downstream (what depends on '{name}'): {len(rows)} ---\n"
+                if not rows:
+                    response += "  (none found - safe to change from a model-dependency standpoint;\n"
+                    response += "   report visuals are not covered here - use pbip_scan_broken_refs for that)\n"
+                for r in rows[:50]:
+                    otype = self._row_get(r, "OBJECT_TYPE") or "?"
+                    otable = self._row_get(r, "TABLE") or ""
+                    oobj = self._row_get(r, "OBJECT") or ""
+                    response += f"  <- [{otype}] {otable}{('[' + oobj + ']') if oobj else ''}\n"
+                response += "\n"
+
+            return response
+
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (
+                f"Error scanning dependencies: {msg}\n\n"
+                "Note: INFO.CALCDEPENDENCY requires a recent Analysis Services engine. "
+                "If unsupported, upgrade Power BI Desktop or use scan_table_dependencies."
+            )
+
+    async def _handle_tom_begin_transaction(self) -> str:
+        """Begin a TOM write transaction (defers SaveChanges until commit)."""
+        error = await self._ensure_tom_connected()
+        if error:
+            return error
+        if self._tom_transaction_active:
+            return "A TOM transaction is already open. Commit or roll it back first."
+        self._tom_transaction_active = True
+        return (
+            "TOM transaction started. Subsequent create_measure / delete_measure / "
+            "batch_update_measures edits are deferred until tom_commit_transaction "
+            "(or discarded by tom_rollback_transaction)."
+        )
+
+    async def _handle_tom_commit_transaction(self) -> str:
+        """Commit pending TOM edits."""
+        if not self._tom_transaction_active:
+            return "No TOM transaction is open."
+        tom = self._get_tom_connector()
+        result = await asyncio.get_event_loop().run_in_executor(None, tom.save_changes)
+        self._tom_transaction_active = False
+        if getattr(result, "success", False):
+            return f"Transaction committed. {getattr(result, 'message', '')}".strip()
+        return f"Commit failed: {getattr(result, 'message', 'unknown error')}"
+
+    async def _handle_tom_rollback_transaction(self) -> str:
+        """Roll back pending TOM edits."""
+        if not self._tom_transaction_active:
+            return "No TOM transaction is open."
+        tom = self._get_tom_connector()
+        result = await asyncio.get_event_loop().run_in_executor(None, tom.discard_changes)
+        self._tom_transaction_active = False
+        if getattr(result, "success", False):
+            return f"Transaction rolled back. {getattr(result, 'message', '')}".strip()
+        return f"Rollback failed: {getattr(result, 'message', 'unknown error')}"
 
     # ==================== PBIP HANDLERS (File-based editing) ====================
 
