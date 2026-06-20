@@ -16,8 +16,14 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from mcp.server import Server, NotificationOptions
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ToolAnnotations
+from mcp.types import (
+    Tool, TextContent, ToolAnnotations,
+    Resource, ResourceTemplate,
+    Prompt, PromptArgument, PromptMessage, GetPromptResult,
+    Completion,
+)
 from mcp.server.models import InitializationOptions
+from urllib.parse import unquote
 
 # Load environment variables
 load_dotenv()
@@ -116,8 +122,75 @@ class PowerBIMCPServer:
         # register here (dispatch + annotations) in addition to handle_list_tools.
         self._tool_dispatch = self._build_tool_dispatch()
         self._tool_annotations = self._build_tool_annotations()
+        self._prompts = self._build_prompts()
 
         self._setup_handlers()
+
+    def _build_prompts(self):
+        """Reusable, user-invokable BI workflows exposed as MCP prompts. Each renders a
+        guidance message that orchestrates the right tools in the right order."""
+        return {
+            "optimize_measure": {
+                "title": "Optimize a DAX measure",
+                "description": "Diagnose and optimize a DAX measure safely",
+                "arguments": [PromptArgument(name="measure_name", description="Measure to optimize", required=True)],
+                "render": lambda a: (
+                    f"Optimize the DAX measure [{a.get('measure_name','<name>')}] in the connected model.\n"
+                    "1) scan_measure_dependencies to understand what it uses and what depends on it.\n"
+                    "2) analyze_query_performance on a query that exercises it to get a baseline.\n"
+                    "3) Propose an improved expression; validate_dax it before changing anything.\n"
+                    "4) Apply with create_measure/batch_update_measures (inside a tom transaction) and re-check."
+                ),
+            },
+            "explain_measure": {
+                "title": "Explain a measure",
+                "description": "Explain what a measure computes in business terms",
+                "arguments": [PromptArgument(name="measure_name", description="Measure to explain", required=True)],
+                "render": lambda a: (
+                    f"Explain the measure [{a.get('measure_name','<name>')}] in plain business language.\n"
+                    "Use desktop_list_measures for its DAX and scan_measure_dependencies for context. "
+                    "Describe inputs, the calculation, filter context, and a usage example."
+                ),
+            },
+            "audit_model": {
+                "title": "Audit the model",
+                "description": "Full quality + AI-readiness audit of the connected model",
+                "arguments": [],
+                "render": lambda a: (
+                    "Audit the connected Power BI model end to end:\n"
+                    "1) run_bpa (note errors/warnings by category).\n"
+                    "2) audit_ai_readiness (descriptions/format coverage).\n"
+                    "3) analyze_model_storage (largest tables).\n"
+                    "Then summarize the top issues and a prioritized remediation plan."
+                ),
+            },
+            "document_model": {
+                "title": "Document the model",
+                "description": "Generate human-readable documentation for the connected model",
+                "arguments": [],
+                "render": lambda a: (
+                    "Generate documentation for the connected model.\n"
+                    "Use get_model_info / desktop_get_model_info and the powerbi://desktop/schema resource. "
+                    "Produce: overview, table-by-table (purpose, key columns), key measures (with descriptions), "
+                    "relationships, and any best-practice issues from run_bpa."
+                ),
+            },
+            "plan_safe_rename": {
+                "title": "Plan a safe rename",
+                "description": "Plan a rename that won't break visuals or downstream measures",
+                "arguments": [
+                    PromptArgument(name="old_name", description="Current name", required=True),
+                    PromptArgument(name="new_name", description="New name", required=True),
+                ],
+                "render": lambda a: (
+                    f"Plan a SAFE rename from [{a.get('old_name','<old>')}] to [{a.get('new_name','<new>')}].\n"
+                    "1) scan_measure_dependencies (downstream) and pbip_scan_broken_refs to see impact.\n"
+                    "2) Use the PBIP tools (pbip_rename_tables/columns/measures) which update model AND report visuals - "
+                    "do NOT use the deprecated TOM batch_rename_* tools (they break visuals).\n"
+                    "3) After renaming, run pbip_validate and pbip_scan_broken_refs to confirm nothing is broken."
+                ),
+            },
+        }
 
     def _build_tool_dispatch(self):
         """Map tool name -> coroutine handler. Every entry accepts the args dict
@@ -839,6 +912,14 @@ class PowerBIMCPServer:
                             "dataset_name": {"type": "string", "description": "Cloud only: dataset name"}
                         },
                         "required": ["dax"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "valid": {"type": "boolean"},
+                            "error": {"type": ["string", "null"]},
+                            "probe": {"type": "string"}
+                        }
                     }
                 ),
                 Tool(
@@ -885,6 +966,13 @@ class PowerBIMCPServer:
                             "dataset_name": {"type": "string"}
                         },
                         "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "summary": {"type": "object"},
+                            "findings": {"type": "array"}
+                        }
                     }
                 ),
                 Tool(
@@ -898,6 +986,15 @@ class PowerBIMCPServer:
                             "dataset_name": {"type": "string"}
                         },
                         "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "score": {"type": "number"},
+                            "grade": {"type": "string"},
+                            "metrics": {"type": "object"},
+                            "recommendations": {"type": "array"}
+                        }
                     }
                 ),
                 Tool(
@@ -953,12 +1050,78 @@ class PowerBIMCPServer:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
                 result = await handler(args)
+                # Handlers return either a plain string (text only) or a
+                # (text, structured_dict) tuple for tools that declare an outputSchema.
+                # The MCP SDK puts the dict in structuredContent for typed, chainable results.
+                if isinstance(result, tuple) and len(result) == 2:
+                    text, structured = result
+                    return [TextContent(type="text", text=text)], structured
                 return [TextContent(type="text", text=result)]
 
             except Exception as e:
                 safe_err = redact_secrets(str(e), [self.client_secret])
                 logger.error(f"Error executing {name}: {safe_err}", exc_info=True)
                 return [TextContent(type="text", text=f"Error executing {name}: {safe_err}")]
+
+        # ---------- MCP Resources: model context without spending a tool call ----------
+        @self.server.list_resources()
+        async def handle_list_resources():
+            return [
+                Resource(uri="powerbi://desktop/schema", name="desktop_schema",
+                         title="Connected model schema",
+                         description="Tables, columns, measures and relationships of the connected Power BI Desktop model",
+                         mimeType="application/json"),
+                Resource(uri="powerbi://desktop/measures", name="desktop_measures",
+                         title="Model measures",
+                         description="All measures (with DAX expressions) in the connected Desktop model",
+                         mimeType="application/json"),
+                Resource(uri="powerbi://desktop/bpa", name="desktop_bpa",
+                         title="Best Practice Analyzer findings",
+                         description="BPA scan of the connected Desktop model",
+                         mimeType="application/json"),
+                Resource(uri="powerbi://desktop/ai-readiness", name="desktop_ai_readiness",
+                         title="AI-readiness report",
+                         description="AI-readiness score and metrics for the connected Desktop model",
+                         mimeType="application/json"),
+            ]
+
+        @self.server.list_resource_templates()
+        async def handle_list_resource_templates():
+            return [
+                ResourceTemplate(uriTemplate="powerbi://cloud/{workspace}/{dataset}/schema",
+                                 name="cloud_schema", title="Cloud model schema",
+                                 description="Schema of a published semantic model via the XMLA endpoint",
+                                 mimeType="application/json"),
+            ]
+
+        @self.server.read_resource()
+        async def handle_read_resource(uri):
+            return await self._read_resource(str(uri))
+
+        # ---------- MCP Prompts: reusable guided BI workflows ----------
+        @self.server.list_prompts()
+        async def handle_list_prompts():
+            return [
+                Prompt(name=n, title=p.get("title", n), description=p["description"],
+                       arguments=p.get("arguments", []))
+                for n, p in self._prompts.items()
+            ]
+
+        @self.server.get_prompt()
+        async def handle_get_prompt(name, arguments):
+            p = self._prompts.get(name)
+            if not p:
+                raise ValueError(f"Unknown prompt: {name}")
+            text = p["render"](arguments or {})
+            return GetPromptResult(
+                description=p["description"],
+                messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))],
+            )
+
+        # ---------- MCP Completion: ground arguments in real model object names ----------
+        @self.server.completion()
+        async def handle_completion(ref, argument, context):
+            return await self._complete_argument(argument)
 
     # ==================== DESKTOP HANDLERS ====================
 
@@ -2142,41 +2305,44 @@ class PowerBIMCPServer:
         except Exception as e:
             return False, str(e)
 
-    async def _handle_validate_dax(self, args: Dict[str, Any]) -> str:
-        """Validate DAX (query or scalar measure expression) without committing."""
-        try:
-            dax = args.get("dax")
-            if not dax:
-                return "Error: dax is required"
-            as_measure = bool(args.get("as_measure", False))
-            source = (args.get("source") or "desktop").lower()
-            probe = build_validation_probe(dax, as_measure)
-            loop = asyncio.get_event_loop()
+    async def _handle_validate_dax(self, args: Dict[str, Any]):
+        """Validate DAX (query or scalar measure expression) without committing.
 
+        Returns (text, {valid, error, probe}) so agents get a typed result.
+        """
+        dax = args.get("dax")
+        probe = build_validation_probe(dax or "", bool(args.get("as_measure", False)))
+        if not dax:
+            return ("Error: dax is required", {"valid": False, "error": "dax is required", "probe": probe})
+        source = (args.get("source") or "desktop").lower()
+        loop = asyncio.get_event_loop()
+        try:
             if source == "cloud":
                 workspace = args.get("workspace_name")
                 dataset = args.get("dataset_name")
                 if not (workspace and dataset):
-                    return "Error: workspace_name and dataset_name are required for cloud validation"
-                connector = await loop.run_in_executor(
-                    None, self._get_xmla_connector, workspace, dataset
-                )
+                    msg = "Error: workspace_name and dataset_name are required for cloud validation"
+                    return (msg, {"valid": False, "error": msg, "probe": probe})
+                connector = await loop.run_in_executor(None, self._get_xmla_connector, workspace, dataset)
                 if not connector:
-                    return f"Error: could not connect to dataset '{dataset}'"
+                    msg = f"Error: could not connect to dataset '{dataset}'"
+                    return (msg, {"valid": False, "error": msg, "probe": probe})
                 await loop.run_in_executor(None, connector.execute_dax, probe)
             else:
                 desktop = self._get_desktop_connector()
                 if not desktop.current_port:
-                    return "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+                    msg = "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+                    return (msg, {"valid": False, "error": msg, "probe": probe})
                 await loop.run_in_executor(None, desktop.execute_dax, probe, 1)
-
-            return f"[VALID] DAX validated successfully against the model.\n\nProbe executed:\n{probe}"
-
+            return (
+                f"[VALID] DAX validated successfully against the model.\n\nProbe executed:\n{probe}",
+                {"valid": True, "error": None, "probe": probe},
+            )
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (
-                "[INVALID] DAX failed validation.\n\n"
-                f"Error:\n{msg}\n\nProbe:\n{build_validation_probe(args.get('dax', ''), bool(args.get('as_measure', False)))}"
+                f"[INVALID] DAX failed validation.\n\nError:\n{msg}\n\nProbe:\n{probe}",
+                {"valid": False, "error": msg, "probe": probe},
             )
 
     @staticmethod
@@ -2375,14 +2541,14 @@ class PowerBIMCPServer:
             })
         return {"tables": list(tmap.values()), "relationships": rels}, None
 
-    async def _handle_run_bpa(self, args: Dict[str, Any]) -> str:
-        """Run the Best Practice Analyzer over the connected model."""
+    async def _handle_run_bpa(self, args: Dict[str, Any]):
+        """Run the Best Practice Analyzer over the connected model. Returns (text, result)."""
         try:
             model, err = await self._gather_model_metadata(
                 args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name")
             )
             if err:
-                return f"Error: {err}"
+                return (f"Error: {err}", {"error": err, "summary": {"total": 0}, "findings": []})
             result = model_analysis.run_bpa(
                 model, categories=args.get("categories"),
                 min_severity=(args.get("min_severity") or "info"),
@@ -2404,18 +2570,19 @@ class PowerBIMCPServer:
                 out += f"\n... and {s['total'] - 200} more findings (filter by category or min_severity).\n"
             if s["total"] == 0:
                 out += "No issues found for the selected rules.\n"
-            return out
+            return (out, result)
         except Exception as e:
-            return f"Error running BPA: {redact_secrets(str(e), [self.client_secret])}"
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error running BPA: {msg}", {"error": msg, "summary": {"total": 0}, "findings": []})
 
-    async def _handle_audit_ai_readiness(self, args: Dict[str, Any]) -> str:
-        """Score how AI-ready (Copilot/agent-ready) the connected model is."""
+    async def _handle_audit_ai_readiness(self, args: Dict[str, Any]):
+        """Score how AI-ready (Copilot/agent-ready) the connected model is. Returns (text, result)."""
         try:
             model, err = await self._gather_model_metadata(
                 args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name")
             )
             if err:
-                return f"Error: {err}"
+                return (f"Error: {err}", {"error": err, "score": 0})
             r = model_analysis.audit_ai_readiness(model)
             m = r["metrics"]
             out = "=== AI-Readiness Audit ===\n\n"
@@ -2428,9 +2595,10 @@ class PowerBIMCPServer:
             out += "--- Recommendations ---\n"
             for rec in r["recommendations"]:
                 out += f"  - {rec}\n"
-            return out
+            return (out, r)
         except Exception as e:
-            return f"Error auditing AI-readiness: {redact_secrets(str(e), [self.client_secret])}"
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error auditing AI-readiness: {msg}", {"error": msg, "score": 0})
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus
@@ -2532,6 +2700,67 @@ class PowerBIMCPServer:
             return out
         except Exception as e:
             return f"Error analyzing query performance: {redact_secrets(str(e), [self.client_secret])}"
+
+    # ==================== MCP RESOURCES & COMPLETION (Bundle C) ====================
+
+    async def _read_resource(self, uri: str) -> str:
+        """Resolve a powerbi:// resource URI to a JSON document (read-only model context)."""
+        try:
+            rest = uri.split("://", 1)[1] if "://" in uri else uri
+            parts = [unquote(p) for p in rest.split("/") if p != ""]
+            if not parts:
+                return json.dumps({"error": f"unrecognized resource uri: {uri}"})
+
+            if parts[0] == "desktop":
+                kind = parts[1] if len(parts) > 1 else "schema"
+                model, err = await self._gather_model_metadata("desktop")
+                if err:
+                    return json.dumps({"error": err})
+                if kind == "schema":
+                    return json.dumps(model, default=str, indent=2)
+                if kind == "measures":
+                    measures = [m for t in model["tables"] for m in t.get("measures", [])]
+                    return json.dumps(measures, default=str, indent=2)
+                if kind == "bpa":
+                    return json.dumps(model_analysis.run_bpa(model), default=str, indent=2)
+                if kind in ("ai-readiness", "ai_readiness"):
+                    return json.dumps(model_analysis.audit_ai_readiness(model), default=str, indent=2)
+                return json.dumps({"error": f"unknown desktop resource '{kind}'"})
+
+            if parts[0] == "cloud" and len(parts) >= 3:
+                workspace, dataset = parts[1], parts[2]
+                model, err = await self._gather_model_metadata("cloud", workspace, dataset)
+                if err:
+                    return json.dumps({"error": err})
+                return json.dumps(model, default=str, indent=2)
+
+            return json.dumps({"error": f"unrecognized resource uri: {uri}"})
+        except Exception as e:
+            return json.dumps({"error": redact_secrets(str(e), [self.client_secret])})
+
+    async def _complete_argument(self, argument) -> Completion:
+        """Completion for prompt/resource-template arguments: real table/measure names
+        from the connected Desktop model when available."""
+        try:
+            name = getattr(argument, "name", "") or ""
+            value = (getattr(argument, "value", "") or "").lower()
+            candidates = []
+            desktop = self.desktop_connector
+            if desktop is not None and getattr(desktop, "current_port", None):
+                model, err = await self._gather_model_metadata("desktop")
+                if not err and model:
+                    measures = [m["name"] for t in model["tables"] for m in t.get("measures", []) if m.get("name")]
+                    tables = [t["name"] for t in model["tables"] if t.get("name")]
+                    if name in ("measure_name", "old_name", "new_name"):
+                        candidates = measures + tables
+                    elif name in ("table", "dataset", "table_name"):
+                        candidates = tables
+                    else:
+                        candidates = tables + measures
+            filtered = [c for c in candidates if value in c.lower()][:100]
+            return Completion(values=filtered, total=len(filtered), hasMore=False)
+        except Exception:
+            return Completion(values=[], total=0, hasMore=False)
 
     # ==================== PBIP HANDLERS (File-based editing) ====================
 

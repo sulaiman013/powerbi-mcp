@@ -88,10 +88,12 @@ def run(coro):
 def test_validate_dax():
     print("\n== validate_dax ==")
     srv = make_server(bad=("BADTOKEN",))
-    ok = run(srv._handle_validate_dax({"dax": "EVALUATE Sales"}))
-    check("valid query -> [VALID]", ok.startswith("[VALID]"), ok[:60])
-    bad = run(srv._handle_validate_dax({"dax": "EVALUATE BADTOKEN"}))
-    check("bad query -> [INVALID]", bad.startswith("[INVALID]"), bad[:60])
+    ok_text, ok_struct = run(srv._handle_validate_dax({"dax": "EVALUATE Sales"}))
+    check("valid query -> [VALID]", ok_text.startswith("[VALID]"), ok_text[:60])
+    check("valid -> structured valid=True", ok_struct.get("valid") is True, str(ok_struct))
+    bad_text, bad_struct = run(srv._handle_validate_dax({"dax": "EVALUATE BADTOKEN"}))
+    check("bad query -> [INVALID]", bad_text.startswith("[INVALID]"), bad_text[:60])
+    check("bad -> structured valid=False", bad_struct.get("valid") is False, str(bad_struct))
 
 
 def test_create_measure_validation():
