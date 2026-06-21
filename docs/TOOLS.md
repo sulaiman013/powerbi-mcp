@@ -1,6 +1,6 @@
 # Tool Reference
 
-The Power BI MCP server exposes **68 tools**, plus MCP **resources**, **prompts**, and
+The Power BI MCP server exposes **70 tools**, plus MCP **resources**, **prompts**, and
 **completion**. Every tool carries MCP annotations (`readOnlyHint` / `destructiveHint` /
 `idempotentHint` / `openWorldHint`) so clients can auto-approve reads and confirm writes.
 
@@ -128,6 +128,12 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 |------|--|-------------|
 | `pbix_inspect` | 🟢 | Inspect a `.pbix` (ZIP/OPC) package: thick vs thin, report format, page count, entry list. No extraction |
 | `pbix_extract` | 🟡 | Extract a `.pbix` to a folder (Zip-Slip protected) and decode the legacy UTF-16-LE `Report/Layout` to readable `Report/Layout.json` |
+
+## Custom BPA governance — 2
+| Tool | | Description |
+|------|--|-------------|
+| `bpa_validate_rules` | 🟢 | Validate a custom BPA rules JSON (required fields, valid Severity/Scope, duplicate IDs, destructive low-severity fixes, stray runtime fields); optional `fix` returns a cleaned copy |
+| `bpa_audit_rule_sources` | 🟢 | Audit where BPA rules live for the loaded project: embedded model rules, external rule-file URLs, ignored rule IDs, plus any local user/machine BPARules.json |
 
 ## Documentation, diff & CI — 5
 | Tool | | Description |

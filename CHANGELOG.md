@@ -3,6 +3,23 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.5.0] - 2026-06-21 — Custom BPA governance
+
+Grew the server from **68 to 70 tools**. We already RUN a built-in Best Practice Analyzer; now
+teams can AUTHOR and GOVERN their own rule sets.
+
+### Added
+- **`bpa_validate_rules`** — validate a custom BPA rules JSON against the public rule shape:
+  required fields (ID/Name/Category/Severity/Scope/Expression), valid Severity (1/2/3) and Scope
+  values, duplicate IDs, destructive `Delete()` fixes on low-severity rules, and stray runtime-only
+  fields. With `fix=true`, returns a cleaned copy.
+- **`bpa_audit_rule_sources`** — audit where BPA rules live for the loaded project: rules embedded
+  in the model (`BestPracticeAnalyzer` annotation), external rule-file URLs, ignored rule IDs, and
+  any local user/machine `BPARules.json` found. Surfaces shadow governance and silently-ignored rules.
+- New pure module `bpa_authoring.py` and `tests/test_bpa_authoring.py`.
+
+---
+
 ## [3.4.0] - 2026-06-21 — PBIX onboarding
 
 Grew the server from **66 to 68 tools** so an agent can work with a real `.pbix` file, not just
