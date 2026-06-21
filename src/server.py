@@ -294,6 +294,7 @@ class PowerBIMCPServer:
             # Governance-ops fleet (Wave 3, admin-gated)
             "cross_workspace_lineage": lambda a: self._handle_cross_workspace_lineage(a),
             "fleet_refresh_monitor": lambda a: self._handle_fleet_refresh_monitor(a),
+            "usage_and_orphan_analytics": lambda a: self._handle_usage_and_orphan_analytics(a),
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
@@ -381,6 +382,7 @@ class PowerBIMCPServer:
             # Governance-ops fleet (Wave 3) - read-only, cloud/admin
             "cross_workspace_lineage": cloud_read,
             "fleet_refresh_monitor": cloud_read,
+            "usage_and_orphan_analytics": cloud_read,
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
@@ -1320,6 +1322,18 @@ class PowerBIMCPServer:
                             "workspace_ids": {"type": "array", "items": {"type": "string"}, "description": "Workspace GUIDs to monitor (required, to bound the scan)"}
                         },
                         "required": ["workspace_ids"]
+                    }
+                ),
+                Tool(
+                    name="usage_and_orphan_analytics",
+                    description="Tenant usage analytics from the Admin Activity Events API for one UTC day: total events, distinct users, top activities, top viewed reports, top users. Requires Fabric admin (28-day retention). Defaults to yesterday (today is incomplete).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "date": {"type": "string", "description": "UTC day to analyze, YYYY-MM-DD (default: yesterday). Must be within 28 days."},
+                            "filter": {"type": "string", "description": "Optional OData filter, e.g. \"Activity eq 'viewreport'\""}
+                        },
+                        "required": []
                     }
                 )
             ]
@@ -3514,14 +3528,18 @@ class PowerBIMCPServer:
                 if not scan_id:
                     return f"Error: scan did not start ({started})."
                 status = ""
-                for _ in range(40):  # ~80s budget
-                    st = await loop.run_in_executor(None, rest.admin_get_scan_status, scan_id)
-                    status = str(st.get("status", "")).lower()
+                last_st = {}
+                for _ in range(20):  # ~5 min budget (Microsoft suggests 30-60s polling for big scans)
+                    last_st = await loop.run_in_executor(None, rest.admin_get_scan_status, scan_id)
+                    status = str(last_st.get("status", "")).lower()
                     if status == "succeeded":
                         break
-                    await asyncio.sleep(2)
+                    if status == "failed":
+                        return f"Scan failed: {last_st.get('error') or last_st}"
+                    await asyncio.sleep(15)
                 if status != "succeeded":
-                    return f"Scan did not finish in time (status={status}). Try again or scan fewer workspaces."
+                    return (f"Scan still running after the wait (status={status}). Re-run with the same "
+                            "cache_path to resume later, or scan fewer workspace_ids.")
                 scan = await loop.run_in_executor(None, rest.admin_get_scan_result, scan_id)
                 if cache_path:
                     try:
@@ -3589,6 +3607,41 @@ class PowerBIMCPServer:
             return out
         except Exception as e:
             return f"Error in fleet refresh monitor: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_usage_and_orphan_analytics(self, args: Dict[str, Any]) -> str:
+        """Tenant usage analytics from the Admin Activity Events API for a single UTC day."""
+        try:
+            rest = self._get_rest_connector()
+            if not rest:
+                return "Error: cloud credentials not configured (TENANT_ID / CLIENT_ID / CLIENT_SECRET)."
+            date = args.get("date")
+            if not date:
+                from datetime import datetime, timezone, timedelta
+                # default to yesterday UTC (today is incomplete; events lag up to ~60 min)
+                date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+            loop = asyncio.get_event_loop()
+            try:
+                events = await loop.run_in_executor(
+                    None, rest.admin_get_activity_events_for_day, date, args.get("filter")
+                )
+            except Exception as e:
+                return (f"Error reading activity events (needs admin / read-only admin APIs; 28-day "
+                        f"retention): {redact_secrets(str(e), [self.client_secret])}")
+            agg = governance.aggregate_activity(events)
+            out = f"=== Usage Analytics ({date} UTC) ===\n\n"
+            out += f"Total events: {agg['total_events']}   Distinct users: {agg['distinct_users']}\n\n"
+            out += "Top activities:\n"
+            out += ("\n".join(f"  {n}  {a}" for a, n in agg["by_activity"][:15]) or "  (none)") + "\n\n"
+            out += "Top viewed reports:\n"
+            out += ("\n".join(f"  {n}  {r}" for r, n in agg["top_reports_by_views"][:15]) or "  (none)") + "\n\n"
+            out += "Top users:\n"
+            out += ("\n".join(f"  {n}  {u}" for u, n in agg["top_users"][:15]) or "  (none)") + "\n"
+            out += ("\nNote: 28-day retention; pull a fully-past day for completeness. For orphan "
+                    "(zero-view) detection, correlate cross_workspace_lineage inventory with a longer "
+                    "activity window persisted over time.")
+            return out
+        except Exception as e:
+            return f"Error in usage analytics: {redact_secrets(str(e), [self.client_secret])}"
 
     async def _handle_verify_audit_integrity(self):
         """Verify the tamper-evident hash chain of the audit log."""

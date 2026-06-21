@@ -11,7 +11,7 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 import server  # noqa: E402
-from governance import summarize_scan  # noqa: E402
+from governance import summarize_scan, aggregate_activity  # noqa: E402
 
 _failures = []
 
@@ -85,6 +85,30 @@ def test_fleet_monitor():
     check("non-refreshable skipped (B absent)", "] B (" not in out)
 
 
+def test_activity_aggregate():
+    print("\n== aggregate_activity + usage_and_orphan_analytics ==")
+    events = [
+        {"Activity": "ViewReport", "UserId": "a@x.com", "ReportName": "Sales"},
+        {"Activity": "ViewReport", "UserId": "b@x.com", "ReportName": "Sales"},
+        {"Activity": "ViewReport", "UserId": "a@x.com", "ReportName": "Exec"},
+        {"Activity": "CreateReport", "UserId": "a@x.com"},
+    ]
+    agg = aggregate_activity(events)
+    check("total events", agg["total_events"] == 4)
+    check("distinct users", agg["distinct_users"] == 2, str(agg["distinct_users"]))
+    check("top report is Sales (2 views)", agg["top_reports_by_views"][0] == ("Sales", 2), str(agg["top_reports_by_views"]))
+
+    class FakeRest:
+        def admin_get_activity_events_for_day(self, date, filter_expr=None):
+            return events
+    srv = server.PowerBIMCPServer()
+    srv.tenant_id = srv.client_id = srv.client_secret = "x"
+    srv.rest_connector = FakeRest()
+    out = run(srv._handle_usage_and_orphan_analytics({"date": "2026-06-20"}))
+    check("usage output shows totals", "Total events: 4" in out, out[:80])
+    check("usage output lists Sales", "Sales" in out)
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  WAVE 3 (GOVERNANCE-OPS FLEET) TESTS")
@@ -92,6 +116,7 @@ if __name__ == "__main__":
     test_summarize()
     test_lineage_handler_cache()
     test_fleet_monitor()
+    test_activity_aggregate()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")
