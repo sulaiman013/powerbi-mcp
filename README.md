@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue?style=flat-square" alt="MCP compatible"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-green?style=flat-square" alt="Python 3.10+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-58-purple?style=flat-square" alt="58 tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-62-purple?style=flat-square" alt="62 tools"></a>
   <a href="#"><img src="https://img.shields.io/badge/Live-Windows-lightgrey?style=flat-square" alt="Windows for live connectivity"></a>
   <a href="#"><img src="https://img.shields.io/badge/Offline-cross--platform-success?style=flat-square" alt="Offline cross-platform"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT license"></a>
@@ -30,14 +30,15 @@ Power BI content through one consistent interface. It talks to a local Power BI 
 a published Power BI Service dataset, or Power BI Project (PBIP) files on disk, and wraps every
 operation in a security and governance layer.
 
-It exposes **58 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-12 assert-based test suites.
+It exposes **62 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
+14 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
 | **Dual connectivity** | Power BI Desktop (local) and Power BI Service (cloud) |
 | **Natural-language DAX** | Run, validate, and optimize DAX through conversation |
 | **Safe refactoring** | PBIP-based renames that update the model **and** the report visuals |
+| **Report authoring (preview)** | Add pages, visuals, and field bindings to PBIR reports from the agent |
 | **DAX safety loop** | Validate before committing; impact analysis; atomic transactions |
 | **Model quality** | Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage analysis |
 | **Diagnostics and ops** | Refresh-failure triage, unused-object detection, RLS test matrix |
@@ -83,7 +84,11 @@ limit which rows a user can see).
   that depends on an object and every report visual that uses it.
   > "If I delete the 'Old Revenue' measure, what depends on it?"
 - **Manage relationships** between tables (cardinality and filter direction).
-- **Check model quality like a senior reviewer.** Best Practice Analyzer (performance, DAX,
+- **Build report pages and visuals (preview).** On a saved PBIP project it can add a page, drop
+  a chart, card, table, or slicer on it, and bind fields by role. It checks each field exists in
+  the model first, picks measure vs aggregated-column automatically, and writes Power-BI-faithful
+  PBIR files (right down to the `nativeQueryRef` and `Sum(...)` query refs Desktop itself writes).
+  > "On the PBIP project, add an 'Overview' page with a bar chart of Sales by Region." Best Practice Analyzer (performance, DAX,
   naming, formatting), an AI-readiness score, storage/size analysis, and query-performance hints.
   > "Audit this model and give me the top issues to fix before I ship."
 - **Clean up dead weight.** Find columns and measures that nothing uses (not in any formula
@@ -202,7 +207,7 @@ docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
 
 ## Tools
 
-58 tools across the categories below. The full reference, with parameters and read / write /
+62 tools across the categories below. The full reference, with parameters and read / write /
 destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Category | Count | Highlights |
@@ -216,6 +221,7 @@ destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | Relationships | 2 | `create_relationship`, `delete_relationship` |
 | PBIP safe editing | 5 | load project, get info, rename tables/columns/measures (model + report) |
 | PBIP diagnostics | 4 | fix broken visuals, fix DAX quoting, scan broken refs, validate |
+| Report authoring (PBIR, preview) | 4 | `pbir_add_page`, `pbir_add_visual`, `pbir_bind_fields`, `pbir_validate_report` |
 | Model quality and performance | 4 | `run_bpa`, `audit_ai_readiness`, `analyze_model_storage`, `analyze_query_performance` |
 | Documentation, diff, CI | 5 | `export_data_dictionary`, `model_snapshot`, `model_diff`, `pre_deploy_gate`, `run_dax_tests` |
 | Diagnostics and ops | 4 | `refresh_doctor`, `find_unused_objects`, `impact_analysis`, `rls_test_harness` |
@@ -292,7 +298,7 @@ tables:
 
 | Doc | Contents |
 |-----|----------|
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 58 tools, resources, prompts, env vars |
+| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 62 tools, resources, prompts, env vars |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, security layer, registry pattern, verification methodology, file map |
 | [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
 | [CHANGELOG.md](CHANGELOG.md) | Everything that changed, by milestone |
@@ -320,12 +326,14 @@ those paths needs a Windows + Power BI / Fabric environment.
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server: 58 tools + resources/prompts/completion
+│   ├── server.py                    # MCP server: 62 tools + resources/prompts/completion
 │   ├── powerbi_desktop_connector.py # Desktop (ADOMD) + RLS + VertiPaq DMVs
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
 │   ├── powerbi_rest_connector.py    # REST: discovery, refresh, admin Scanner/Activity
 │   ├── powerbi_tom_connector.py     # TOM writes: measures, relationships, transactions
 │   ├── powerbi_pbip_connector.py    # PBIP/TMDL/PBIR offline editing (transactional)
+│   ├── pbir_authoring.py            # PBIR emitters: pages, visuals, field projections
+│   ├── adomd_loader.py             # Shared ADOMD.NET discovery (Desktop + XMLA)
 │   ├── model_analysis.py            # BPA, AI-readiness, data dictionary, diff, DAX tests
 │   ├── refresh_diagnostics.py       # Refresh error classification
 │   ├── governance.py                # Scanner summary + activity aggregation

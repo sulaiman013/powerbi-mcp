@@ -40,6 +40,10 @@ Best Practice Analyzer, AI-readiness, security) even without ADOMD/.NET.
   -> remediate top issues -> re-run.
 - **Safe rename:** `scan_measure_dependencies` + `pbip_scan_broken_refs` ->
   `pbip_load_project` -> `pbip_rename_*` -> `pbip_validate`.
+- **Author a report (PBIR, preview):** `pbip_load_project` -> `pbir_add_page` ->
+  `pbir_add_visual` (bind fields by role) / `pbir_bind_fields` -> `pbir_validate_report`.
+  Pass fields as `Table.Field`; the server picks measure vs aggregated-column from the model,
+  so prefer naming explicit measures for value wells. Close Power BI Desktop before editing.
 - **Ground yourself first:** read the `powerbi://desktop/schema` resource (or
   `get_model_info`) before generating DAX, so you use real table/column names.
 

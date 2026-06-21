@@ -51,6 +51,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
+import pbir_authoring
+
 logger = logging.getLogger(__name__)
 
 
@@ -534,7 +536,11 @@ class PowerBIPBIPConnector:
                     if entity:
                         refs.add((entity, node[namekey]))
             ref_name = obj.get("queryRef") or obj.get("NativeReferenceName")
-            if isinstance(ref_name, str) and "." in ref_name:
+            # Skip aggregation/function forms like "Sum(Sales.Amount)" - their underlying
+            # column is captured structurally above; partitioning them on "." would invent a
+            # bogus ("Sum(Sales", "Amount)") reference.
+            if (isinstance(ref_name, str) and "." in ref_name
+                    and "(" not in ref_name and ")" not in ref_name):
                 tbl, _, fld = ref_name.partition(".")
                 if tbl and fld:
                     refs.add((tbl, fld))
@@ -572,6 +578,267 @@ class PowerBIPBIPConnector:
         for s in self.collect_report_references_by_file().values():
             refs |= s
         return refs
+
+    # ==================== PBIR REPORT AUTHORING (preview) ====================
+
+    def _pages_folder(self) -> Optional[Path]:
+        if self.current_project and self.current_project.pbir_definition_folder:
+            return self.current_project.pbir_definition_folder / "pages"
+        return None
+
+    def _schema_from_sibling(self, filename: str, default_key: str) -> Optional[str]:
+        """Read a $schema URL from an existing PBIR file of the same kind (preferred over
+        hardcoding, since PBIR schemas bump over time). Falls back to a documented default."""
+        base = self._pages_folder()
+        if base and base.exists():
+            for p in base.glob("**/" + filename):
+                try:
+                    data = json.loads(self._read_text(p))
+                    if isinstance(data.get("$schema"), str):
+                        return data["$schema"]
+                except Exception:
+                    continue
+        return pbir_authoring.DEFAULT_SCHEMAS.get(default_key)
+
+    def _model_field_index(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Parse the project's TMDL files into {table: {field: {kind, dataType}}} (one table
+        per file, the PBIP convention). kind is 'column' or 'measure'; dataType is the TMDL
+        data type for columns (None for measures). Drives both binding validation and the
+        measure-vs-aggregated-column decision when authoring visuals."""
+        index: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        if not self.current_project:
+            return index
+        for tmdl in self.current_project.tmdl_files:
+            try:
+                content = self._read_text(tmdl)
+            except Exception:
+                continue
+            tmatch = re.search(r"^\s*table\s+(?:'([^']+)'|(\S+))", content, re.MULTILINE)
+            if not tmatch:
+                continue
+            tname = (tmatch.group(1) or tmatch.group(2)).replace("''", "'")
+            fields = index.setdefault(tname, {})
+            current: Optional[str] = None
+            for line in content.splitlines():
+                cm = re.match(r"^\s*(column|measure)\s+(?:'([^']+)'|([^\s=]+))", line)
+                if cm:
+                    fname = (cm.group(2) or cm.group(3)).replace("''", "'")
+                    fields[fname] = {"kind": cm.group(1), "dataType": None}
+                    current = fname
+                    continue
+                if current and fields.get(current, {}).get("kind") == "column":
+                    dm = re.match(r"^\s*dataType:\s*(\S+)", line)
+                    if dm:
+                        fields[current]["dataType"] = dm.group(1).strip()
+        return index
+
+    def model_field_catalog(self) -> Dict[str, Set[str]]:
+        """{table_name: {column/measure names}} - the name-only view used to validate that
+        report field bindings exist. Derived from the richer _model_field_index."""
+        return {t: set(fs.keys()) for t, fs in self._model_field_index().items()}
+
+    # TMDL numeric data types whose default value-well aggregation is Sum (others Count).
+    _NUMERIC_DATATYPES = {"int64", "double", "decimal", "int", "integer", "number"}
+
+    def _resolve_roles(self, fields_by_role: Dict[str, Any]) -> Dict[str, Any]:
+        """Turn {role: 'Table.Field' | [...]} into enriched per-field projection specs that
+        match how Power BI Desktop writes them: explicit Measure vs Column, a nativeQueryRef,
+        and - for a plain numeric/text COLUMN dropped on an aggregating well (Y/Values/...) -
+        an Aggregation (Sum for numeric, else CountNonNull). Dicts are passed through as-is so
+        an advanced caller can specify a projection exactly."""
+        index = self._model_field_index()
+        lut = {t.lower(): {f.lower(): (f, meta) for f, meta in fs.items()} for t, fs in index.items()}
+        resolved: Dict[str, Any] = {}
+        for role, val in (fields_by_role or {}).items():
+            aggregating = role.lower() in pbir_authoring.AGGREGATING_ROLES
+            out: List[Any] = []
+            for ref in (val if isinstance(val, list) else [val]):
+                if not ref:
+                    continue
+                if isinstance(ref, dict):
+                    out.append(ref)
+                    continue
+                table, fld = pbir_authoring.split_table_field(str(ref))
+                meta = lut.get(table.lower(), {}).get(fld.lower())
+                spec: Dict[str, Any] = {"table": table, "field": fld, "nativeQueryRef": fld}
+                if meta and meta[1].get("kind") == "measure":
+                    spec["kind"] = "Measure"
+                elif meta:
+                    spec["kind"] = "Column"
+                    if aggregating:
+                        dt = (meta[1].get("dataType") or "").lower()
+                        spec["aggregation"] = (pbir_authoring.AGG_SUM if dt in self._NUMERIC_DATATYPES
+                                               else pbir_authoring.AGG_COUNT_NONNULL)
+                else:
+                    # Unknown field (e.g. skip_validation): fall back to the role heuristic.
+                    spec["kind"] = "Measure" if aggregating else "Column"
+                out.append(spec)
+            if out:
+                resolved[role] = out
+        return resolved
+
+    def _check_fields(self, fields_by_role: Dict[str, Any]) -> List[str]:
+        """Return a list of 'Table[Field]' refs that do NOT exist in the model catalog."""
+        catalog = self.model_field_catalog()
+        tables_lower = {t.lower() for t in catalog}
+        fields_lower = {t.lower(): {f.lower() for f in fs} for t, fs in catalog.items()}
+        missing = []
+        for role, val in (fields_by_role or {}).items():
+            for ref in (val if isinstance(val, list) else [val]):
+                if not ref:
+                    continue
+                if isinstance(ref, dict):
+                    table = ref.get("table") or ref.get("entity") or ""
+                    fld = ref.get("field") or ref.get("property") or ref.get("column") or ref.get("measure") or ""
+                else:
+                    table, fld = pbir_authoring.split_table_field(str(ref))
+                if table.lower() not in tables_lower or fld.lower() not in fields_lower.get(table.lower(), set()):
+                    missing.append(f"{table}[{fld}]")
+        return missing
+
+    def _find_page_folder(self, ref: str) -> Optional[Path]:
+        pages = self._pages_folder()
+        if not pages or not pages.exists():
+            return None
+        direct = pages / ref
+        if direct.exists() and (direct / "page.json").exists():
+            return direct
+        for pj in pages.glob("*/page.json"):
+            try:
+                data = json.loads(self._read_text(pj))
+                if data.get("displayName") == ref or data.get("name") == ref:
+                    return pj.parent
+            except Exception:
+                continue
+        return None
+
+    def add_page(self, display_name: str, width: int = 1280, height: int = 720,
+                 set_active: bool = False) -> Dict[str, Any]:
+        """Create a new report page (PBIR-Enhanced) and register it in pages.json."""
+        if not self.current_project or not self.current_project.is_pbir_enhanced:
+            return {"success": False, "message": "Requires a loaded PBIR-Enhanced PBIP project"}
+        pages = self._pages_folder()
+        if not pages:
+            return {"success": False, "message": "No PBIR definition/pages folder found"}
+        if self.auto_backup and not self.current_project.backup_path:
+            self.create_backup()
+
+        name = pbir_authoring.new_name()
+        page_dir = pages / name
+        page_dir.mkdir(parents=True, exist_ok=True)
+        page_path = page_dir / "page.json"
+        page_json = pbir_authoring.build_page(name, display_name, width, height,
+                                              self._schema_from_sibling("page.json", "page"))
+        self._write_text(page_path, json.dumps(page_json, indent=2))
+
+        # Update (or create) pages.json, preserving any existing keys.
+        meta_path = pages / "pages.json"
+        meta: Dict[str, Any] = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(self._read_text(meta_path))
+            except Exception:
+                meta = {}
+        if "$schema" not in meta:
+            meta["$schema"] = pbir_authoring.DEFAULT_SCHEMAS["pagesMetadata"]
+        order = list(meta.get("pageOrder", []))
+        if name not in order:
+            order.append(name)
+        meta["pageOrder"] = order
+        if set_active or not meta.get("activePageName"):
+            meta["activePageName"] = name
+        self._write_text(meta_path, json.dumps(meta, indent=2))
+
+        return {"success": True, "page_name": name, "display_name": display_name, "path": str(page_path)}
+
+    def add_visual(self, page: str, visual_type: str, position: Optional[Dict[str, Any]] = None,
+                   fields_by_role: Optional[Dict[str, Any]] = None,
+                   skip_validation: bool = False) -> Dict[str, Any]:
+        """Create a visual on a page (PBIR-Enhanced). fields_by_role maps a query role to
+        'Table.Field' (or a list). Validates field existence against the model first."""
+        if not self.current_project or not self.current_project.is_pbir_enhanced:
+            return {"success": False, "message": "Requires a loaded PBIR-Enhanced PBIP project"}
+        page_dir = self._find_page_folder(page)
+        if not page_dir:
+            return {"success": False, "message": f"Page '{page}' not found"}
+        if fields_by_role and not skip_validation:
+            missing = self._check_fields(fields_by_role)
+            if missing:
+                return {"success": False, "message": "Field(s) not found in the model; not created",
+                        "missing_fields": missing}
+        if self.auto_backup and not self.current_project.backup_path:
+            self.create_backup()
+
+        name = pbir_authoring.new_name()
+        vdir = page_dir / "visuals" / name
+        vdir.mkdir(parents=True, exist_ok=True)
+        vpath = vdir / "visual.json"
+        visual_json = pbir_authoring.build_visual(
+            name, visual_type, position or {"x": 0, "y": 0, "width": 400, "height": 300},
+            self._resolve_roles(fields_by_role), self._schema_from_sibling("visual.json", "visual"))
+        self._write_text(vpath, json.dumps(visual_json, indent=2))
+        self.current_project.visual_json_files.append(vpath)
+
+        return {"success": True, "visual_name": name, "page": page_dir.name,
+                "visual_type": visual_type, "path": str(vpath)}
+
+    def bind_fields(self, page: str, visual_name: str, fields_by_role: Dict[str, Any],
+                    mode: str = "add", skip_validation: bool = False) -> Dict[str, Any]:
+        """Add/replace field projections on an existing visual's query (mode: 'add' or 'replace')."""
+        if not self.current_project or not self.current_project.is_pbir_enhanced:
+            return {"success": False, "message": "Requires a loaded PBIR-Enhanced PBIP project"}
+        page_dir = self._find_page_folder(page)
+        if not page_dir:
+            return {"success": False, "message": f"Page '{page}' not found"}
+        vpath = page_dir / "visuals" / visual_name / "visual.json"
+        if not vpath.exists():
+            return {"success": False, "message": f"Visual '{visual_name}' not found on page"}
+        if not skip_validation:
+            missing = self._check_fields(fields_by_role)
+            if missing:
+                return {"success": False, "message": "Field(s) not found in the model", "missing_fields": missing}
+        if self.auto_backup and not self.current_project.backup_path:
+            self.create_backup()
+
+        try:
+            data = json.loads(self._read_text(vpath))
+        except Exception as e:
+            return {"success": False, "message": f"Could not parse visual.json: {e}"}
+        qs = data.setdefault("visual", {}).setdefault("query", {}).setdefault("queryState", {})
+        resolved = self._resolve_roles(fields_by_role)
+        if mode == "replace":
+            qs.update(pbir_authoring.build_query_state(resolved))
+        else:
+            for role, items in resolved.items():
+                role_obj = qs.setdefault(role, {"projections": []})
+                projections = role_obj.setdefault("projections", [])
+                existing_refs = {p.get("queryRef") for p in projections}
+                for spec in items:
+                    proj = pbir_authoring._projection_for(spec, "Column", active=False)
+                    if proj["queryRef"] not in existing_refs:
+                        projections.append(proj)
+                        existing_refs.add(proj["queryRef"])
+        self._write_text(vpath, json.dumps(data, indent=2))
+        return {"success": True, "visual_name": visual_name, "page": page_dir.name, "mode": mode}
+
+    def validate_report_bindings(self) -> List[ValidationError]:
+        """Check that every (table, field) referenced by the report exists in the model.
+        This is the #1 cause of blank visuals / 'repair' prompts after external edits."""
+        errors: List[ValidationError] = []
+        catalog = self.model_field_catalog()
+        tables_lower = {t.lower() for t in catalog}
+        fields_lower = {t.lower(): {f.lower() for f in fs} for t, fs in catalog.items()}
+        for fp, refs in self.collect_report_references_by_file().items():
+            for (table, field) in sorted(refs):
+                tl = table.lower()
+                if tl not in tables_lower:
+                    errors.append(ValidationError(fp, 0, "MISSING_TABLE",
+                        f"Report references table '{table}' that is not in the model", f"{table}[{field}]"))
+                elif field.lower() not in fields_lower.get(tl, set()):
+                    errors.append(ValidationError(fp, 0, "MISSING_FIELD",
+                        f"Report references '{table}[{field}]' but '{field}' is not in table '{table}'",
+                        f"{table}[{field}]"))
+        return errors
 
     def _read_text(self, file_path) -> str:
         """Read a text file, remembering its encoding (utf-8 vs utf-8-sig/BOM) so it can be

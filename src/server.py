@@ -269,6 +269,11 @@ class PowerBIMCPServer:
             "pbip_fix_dax_quoting": lambda a: self._handle_pbip_fix_dax_quoting(),
             "pbip_scan_broken_refs": lambda a: self._handle_pbip_scan_broken_refs(),
             "pbip_validate": lambda a: self._handle_pbip_validate(),
+            # PBIR report authoring (preview)
+            "pbir_add_page": lambda a: self._handle_pbir_add_page(a),
+            "pbir_add_visual": lambda a: self._handle_pbir_add_visual(a),
+            "pbir_bind_fields": lambda a: self._handle_pbir_bind_fields(a),
+            "pbir_validate_report": lambda a: self._handle_pbir_validate_report(),
             # DAX safety loop + transactions (Bundle A)
             "validate_dax": lambda a: self._handle_validate_dax(a),
             "scan_measure_dependencies": lambda a: self._handle_scan_measure_dependencies(a),
@@ -357,6 +362,11 @@ class PowerBIMCPServer:
             "pbip_fix_dax_quoting": local_destructive,
             "pbip_scan_broken_refs": local_read,
             "pbip_validate": local_read,
+            # PBIR report authoring (preview) - write files
+            "pbir_add_page": local_destructive,
+            "pbir_add_visual": local_destructive,
+            "pbir_bind_fields": local_destructive,
+            "pbir_validate_report": local_read,
             # DAX safety loop + transactions (Bundle A)
             "validate_dax": ann(True, open_world=False),
             "scan_measure_dependencies": local_read,
@@ -964,6 +974,56 @@ class PowerBIMCPServer:
                         "properties": {},
                         "required": []
                     }
+                ),
+                # === PBIR REPORT AUTHORING (preview) ===
+                Tool(
+                    name="pbir_add_page",
+                    description="[PREVIEW] Add a new report page to the loaded PBIR-Enhanced PBIP project. Writes a schema-valid page.json and registers it in pages.json. Close Power BI Desktop before editing; reopen after.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "display_name": {"type": "string", "description": "Visible page name"},
+                            "width": {"type": "integer", "default": 1280},
+                            "height": {"type": "integer", "default": 720},
+                            "set_active": {"type": "boolean", "default": False}
+                        },
+                        "required": ["display_name"]
+                    }
+                ),
+                Tool(
+                    name="pbir_add_visual",
+                    description="[PREVIEW] Add a visual to a page in the loaded PBIR-Enhanced project. Supported visual_type: card, kpi, tableEx, slicer, barChart, columnChart, lineChart, areaChart, pieChart, donutChart, gauge, pivotTable. 'fields' maps a query role to 'Table.Field' or a list (roles per type: e.g. barChart -> Category/Y/Series, card -> Values, tableEx -> Values, slicer -> Values). Field existence is validated against the model first.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page": {"type": "string", "description": "Page display name or folder name"},
+                            "visual_type": {"type": "string"},
+                            "position": {"type": "object", "description": "{x, y, width, height} (and optional z, tabOrder)"},
+                            "fields": {"type": "object", "description": "Role -> 'Table.Field' or ['Table.Field', ...] (e.g. {\"Category\":\"Date.Month\",\"Y\":\"Sales.Total Sales\"})"},
+                            "skip_validation": {"type": "boolean", "default": False}
+                        },
+                        "required": ["page", "visual_type"]
+                    }
+                ),
+                Tool(
+                    name="pbir_bind_fields",
+                    description="[PREVIEW] Add or replace field bindings on an existing visual without recreating it. mode 'add' appends projections (deduped); 'replace' replaces the given roles.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page": {"type": "string"},
+                            "visual_name": {"type": "string", "description": "The visual's folder/name (from pbir_add_visual)"},
+                            "fields": {"type": "object", "description": "Role -> 'Table.Field' or list"},
+                            "mode": {"type": "string", "enum": ["add", "replace"], "default": "add"},
+                            "skip_validation": {"type": "boolean", "default": False}
+                        },
+                        "required": ["page", "visual_name", "fields"]
+                    }
+                ),
+                Tool(
+                    name="pbir_validate_report",
+                    description="[PREVIEW] Validate that every field referenced by the report's visuals exists in the model (the #1 cause of blank visuals / repair prompts after edits).",
+                    inputSchema={"type": "object", "properties": {}, "required": []}
                 ),
                 # === DAX SAFETY LOOP & TRANSACTIONS (Bundle A) ===
                 Tool(
@@ -4192,6 +4252,95 @@ class PowerBIMCPServer:
         except Exception as e:
             logger.error(f"PBIP validate error: {e}")
             return f"Error: {str(e)}"
+
+    # ==================== PBIR REPORT AUTHORING (preview) ====================
+
+    async def _handle_pbir_add_page(self, args: Dict[str, Any]) -> str:
+        """Add a report page to the loaded PBIR-Enhanced project."""
+        try:
+            connector = self._get_pbip_connector()
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+            display_name = args.get("display_name")
+            if not display_name:
+                return "Error: display_name is required"
+            fn = lambda: connector.add_page(
+                display_name, width=int(args.get("width", 1280)),
+                height=int(args.get("height", 720)), set_active=bool(args.get("set_active", False)))
+            result = await asyncio.get_event_loop().run_in_executor(None, fn)
+            if not result.get("success"):
+                return f"Failed to add page: {result.get('message')}"
+            return (f"Added page '{display_name}' (name {result['page_name']}).\n"
+                    f"Path: {result['path']}\nReopen Power BI Desktop to see it.")
+        except Exception as e:
+            return f"Error adding page: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_pbir_add_visual(self, args: Dict[str, Any]) -> str:
+        """Add a visual to a page in the loaded PBIR-Enhanced project."""
+        try:
+            connector = self._get_pbip_connector()
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+            page = args.get("page")
+            visual_type = args.get("visual_type")
+            if not page or not visual_type:
+                return "Error: page and visual_type are required"
+            fn = lambda: connector.add_visual(
+                page, visual_type, position=args.get("position"),
+                fields_by_role=args.get("fields"), skip_validation=bool(args.get("skip_validation", False)))
+            result = await asyncio.get_event_loop().run_in_executor(None, fn)
+            if not result.get("success"):
+                msg = result.get("message", "failed")
+                if result.get("missing_fields"):
+                    msg += "\nMissing fields: " + ", ".join(result["missing_fields"])
+                return f"Failed to add visual: {msg}"
+            return (f"Added {visual_type} '{result['visual_name']}' to page '{result['page']}'.\n"
+                    f"Path: {result['path']}\nReopen Power BI Desktop to see it.")
+        except Exception as e:
+            return f"Error adding visual: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_pbir_bind_fields(self, args: Dict[str, Any]) -> str:
+        """Add or replace field bindings on an existing visual."""
+        try:
+            connector = self._get_pbip_connector()
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+            page = args.get("page")
+            visual_name = args.get("visual_name")
+            fields = args.get("fields")
+            if not (page and visual_name and fields):
+                return "Error: page, visual_name, and fields are required"
+            fn = lambda: connector.bind_fields(
+                page, visual_name, fields, mode=(args.get("mode") or "add"),
+                skip_validation=bool(args.get("skip_validation", False)))
+            result = await asyncio.get_event_loop().run_in_executor(None, fn)
+            if not result.get("success"):
+                msg = result.get("message", "failed")
+                if result.get("missing_fields"):
+                    msg += "\nMissing fields: " + ", ".join(result["missing_fields"])
+                return f"Failed to bind fields: {msg}"
+            return f"Bound fields on visual '{visual_name}' (page '{result['page']}', mode {result['mode']})."
+        except Exception as e:
+            return f"Error binding fields: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_pbir_validate_report(self) -> str:
+        """Validate that every report field binding exists in the model (catches blank visuals)."""
+        try:
+            connector = self._get_pbip_connector()
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+            fn = lambda: connector.validate_report_bindings()
+            errors = await asyncio.get_event_loop().run_in_executor(None, fn)
+            out = "=== Report Binding Validation ===\n\n"
+            if not errors:
+                out += "All report field bindings resolve to existing model tables/columns/measures.\n"
+                return out
+            out += f"Found {len(errors)} binding issue(s) (these render blank or trigger repair):\n\n"
+            for e in errors[:100]:
+                out += f"  [{e.error_type}] {e.message}\n"
+            return out
+        except Exception as e:
+            return f"Error validating report bindings: {redact_secrets(str(e), [self.client_secret])}"
 
     async def run(self):
         """Run the MCP server"""
