@@ -70,6 +70,33 @@ def test_pbir_scanner():
         check("by-file has one file", len(byfile) == 1 and any(("Sales", "Total") in s for s in byfile.values()))
 
 
+def test_pbir_scanner_advanced():
+    print("\n== PBIR scanner: hierarchy, From/Source alias, two-table arithmetic ==")
+    refs = set()
+    # HierarchyLevel on an axis (date hierarchy) - both hierarchy + level captured
+    hier = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+        "Expression": {"SourceRef": {"Entity": "DateDim"}}, "Hierarchy": "Calendar"}}, "Level": "Month"}}
+    PowerBIPBIPConnector._walk_report_refs(hier, refs)
+    check("hierarchy captured", ("DateDim", "Calendar") in refs, str(refs))
+    check("level captured", ("DateDim", "Month") in refs, str(refs))
+
+    # Filter with From-clause alias resolution (SourceRef.Source -> Entity)
+    refs2 = set()
+    flt = {"From": [{"Name": "s", "Entity": "Sales", "Type": 0}],
+           "Where": [{"Condition": {"In": {"Expressions": [
+               {"Column": {"Expression": {"SourceRef": {"Source": "s"}}, "Property": "Region"}}]}}}]}
+    PowerBIPBIPConnector._walk_report_refs(flt, refs2)
+    check("From/Source alias resolved", ("Sales", "Region") in refs2, str(refs2))
+
+    # Two-table arithmetic: each column attributed to its OWN table
+    refs3 = set()
+    arith = {"Arithmetic": {
+        "Left": {"Column": {"Expression": {"SourceRef": {"Entity": "A"}}, "Property": "x"}},
+        "Right": {"Column": {"Expression": {"SourceRef": {"Entity": "B"}}, "Property": "y"}}}}
+    PowerBIPBIPConnector._walk_report_refs(arith, refs3)
+    check("two-table arithmetic correctly attributed", {("A", "x"), ("B", "y")} <= refs3, str(refs3))
+
+
 class FakeRest:
     def resolve_dataset(self, ws, ds):
         return "wid", "did", None
@@ -185,6 +212,7 @@ if __name__ == "__main__":
     print("  WAVE 2 (DIAGNOSTICS & OPS) TESTS")
     print("=" * 70)
     test_pbir_scanner()
+    test_pbir_scanner_advanced()
     test_refresh_doctor()
     test_find_unused()
     test_impact()

@@ -73,6 +73,14 @@ def build_validation_probe(dax: str, as_measure: bool = False) -> str:
     return f'EVALUATE ROW("validation", {stripped})'
 
 
+# Real constraints on INFO.CALCDEPENDENCY (not "old engine"): it needs write permission on
+# the model and cannot run over a live Power BI Desktop connection.
+INFO_CALCDEP_NOTE = (
+    "INFO.CALCDEPENDENCY needs write permission on the model and does not run over a live "
+    "Power BI Desktop connection (it also requires a reasonably recent engine)."
+)
+
+
 # Import connectors
 from powerbi_rest_connector import PowerBIRestConnector
 from powerbi_xmla_connector import PowerBIXmlaConnector
@@ -975,6 +983,7 @@ class PowerBIMCPServer:
                         "type": "object",
                         "properties": {
                             "measure_name": {"type": "string", "description": "Name of the measure or column to analyze"},
+                            "table_name": {"type": "string", "description": "Optional owning table to disambiguate a name used on multiple tables"},
                             "direction": {"type": "string", "enum": ["upstream", "downstream", "both"], "description": "upstream = dependencies; downstream = dependents. Default 'both'.", "default": "both"},
                             "source": {"type": "string", "enum": ["desktop", "cloud"], "description": "Desktop (local) or cloud. Default 'desktop'.", "default": "desktop"},
                             "workspace_name": {"type": "string", "description": "Cloud only: workspace name"},
@@ -2646,6 +2655,8 @@ class PowerBIMCPServer:
             direction = (args.get("direction") or "both").lower()
             source = (args.get("source") or "desktop").lower()
             esc = str(name).replace('"', '""')
+            table = args.get("table_name")
+            etbl = str(table).replace('"', '""') if table else None
             loop = asyncio.get_event_loop()
 
             # Resolve an executor callable for the chosen source
@@ -2669,7 +2680,8 @@ class PowerBIMCPServer:
             response = f"=== Dependency analysis for '{name}' ===\n\n"
 
             if direction in ("upstream", "both"):
-                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), [OBJECT] = "{esc}")'
+                ufilt = f'[OBJECT] = "{esc}"' + (f' && [TABLE] = "{etbl}"' if etbl else "")
+                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), {ufilt})'
                 rows = await loop.run_in_executor(None, run, q)
                 response += f"--- Upstream (what '{name}' depends on): {len(rows)} ---\n"
                 for r in rows[:50]:
@@ -2680,7 +2692,8 @@ class PowerBIMCPServer:
                 response += "\n"
 
             if direction in ("downstream", "both"):
-                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), [REFERENCED_OBJECT] = "{esc}")'
+                dfilt = f'[REFERENCED_OBJECT] = "{esc}"' + (f' && [REFERENCED_TABLE] = "{etbl}"' if etbl else "")
+                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), {dfilt})'
                 rows = await loop.run_in_executor(None, run, q)
                 response += f"--- Downstream (what depends on '{name}'): {len(rows)} ---\n"
                 if not rows:
@@ -2699,8 +2712,7 @@ class PowerBIMCPServer:
             msg = redact_secrets(str(e), [self.client_secret])
             return (
                 f"Error scanning dependencies: {msg}\n\n"
-                "Note: INFO.CALCDEPENDENCY requires a recent Analysis Services engine. "
-                "If unsupported, upgrade Power BI Desktop or use scan_table_dependencies."
+                f"Note: {INFO_CALCDEP_NOTE} If unsupported, use scan_table_dependencies."
             )
 
     async def _handle_tom_begin_transaction(self) -> str:
@@ -3127,13 +3139,17 @@ class PowerBIMCPServer:
 
             completed = sum(1 for h in history if str(h.get("status")) == "Completed")
             failed = [h for h in history if str(h.get("status")) == "Failed"]
-            # consecutive leading failures (history is most-recent-first)
+            # Consecutive leading failures (history is most-recent-first). The status enum is
+            # Unknown | Completed | Failed | Disabled: count Failed, stop at any non-Failed
+            # terminal (Completed/Disabled), and skip Unknown (in-progress) without resetting.
             consecutive = 0
             for h in history:
-                if str(h.get("status")) == "Failed":
+                s = str(h.get("status"))
+                if s == "Failed":
                     consecutive += 1
-                elif str(h.get("status")) == "Completed":
+                elif s in ("Completed", "Disabled"):
                     break
+                # Unknown / in-progress: skip
 
             out = f"=== Refresh Doctor: {dataset} ===\n\n"
             out += f"Last {len(history)} refreshes: {completed} completed, {len(failed)} failed\n"
@@ -3180,7 +3196,7 @@ class PowerBIMCPServer:
                 dep_rows = await loop.run_in_executor(None, run, "EVALUATE INFO.CALCDEPENDENCY()")
             except Exception as e:
                 return (f"Error reading INFO.CALCDEPENDENCY: {redact_secrets(str(e), [self.client_secret])}. "
-                        "Requires a recent Analysis Services engine.")
+                        + INFO_CALCDEP_NOTE)
 
             used = set()
             for r in dep_rows:
@@ -3238,12 +3254,16 @@ class PowerBIMCPServer:
                 return f"Error: {rerr}"
             loop = asyncio.get_event_loop()
             esc = str(name).replace('"', '""')
+            filt = f'[REFERENCED_OBJECT] = "{esc}"'
+            if table:
+                et = str(table).replace('"', '""')
+                filt = f'[REFERENCED_TABLE] = "{et}" && {filt}'
             try:
-                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), [REFERENCED_OBJECT] = "{esc}")'
+                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), {filt})'
                 rows = await loop.run_in_executor(None, run, q)
             except Exception as e:
                 return (f"Error reading INFO.CALCDEPENDENCY: {redact_secrets(str(e), [self.client_secret])}. "
-                        "Requires a recent Analysis Services engine.")
+                        + INFO_CALCDEP_NOTE)
 
             out = f"=== Impact Analysis: {name}{(' in ' + table) if table else ''} ===\n\n"
             out += f"--- Model objects that depend on it ({len(rows)}) ---\n"

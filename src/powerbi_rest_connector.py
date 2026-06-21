@@ -136,7 +136,8 @@ class PowerBIRestConnector:
     def get_refresh_history(self, workspace_id: str, dataset_id: str, top: int = 20) -> List[Dict[str, Any]]:
         """Get recent refresh history for a dataset (most recent first).
 
-        Each entry: id, refreshType, startTime, endTime, status, serviceExceptionJson (on failure).
+        Each entry: requestId, refreshType, startTime, endTime, status
+        (Unknown|Completed|Failed|Disabled), serviceExceptionJson (a JSON string on failure).
         """
         if not self.access_token and not self.authenticate():
             return []
@@ -156,21 +157,25 @@ class PowerBIRestConnector:
 
     def trigger_refresh(self, workspace_id: str, dataset_id: str,
                         body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Trigger a dataset refresh. A non-empty body uses the enhanced refresh API
-        (Premium/PPU/Fabric); an empty body is a standard refresh (works on Pro).
+        """Trigger a dataset refresh. With no body, sends a standard refresh
+        ({"notifyOption": "NoNotification"}) that works on Pro. A non-empty body uses the
+        enhanced refresh API (Premium/PPU/Fabric) and must NOT include notifyOption.
 
-        Returns {accepted, status_code, request_id, message}.
+        Returns {accepted, status_code, request_id, location, message}.
         """
         if not self.access_token and not self.authenticate():
             return {"accepted": False, "message": "Authentication failed"}
         url = f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
+        payload = body if body else {"notifyOption": "NoNotification"}
         try:
-            response = requests.post(url, headers=self._get_headers(), json=(body or {}), timeout=30)
-            accepted = response.status_code in (200, 202)
+            response = requests.post(url, headers=self._get_headers(), json=payload, timeout=30)
+            accepted = response.status_code in (200, 202)  # async contract is 202 Accepted
+            location = response.headers.get("Location")
             return {
                 "accepted": accepted,
                 "status_code": response.status_code,
-                "request_id": response.headers.get("RequestId") or response.headers.get("x-ms-request-id"),
+                "request_id": response.headers.get("x-ms-request-id") or (location.rstrip("/").split("/")[-1] if location else None),
+                "location": location,
                 "message": "Refresh requested" if accepted else (response.text or "")[:500],
             }
         except Exception as e:

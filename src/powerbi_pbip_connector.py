@@ -492,45 +492,57 @@ class PowerBIPBIPConnector:
             logger.error(f"Failed to create backup: {e}")
             return None
 
-    @staticmethod
-    def _find_entity(obj) -> Optional[str]:
-        """Find the SourceRef Entity (table) within a PBIR reference node."""
-        if isinstance(obj, dict):
-            sr = obj.get("SourceRef")
-            if isinstance(sr, dict) and isinstance(sr.get("Entity"), str):
+    @classmethod
+    def _resolve_entity(cls, expr, alias_map) -> Optional[str]:
+        """Resolve the table from a PBIR Expression node: SourceRef.Entity directly, or
+        SourceRef.Source (a From-clause alias) resolved via alias_map, or a nested
+        Hierarchy expression. Resolves from THIS node only (no whole-subtree guessing)."""
+        if not isinstance(expr, dict):
+            return None
+        sr = expr.get("SourceRef")
+        if isinstance(sr, dict):
+            if isinstance(sr.get("Entity"), str):
                 return sr["Entity"]
-            if isinstance(obj.get("Entity"), str):
-                return obj["Entity"]
-            for v in obj.values():
-                e = PowerBIPBIPConnector._find_entity(v)
-                if e:
-                    return e
-        elif isinstance(obj, list):
-            for it in obj:
-                e = PowerBIPBIPConnector._find_entity(it)
-                if e:
-                    return e
+            if isinstance(sr.get("Source"), str):
+                return alias_map.get(sr["Source"])
+        h = expr.get("Hierarchy")
+        if isinstance(h, dict):
+            return cls._resolve_entity(h.get("Expression", {}), alias_map)
         return None
 
     @classmethod
-    def _walk_report_refs(cls, obj, refs: set) -> None:
-        """Collect (Entity, Property) field/measure references from a PBIR JSON tree."""
+    def _walk_report_refs(cls, obj, refs: set, alias_map=None) -> None:
+        """Collect (table, field) references from a PBIR JSON tree.
+
+        Handles Column/Measure (Property), Hierarchy (Hierarchy name), and HierarchyLevel
+        (Level) nodes; resolves From-clause Source aliases used by filters/slicers; and
+        resolves each reference's table from its OWN Expression so compound expressions that
+        touch multiple tables are not mis-attributed."""
+        alias_map = dict(alias_map or {})
         if isinstance(obj, dict):
-            prop = obj.get("Property")
-            if isinstance(prop, str):
-                entity = cls._find_entity(obj)
-                if entity:
-                    refs.add((entity, prop))
-            nrn = obj.get("NativeReferenceName")
-            if isinstance(nrn, str) and "." in nrn:
-                tbl, _, fld = nrn.partition(".")
+            # A From clause at this scope defines alias -> table for descendant Source refs.
+            frm = obj.get("From")
+            if isinstance(frm, list):
+                for src in frm:
+                    if isinstance(src, dict) and isinstance(src.get("Name"), str) and isinstance(src.get("Entity"), str):
+                        alias_map[src["Name"]] = src["Entity"]
+            for kind, namekey in (("Column", "Property"), ("Measure", "Property"),
+                                  ("Hierarchy", "Hierarchy"), ("HierarchyLevel", "Level")):
+                node = obj.get(kind)
+                if isinstance(node, dict) and isinstance(node.get(namekey), str):
+                    entity = cls._resolve_entity(node.get("Expression", {}), alias_map)
+                    if entity:
+                        refs.add((entity, node[namekey]))
+            ref_name = obj.get("queryRef") or obj.get("NativeReferenceName")
+            if isinstance(ref_name, str) and "." in ref_name:
+                tbl, _, fld = ref_name.partition(".")
                 if tbl and fld:
                     refs.add((tbl, fld))
             for v in obj.values():
-                cls._walk_report_refs(v, refs)
+                cls._walk_report_refs(v, refs, alias_map)
         elif isinstance(obj, list):
             for it in obj:
-                cls._walk_report_refs(it, refs)
+                cls._walk_report_refs(it, refs, alias_map)
 
     def collect_report_references_by_file(self) -> Dict[str, set]:
         """Scan the report layer and return {file_path: set((table, field))} references.
