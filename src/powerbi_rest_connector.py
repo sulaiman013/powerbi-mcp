@@ -115,3 +115,63 @@ class PowerBIRestConnector:
         except Exception as e:
             logger.error(f"Failed to list datasets: {str(e)}")
             return []
+
+    # ==================== REFRESH OPERATIONS ====================
+
+    def resolve_dataset(self, workspace_name: str, dataset_name: str):
+        """Resolve a workspace+dataset name to (workspace_id, dataset_id).
+
+        Returns (workspace_id, dataset_id, None) or (None, None, error_message).
+        """
+        workspaces = self.list_workspaces()
+        ws = next((w for w in workspaces if w["name"] == workspace_name), None)
+        if not ws:
+            return None, None, f"Workspace '{workspace_name}' not found (or no access)"
+        datasets = self.list_datasets(ws["id"])
+        ds = next((d for d in datasets if d["name"] == dataset_name), None)
+        if not ds:
+            return None, None, f"Dataset '{dataset_name}' not found in workspace '{workspace_name}'"
+        return ws["id"], ds["id"], None
+
+    def get_refresh_history(self, workspace_id: str, dataset_id: str, top: int = 20) -> List[Dict[str, Any]]:
+        """Get recent refresh history for a dataset (most recent first).
+
+        Each entry: id, refreshType, startTime, endTime, status, serviceExceptionJson (on failure).
+        """
+        if not self.access_token and not self.authenticate():
+            return []
+        url = f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/refreshes?$top={int(top)}"
+        response = requests.get(url, headers=self._get_headers(), timeout=30)
+        response.raise_for_status()
+        return response.json().get("value", [])
+
+    def get_datasources(self, workspace_id: str, dataset_id: str) -> List[Dict[str, Any]]:
+        """Get the data sources bound to a dataset (for gateway/source diagnostics)."""
+        if not self.access_token and not self.authenticate():
+            return []
+        url = f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/datasources"
+        response = requests.get(url, headers=self._get_headers(), timeout=30)
+        response.raise_for_status()
+        return response.json().get("value", [])
+
+    def trigger_refresh(self, workspace_id: str, dataset_id: str,
+                        body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Trigger a dataset refresh. A non-empty body uses the enhanced refresh API
+        (Premium/PPU/Fabric); an empty body is a standard refresh (works on Pro).
+
+        Returns {accepted, status_code, request_id, message}.
+        """
+        if not self.access_token and not self.authenticate():
+            return {"accepted": False, "message": "Authentication failed"}
+        url = f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
+        try:
+            response = requests.post(url, headers=self._get_headers(), json=(body or {}), timeout=30)
+            accepted = response.status_code in (200, 202)
+            return {
+                "accepted": accepted,
+                "status_code": response.status_code,
+                "request_id": response.headers.get("RequestId") or response.headers.get("x-ms-request-id"),
+                "message": "Refresh requested" if accepted else (response.text or "")[:500],
+            }
+        except Exception as e:
+            return {"accepted": False, "message": str(e)}

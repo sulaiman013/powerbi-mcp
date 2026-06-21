@@ -275,6 +275,10 @@ class PowerBIMCPServer:
             "model_snapshot": lambda a: self._handle_model_snapshot(a),
             "model_diff": lambda a: self._handle_model_diff(a),
             "pre_deploy_gate": lambda a: self._handle_pre_deploy_gate(a),
+            # Diagnostics & ops (Wave 2)
+            "refresh_doctor": lambda a: self._handle_refresh_doctor(a),
+            "find_unused_objects": lambda a: self._handle_find_unused_objects(a),
+            "impact_analysis": lambda a: self._handle_impact_analysis(a),
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
@@ -352,6 +356,10 @@ class PowerBIMCPServer:
             "model_snapshot": ann(False, destructive=False, idempotent=True, open_world=False),
             "model_diff": local_read,
             "pre_deploy_gate": local_read,
+            # Diagnostics & ops (Wave 2)
+            "refresh_doctor": cloud_read,
+            "find_unused_objects": local_read,
+            "impact_analysis": local_read,
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
@@ -1162,6 +1170,58 @@ class PowerBIMCPServer:
                             "ai_score": {"type": "number"},
                             "blocking": {"type": "array"}
                         }
+                    }
+                ),
+                # === DIAGNOSTICS & OPS (Wave 2) ===
+                Tool(
+                    name="refresh_doctor",
+                    description="Diagnose a dataset's refresh failures: pulls refresh history via REST, classifies the most recent failure (expired credentials, capacity throttle, model eviction 0xC11C0020, gateway down, timeout, source/query error) with a concrete fix, and warns when approaching the 4-consecutive-failure auto-disable. Reads work on Pro.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"},
+                            "history_count": {"type": "integer", "description": "How many recent refreshes to inspect (default 10)", "default": 10}
+                        },
+                        "required": ["workspace_name", "dataset_name"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "completed": {"type": "integer"},
+                            "failed": {"type": "integer"},
+                            "consecutive_failures": {"type": "integer"},
+                            "most_recent_status": {"type": ["string", "null"]},
+                            "diagnosis": {"type": ["object", "null"]}
+                        }
+                    }
+                ),
+                Tool(
+                    name="find_unused_objects",
+                    description="Find columns and measures not referenced by any other model object (INFO.CALCDEPENDENCY), relationship, or - when a PBIP project is loaded - any report visual. Safe-cleanup candidate list (a free replacement for paid unused-object tools).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="impact_analysis",
+                    description="Blast radius before a change: lists model objects that depend on a measure/column (INFO.CALCDEPENDENCY) and, when a PBIP project is loaded, the report files/visuals that reference it. Run before renaming or deleting.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "object_name": {"type": "string", "description": "Measure or column name to analyze"},
+                            "table_name": {"type": "string", "description": "Optional owning table to disambiguate"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": ["object_name"]
                     }
                 )
             ]
@@ -3024,6 +3084,180 @@ class PowerBIMCPServer:
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (f"Error running pre-deploy gate: {msg}", {"passed": False, "error": msg})
+
+    # ==================== DIAGNOSTICS & OPS (Wave 2) ====================
+
+    async def _handle_refresh_doctor(self, args: Dict[str, Any]):
+        """Diagnose dataset refresh failures (root cause + remediation) from REST history."""
+        try:
+            workspace = args.get("workspace_name")
+            dataset = args.get("dataset_name")
+            if not (workspace and dataset):
+                return ("Error: workspace_name and dataset_name are required",
+                        {"error": "missing workspace_name/dataset_name"})
+            rest = self._get_rest_connector()
+            if not rest:
+                return ("Error: cloud credentials not configured (TENANT_ID / CLIENT_ID / CLIENT_SECRET).",
+                        {"error": "no cloud credentials"})
+            loop = asyncio.get_event_loop()
+            wid, did, err = await loop.run_in_executor(None, rest.resolve_dataset, workspace, dataset)
+            if err:
+                return (f"Error: {err}", {"error": err})
+            top = int(args.get("history_count", 10))
+            history = await loop.run_in_executor(None, rest.get_refresh_history, wid, did, top)
+            if not history:
+                return ("No refresh history found (dataset may never have refreshed, or history expired ~30 days).",
+                        {"history": 0})
+
+            completed = sum(1 for h in history if str(h.get("status")) == "Completed")
+            failed = [h for h in history if str(h.get("status")) == "Failed"]
+            # consecutive leading failures (history is most-recent-first)
+            consecutive = 0
+            for h in history:
+                if str(h.get("status")) == "Failed":
+                    consecutive += 1
+                elif str(h.get("status")) == "Completed":
+                    break
+
+            out = f"=== Refresh Doctor: {dataset} ===\n\n"
+            out += f"Last {len(history)} refreshes: {completed} completed, {len(failed)} failed\n"
+            recent = history[0]
+            out += f"Most recent: {recent.get('status')} ({recent.get('refreshType','?')}) ended {recent.get('endTime','?')}\n\n"
+
+            diagnosis = None
+            if failed:
+                err_text = failed[0].get("serviceExceptionJson") or ""
+                diag = refresh_diagnostics.classify_refresh_error(err_text)
+                diagnosis = diag
+                out += f"Most recent failure:\n  Cause: {diag['cause']}\n  Fix: {diag['remediation']}\n"
+                if err_text:
+                    out += f"  Raw: {redact_secrets(err_text, [self.client_secret])[:300]}\n"
+                out += "\n"
+            thr = refresh_diagnostics.CONSECUTIVE_FAILURE_DISABLE_THRESHOLD
+            if consecutive >= thr - 1:
+                out += (f"WARNING: {consecutive} consecutive failure(s). Power BI auto-disables a "
+                        f"refresh schedule after {thr} consecutive failures.\n")
+
+            structured = {
+                "completed": completed, "failed": len(failed),
+                "consecutive_failures": consecutive,
+                "most_recent_status": recent.get("status"),
+                "diagnosis": diagnosis,
+            }
+            return (out, structured)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error diagnosing refresh: {msg}", {"error": msg})
+
+    async def _handle_find_unused_objects(self, args: Dict[str, Any]) -> str:
+        """Find columns/measures not referenced by any other model object nor any report visual."""
+        try:
+            source = args.get("source") or "desktop"
+            model, err = await self._gather_model_metadata(source, args.get("workspace_name"), args.get("dataset_name"))
+            if err:
+                return f"Error: {err}"
+            run, rerr = await self._get_query_runner(source, args.get("workspace_name"), args.get("dataset_name"))
+            if rerr:
+                return f"Error: {rerr}"
+            loop = asyncio.get_event_loop()
+            try:
+                dep_rows = await loop.run_in_executor(None, run, "EVALUATE INFO.CALCDEPENDENCY()")
+            except Exception as e:
+                return (f"Error reading INFO.CALCDEPENDENCY: {redact_secrets(str(e), [self.client_secret])}. "
+                        "Requires a recent Analysis Services engine.")
+
+            used = set()
+            for r in dep_rows:
+                rt = self._row_get(r, "REFERENCED_TABLE")
+                ro = self._row_get(r, "REFERENCED_OBJECT")
+                if rt and ro:
+                    used.add((str(rt), str(ro)))
+            # columns used in relationships are not 'unused'
+            for rel in model.get("relationships", []):
+                if rel.get("from_table") and rel.get("from_column"):
+                    used.add((str(rel["from_table"]), str(rel["from_column"])))
+                if rel.get("to_table") and rel.get("to_column"):
+                    used.add((str(rel["to_table"]), str(rel["to_column"])))
+
+            report_scanned = False
+            pbip = self.pbip_connector
+            if pbip and pbip.current_project:
+                used |= pbip.collect_report_references()
+                report_scanned = True
+
+            unused_cols, unused_measures = [], []
+            for t in model.get("tables", []):
+                tn = t.get("name")
+                for c in t.get("columns", []):
+                    if (tn, c.get("name")) not in used:
+                        unused_cols.append(f"{tn}[{c.get('name')}]")
+                for m in t.get("measures", []):
+                    if (tn, m.get("name")) not in used:
+                        unused_measures.append(f"{tn}[{m.get('name')}]")
+
+            out = "=== Unused Object Scan ===\n\n"
+            if not report_scanned:
+                out += ("WARNING: no PBIP project loaded, so REPORT usage was NOT checked - objects used only "
+                        "in reports may be wrongly listed. Load the .pbip with pbip_load_project for an accurate scan.\n\n")
+            out += f"Unused measures ({len(unused_measures)}):\n"
+            out += ("\n".join(f"  - {m}" for m in unused_measures[:100]) or "  (none)") + "\n\n"
+            out += f"Unused columns ({len(unused_cols)}):\n"
+            out += ("\n".join(f"  - {c}" for c in unused_cols[:100]) or "  (none)") + "\n"
+            out += ("\nNote: dependency graph includes measures, calc columns, RLS, calc groups and "
+                    "field parameters (via INFO.CALCDEPENDENCY) plus relationships; review before deleting.")
+            return out
+        except Exception as e:
+            return f"Error finding unused objects: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_impact_analysis(self, args: Dict[str, Any]) -> str:
+        """Blast radius for an object: model dependents (INFO.CALCDEPENDENCY) + report visuals using it."""
+        try:
+            name = args.get("object_name") or args.get("measure_name") or args.get("column_name")
+            if not name:
+                return "Error: object_name is required (a measure or column name)"
+            table = args.get("table_name")
+            source = args.get("source") or "desktop"
+            run, rerr = await self._get_query_runner(source, args.get("workspace_name"), args.get("dataset_name"))
+            if rerr:
+                return f"Error: {rerr}"
+            loop = asyncio.get_event_loop()
+            esc = str(name).replace('"', '""')
+            try:
+                q = f'EVALUATE FILTER(INFO.CALCDEPENDENCY(), [REFERENCED_OBJECT] = "{esc}")'
+                rows = await loop.run_in_executor(None, run, q)
+            except Exception as e:
+                return (f"Error reading INFO.CALCDEPENDENCY: {redact_secrets(str(e), [self.client_secret])}. "
+                        "Requires a recent Analysis Services engine.")
+
+            out = f"=== Impact Analysis: {name}{(' in ' + table) if table else ''} ===\n\n"
+            out += f"--- Model objects that depend on it ({len(rows)}) ---\n"
+            if not rows:
+                out += "  (none at the model level)\n"
+            for r in rows[:100]:
+                otype = self._row_get(r, "OBJECT_TYPE") or "?"
+                otable = self._row_get(r, "TABLE") or ""
+                oobj = self._row_get(r, "OBJECT") or ""
+                out += f"  <- [{otype}] {otable}{('[' + oobj + ']') if oobj else ''}\n"
+
+            # Report-layer usage from a loaded PBIP project
+            pbip = self.pbip_connector
+            if pbip and pbip.current_project:
+                by_file = pbip.collect_report_references_by_file()
+                hit_files = [fp for fp, refs in by_file.items()
+                             if any(fld == name and (not table or tbl == table) for (tbl, fld) in refs)]
+                out += f"\n--- Report files that reference it ({len(hit_files)}) ---\n"
+                if not hit_files:
+                    out += "  (none in the loaded report)\n"
+                for fp in hit_files[:100]:
+                    out += f"  * {fp}\n"
+            else:
+                out += "\n(No PBIP project loaded - report-layer usage not checked. Use pbip_load_project.)\n"
+
+            if not rows:
+                out += "\nSafe to change from a model-dependency standpoint (verify report usage above)."
+            return out
+        except Exception as e:
+            return f"Error in impact analysis: {redact_secrets(str(e), [self.client_secret])}"
 
     # ==================== MCP RESOURCES & COMPLETION (Bundle C) ====================
 

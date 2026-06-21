@@ -492,6 +492,75 @@ class PowerBIPBIPConnector:
             logger.error(f"Failed to create backup: {e}")
             return None
 
+    @staticmethod
+    def _find_entity(obj) -> Optional[str]:
+        """Find the SourceRef Entity (table) within a PBIR reference node."""
+        if isinstance(obj, dict):
+            sr = obj.get("SourceRef")
+            if isinstance(sr, dict) and isinstance(sr.get("Entity"), str):
+                return sr["Entity"]
+            if isinstance(obj.get("Entity"), str):
+                return obj["Entity"]
+            for v in obj.values():
+                e = PowerBIPBIPConnector._find_entity(v)
+                if e:
+                    return e
+        elif isinstance(obj, list):
+            for it in obj:
+                e = PowerBIPBIPConnector._find_entity(it)
+                if e:
+                    return e
+        return None
+
+    @classmethod
+    def _walk_report_refs(cls, obj, refs: set) -> None:
+        """Collect (Entity, Property) field/measure references from a PBIR JSON tree."""
+        if isinstance(obj, dict):
+            prop = obj.get("Property")
+            if isinstance(prop, str):
+                entity = cls._find_entity(obj)
+                if entity:
+                    refs.add((entity, prop))
+            nrn = obj.get("NativeReferenceName")
+            if isinstance(nrn, str) and "." in nrn:
+                tbl, _, fld = nrn.partition(".")
+                if tbl and fld:
+                    refs.add((tbl, fld))
+            for v in obj.values():
+                cls._walk_report_refs(v, refs)
+        elif isinstance(obj, list):
+            for it in obj:
+                cls._walk_report_refs(it, refs)
+
+    def collect_report_references_by_file(self) -> Dict[str, set]:
+        """Scan the report layer and return {file_path: set((table, field))} references.
+
+        Covers PBIR-Enhanced (per-visual.json) and PBIR-Legacy (single report.json)."""
+        out: Dict[str, set] = {}
+        if not self.current_project:
+            return out
+        files = []
+        if self.current_project.is_pbir_enhanced and self.current_project.visual_json_files:
+            files = list(self.current_project.visual_json_files)
+        elif self.current_project.report_json_path:
+            files = [self.current_project.report_json_path]
+        for fp in files:
+            refs: set = set()
+            try:
+                data = json.loads(self._read_text(fp))
+                self._walk_report_refs(data, refs)
+            except Exception as e:
+                logger.warning(f"Could not scan report references in {fp}: {e}")
+            out[str(fp)] = refs
+        return out
+
+    def collect_report_references(self) -> set:
+        """Set of all (table, field) references used anywhere in the report layer."""
+        refs: set = set()
+        for s in self.collect_report_references_by_file().values():
+            refs |= s
+        return refs
+
     def _read_text(self, file_path) -> str:
         """Read a text file, remembering its encoding (utf-8 vs utf-8-sig/BOM) so it can be
         written back faithfully. Returns text with any BOM stripped."""
