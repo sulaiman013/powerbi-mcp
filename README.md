@@ -9,7 +9,7 @@
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10+-green?style=flat-square" alt="Python 3.10+"></a>
   <a href="#"><img src="https://img.shields.io/badge/Platform-Windows-lightgrey?style=flat-square" alt="Windows"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT License"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-45-purple?style=flat-square" alt="45 Tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-58-purple?style=flat-square" alt="58 Tools"></a>
 </p>
 
 <p align="center">
@@ -64,6 +64,10 @@ Microsoft now ships official Power BI MCP servers. This project leans into what 
 - **First-class MCP** - every tool carries safety annotations
   (`readOnlyHint` / `destructiveHint`); key tools return typed structured output;
   the server exposes **resources** (`powerbi://...`), **prompts**, and **completion**.
+- **Productivity, CI & governance layer** - data-dictionary export, semantic
+  `model_diff` + `pre_deploy_gate`, `run_dax_tests` regression runner, `refresh_doctor`,
+  unused-object detection, impact analysis, RLS test matrix, tamper-evident audit,
+  numeric masking, read-only mode, and tenant-wide Scanner-API lineage/usage.
 
 **Positioning vs Microsoft's official Power BI MCP:** the official *remote* server is
 best for cloud chat-with-data and the official *local modeling* MCP for raw model
@@ -186,7 +190,7 @@ We built a dedicated **PBIP Connector** that:
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                    Power BI MCP Server                       │
-│                  (45 Tools + Resources/Prompts)              │
+│                  (58 Tools + Resources/Prompts)              │
 ├──────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
 │  │  Security   │  │   Audit     │  │   Access Policies   │  │
@@ -327,6 +331,36 @@ Beyond tools, the server is a first-class MCP citizen:
 - **Prompts:** `optimize_measure`, `explain_measure`, `audit_model`, `document_model`, `plan_safe_rename` - ready-made, tool-orchestrated playbooks.
 - **Completion:** grounds prompt/template arguments in real table/measure names from the connected model.
 - **Tool annotations + structured output:** every tool declares `readOnlyHint`/`destructiveHint`; `validate_dax`, `run_bpa`, and `audit_ai_readiness` return typed `structuredContent` for chainable workflows.
+
+### Documentation, Diff & CI (5 tools) ✅ NEW
+
+| Tool | Description |
+|------|-------------|
+| `export_data_dictionary` | Full data dictionary (Markdown/HTML) + documentation-coverage score; CI-rerunnable |
+| `model_snapshot` | Capture model metadata to a JSON baseline before a change |
+| `model_diff` | Human-readable semantic diff (added/removed/changed) vs a snapshot or the live model |
+| `pre_deploy_gate` | Machine PASS/FAIL quality gate (BPA + AI-readiness) for CI |
+| `run_dax_tests` | DAX regression test runner: `{name, dax, expected, tolerance}` → pass/fail |
+
+### Diagnostics & Ops (5 tools) ✅ NEW
+
+| Tool | Description |
+|------|-------------|
+| `refresh_doctor` | Classify dataset refresh failures (credentials/throttle/eviction/gateway/timeout) + remediation; works on Pro |
+| `find_unused_objects` | Columns/measures unused by any model object or report visual (safe-cleanup list) |
+| `impact_analysis` | Pre-change blast radius: model dependents + report visuals referencing an object |
+| `rls_test_harness` | Evaluate under every RLS role → pass/fail matrix (flags "sees everything/nothing") |
+| `verify_audit_integrity` | Verify the tamper-evident hash-chained audit log (detects edits/inserts/deletes) |
+
+### Governance-Ops Fleet (3 tools, admin-gated) ✅ NEW
+
+| Tool | Description |
+|------|-------------|
+| `cross_workspace_lineage` | Tenant inventory + lineage via the Scanner API: datasets missing RLS/labels, downstream reports per dataset |
+| `fleet_refresh_monitor` | Refresh health + classified failures across many workspaces |
+| `usage_and_orphan_analytics` | Per-day usage analytics (top reports/users/activities) from the Activity Events API |
+
+> **Read-only / lockdown mode:** set `POWERBI_MCP_READONLY=true` to refuse every write tool (model/report mutations), while reads/diagnostics keep working - safe for shared or autonomous agent use.
 
 ---
 
@@ -500,7 +534,7 @@ User: "Clear RLS role"
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server (45 tools + resources/prompts/completion)
+│   ├── server.py                    # MCP server (58 tools + resources/prompts/completion)
 │   ├── powerbi_desktop_connector.py # Desktop + RLS
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
 │   ├── powerbi_rest_connector.py    # REST API
