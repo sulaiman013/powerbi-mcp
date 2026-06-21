@@ -88,9 +88,10 @@ from powerbi_desktop_connector import PowerBIDesktopConnector
 from powerbi_tom_connector import PowerBITOMConnector
 from powerbi_pbip_connector import PowerBIPBIPConnector
 
-# Pure-Python model analysis (BPA + AI-readiness) and refresh diagnostics
+# Pure-Python model analysis (BPA + AI-readiness), refresh diagnostics, governance
 import model_analysis
 import refresh_diagnostics
+import governance
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -290,6 +291,9 @@ class PowerBIMCPServer:
             "rls_test_harness": lambda a: self._handle_rls_test_harness(a),
             "run_dax_tests": lambda a: self._handle_run_dax_tests(a),
             "verify_audit_integrity": lambda a: self._handle_verify_audit_integrity(),
+            # Governance-ops fleet (Wave 3, admin-gated)
+            "cross_workspace_lineage": lambda a: self._handle_cross_workspace_lineage(a),
+            "fleet_refresh_monitor": lambda a: self._handle_fleet_refresh_monitor(a),
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
@@ -374,6 +378,9 @@ class PowerBIMCPServer:
             "rls_test_harness": local_read,
             "run_dax_tests": local_read,
             "verify_audit_integrity": local_read,
+            # Governance-ops fleet (Wave 3) - read-only, cloud/admin
+            "cross_workspace_lineage": cloud_read,
+            "fleet_refresh_monitor": cloud_read,
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
@@ -1287,6 +1294,32 @@ class PowerBIMCPServer:
                         "properties": {
                             "valid": {"type": "boolean"}, "checked": {"type": "integer"}, "message": {"type": "string"}
                         }
+                    }
+                ),
+                # === GOVERNANCE-OPS FLEET (Wave 3, admin-gated) ===
+                Tool(
+                    name="cross_workspace_lineage",
+                    description="Tenant-wide inventory + lineage via the Admin Scanner API: workspace/dataset/report counts, datasets missing RLS or a sensitivity label, and (with dataset_name) the downstream reports that depend on a dataset across all workspaces. Requires Fabric admin (or an SP allowed to use read-only admin APIs). Cache the scan to cache_path to avoid rescanning.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "dataset_name": {"type": "string", "description": "Optional: focus lineage on this dataset (downstream reports)"},
+                            "workspace_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit workspace GUIDs (default: up to 100 tenant workspaces)"},
+                            "cache_path": {"type": "string", "description": "Optional path to read/write the scan result for reuse"},
+                            "use_cache": {"type": "boolean", "default": True}
+                        },
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="fleet_refresh_monitor",
+                    description="Refresh health across many datasets: for each refreshable dataset in the given workspaces, check the most recent refresh and classify failures (root cause). Centralized 'what failed across the fleet' view. Needs access to the listed workspaces.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "workspace_ids": {"type": "array", "items": {"type": "string"}, "description": "Workspace GUIDs to monitor (required, to bound the scan)"}
+                        },
+                        "required": ["workspace_ids"]
                     }
                 )
             ]
@@ -3445,6 +3478,117 @@ class PowerBIMCPServer:
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (f"Error running DAX tests: {msg}", {"passed": 0, "total": 0, "error": msg})
+
+    async def _handle_cross_workspace_lineage(self, args: Dict[str, Any]) -> str:
+        """Tenant-wide inventory + lineage via the Admin Scanner API (admin-gated)."""
+        try:
+            rest = self._get_rest_connector()
+            if not rest:
+                return "Error: cloud credentials not configured (TENANT_ID / CLIENT_ID / CLIENT_SECRET)."
+            loop = asyncio.get_event_loop()
+
+            # Reuse a cached scanResult if provided (Scanner API is rate-limited).
+            cache_path = args.get("cache_path")
+            scan = None
+            if cache_path and args.get("use_cache", True):
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        scan = json.load(f)
+                except Exception:
+                    scan = None
+
+            if scan is None:
+                ids = args.get("workspace_ids")
+                if not ids:
+                    try:
+                        ws = await loop.run_in_executor(None, rest.admin_list_workspaces, 100)
+                        ids = [w.get("id") for w in ws if w.get("id")]
+                    except Exception as e:
+                        return (f"Error listing workspaces (needs admin / read-only admin APIs enabled): "
+                                f"{redact_secrets(str(e), [self.client_secret])}")
+                ids = [i for i in (ids or [])][:100]  # Scanner caps at 100 workspaces/call
+                if not ids:
+                    return "No workspaces found to scan."
+                started = await loop.run_in_executor(None, rest.admin_post_workspace_info, ids, True)
+                scan_id = started.get("id")
+                if not scan_id:
+                    return f"Error: scan did not start ({started})."
+                status = ""
+                for _ in range(40):  # ~80s budget
+                    st = await loop.run_in_executor(None, rest.admin_get_scan_status, scan_id)
+                    status = str(st.get("status", "")).lower()
+                    if status == "succeeded":
+                        break
+                    await asyncio.sleep(2)
+                if status != "succeeded":
+                    return f"Scan did not finish in time (status={status}). Try again or scan fewer workspaces."
+                scan = await loop.run_in_executor(None, rest.admin_get_scan_result, scan_id)
+                if cache_path:
+                    try:
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            json.dump(scan, f)
+                    except Exception:
+                        pass
+
+            s = governance.summarize_scan(scan, dataset_name=args.get("dataset_name"))
+            out = "=== Cross-Workspace Lineage / Inventory ===\n\n"
+            out += f"Workspaces: {s['workspaces']}  Datasets: {s['datasets']}  Reports: {s['reports']}\n\n"
+            if s.get("focus_dataset"):
+                out += f"Dataset '{s['focus_dataset']}' found in: {', '.join(s['focus_found_in']) or '(not found)'}\n"
+                out += f"Downstream reports ({len(s['downstream_reports'])}):\n"
+                out += ("\n".join(f"  - {r}" for r in s['downstream_reports']) or "  (none)") + "\n\n"
+            out += f"Datasets WITHOUT RLS roles ({len(s['datasets_without_rls'])}):\n"
+            out += ("\n".join(f"  - {d}" for d in s['datasets_without_rls'][:50]) or "  (none)") + "\n\n"
+            out += f"Datasets WITHOUT a sensitivity label ({len(s['datasets_without_sensitivity_label'])}):\n"
+            out += ("\n".join(f"  - {d}" for d in s['datasets_without_sensitivity_label'][:50]) or "  (none)") + "\n"
+            return out
+        except Exception as e:
+            return f"Error in cross-workspace lineage: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_fleet_refresh_monitor(self, args: Dict[str, Any]) -> str:
+        """Refresh health across many datasets/workspaces, classifying failures (admin or workspace access)."""
+        try:
+            rest = self._get_rest_connector()
+            if not rest:
+                return "Error: cloud credentials not configured (TENANT_ID / CLIENT_ID / CLIENT_SECRET)."
+            loop = asyncio.get_event_loop()
+            workspace_ids = args.get("workspace_ids")
+            if not workspace_ids:
+                return ("Error: workspace_ids is required (a list of workspace GUIDs) to bound the scan. "
+                        "Use list_workspaces or cross_workspace_lineage to discover them.")
+
+            failures = []
+            checked = 0
+            for wid in workspace_ids:
+                try:
+                    datasets = await loop.run_in_executor(None, rest.list_datasets, wid)
+                except Exception:
+                    continue
+                for ds in datasets:
+                    if not ds.get("isRefreshable"):
+                        continue
+                    checked += 1
+                    try:
+                        hist = await loop.run_in_executor(None, rest.get_refresh_history, wid, ds["id"], 1)
+                    except Exception:
+                        continue
+                    if not hist:
+                        continue
+                    last = hist[0]
+                    if str(last.get("status")) == "Failed":
+                        diag = refresh_diagnostics.classify_refresh_error(last.get("serviceExceptionJson") or "")
+                        failures.append((ds.get("name"), last.get("endTime"), diag["cause"]))
+
+            out = "=== Fleet Refresh Monitor ===\n\n"
+            out += f"Refreshable datasets checked: {checked}\n"
+            out += f"Most-recent-refresh FAILURES: {len(failures)}\n\n"
+            for name, when, cause in failures[:100]:
+                out += f"  [FAILED] {name} ({when}): {cause}\n"
+            if not failures:
+                out += "  All checked datasets' most recent refresh succeeded.\n"
+            return out
+        except Exception as e:
+            return f"Error in fleet refresh monitor: {redact_secrets(str(e), [self.client_secret])}"
 
     async def _handle_verify_audit_integrity(self):
         """Verify the tamper-evident hash chain of the audit log."""

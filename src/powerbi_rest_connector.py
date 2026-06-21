@@ -180,3 +180,47 @@ class PowerBIRestConnector:
             }
         except Exception as e:
             return {"accepted": False, "message": str(e)}
+
+    # ==================== ADMIN / SCANNER / ACTIVITY (Wave 3) ====================
+    # These require Fabric/Power BI admin rights (or an SP in an allowed security group
+    # with read-only admin APIs enabled). Reads only; rate-limited by the service.
+
+    def admin_list_workspaces(self, top: int = 100) -> List[Dict[str, Any]]:
+        """List workspaces tenant-wide (admin). GET /admin/groups."""
+        if not self.access_token and not self.authenticate():
+            return []
+        url = f"{self.BASE_URL}/admin/groups?$top={int(top)}"
+        response = requests.get(url, headers=self._get_headers(), timeout=30)
+        response.raise_for_status()
+        return response.json().get("value", [])
+
+    def admin_post_workspace_info(self, workspace_ids: List[str], lineage: bool = True) -> Dict[str, Any]:
+        """Start a metadata scan for up to 100 workspaces. POST /admin/workspaces/getInfo.
+        Returns {id: scanId, status,...}."""
+        if not self.access_token and not self.authenticate():
+            return {}
+        url = (f"{self.BASE_URL}/admin/workspaces/getInfo"
+               f"?lineage={'true' if lineage else 'false'}&datasourceDetails=true"
+               f"&datasetSchema=false&datasetExpressions=false&getArtifactUsers=false")
+        response = requests.post(url, headers=self._get_headers(),
+                                 json={"workspaces": workspace_ids[:100]}, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def admin_get_scan_status(self, scan_id: str) -> Dict[str, Any]:
+        """GET /admin/workspaces/scanStatus/{scanId}. status: NotStarted|Running|Succeeded."""
+        if not self.access_token and not self.authenticate():
+            return {}
+        url = f"{self.BASE_URL}/admin/workspaces/scanStatus/{scan_id}"
+        response = requests.get(url, headers=self._get_headers(), timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def admin_get_scan_result(self, scan_id: str) -> Dict[str, Any]:
+        """GET /admin/workspaces/scanResult/{scanId}. Returns the full workspace metadata graph."""
+        if not self.access_token and not self.authenticate():
+            return {}
+        url = f"{self.BASE_URL}/admin/workspaces/scanResult/{scan_id}"
+        response = requests.get(url, headers=self._get_headers(), timeout=60)
+        response.raise_for_status()
+        return response.json()
