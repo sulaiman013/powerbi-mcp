@@ -16,7 +16,7 @@ Run: python test_security_enforcement.py   (pure Python, no Power BI required)
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from security.access_policy import (  # noqa: E402
     AccessPolicyEngine,
@@ -27,7 +27,7 @@ from security.access_policy import (  # noqa: E402
 )
 from security.security_layer import SecurityLayer  # noqa: E402
 
-CONFIG = os.path.join(os.path.dirname(__file__), "config", "policies.yaml")
+CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "policies.yaml")
 
 _failures = []
 
