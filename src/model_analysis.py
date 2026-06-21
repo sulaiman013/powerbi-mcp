@@ -315,6 +315,21 @@ def audit_ai_readiness(model: Dict[str, Any]) -> Dict[str, Any]:
     return {"score": score, "grade": grade, "metrics": metrics, "recommendations": recs}
 
 
+def dax_test_verdict(actual, expected, tolerance=0):
+    """Compare a DAX test's actual scalar result to its expected value.
+
+    Returns (passed: bool, detail: str). Numeric comparison honors an optional tolerance.
+    """
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        passed = bool(actual) == bool(expected)
+        return passed, f"{actual!r} vs expected {expected!r}"
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        if tolerance:
+            return abs(actual - expected) <= tolerance, f"{actual} vs {expected} (±{tolerance})"
+        return actual == expected, f"{actual} vs {expected}"
+    return str(actual) == str(expected), f"{actual!r} vs expected {expected!r}"
+
+
 def diff_models(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
     """Compute a human-readable semantic diff between two normalized model dicts.
 

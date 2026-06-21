@@ -288,6 +288,8 @@ class PowerBIMCPServer:
             "find_unused_objects": lambda a: self._handle_find_unused_objects(a),
             "impact_analysis": lambda a: self._handle_impact_analysis(a),
             "rls_test_harness": lambda a: self._handle_rls_test_harness(a),
+            "run_dax_tests": lambda a: self._handle_run_dax_tests(a),
+            "verify_audit_integrity": lambda a: self._handle_verify_audit_integrity(),
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
@@ -370,6 +372,8 @@ class PowerBIMCPServer:
             "find_unused_objects": local_read,
             "impact_analysis": local_read,
             "rls_test_harness": local_read,
+            "run_dax_tests": local_read,
+            "verify_audit_integrity": local_read,
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
@@ -1247,6 +1251,42 @@ class PowerBIMCPServer:
                             "roles": {"type": "array", "items": {"type": "string"}, "description": "Specific roles to test (default: all roles)"}
                         },
                         "required": []
+                    }
+                ),
+                Tool(
+                    name="run_dax_tests",
+                    description="Run a suite of DAX regression tests against the model: each test is {name, dax, expected, tolerance?}; returns PASS/FAIL per test and an overall verdict. Use to catch measure regressions before deploy. Provide tests inline or via tests_path (JSON file).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "tests": {"type": "array", "description": "Array of {name, dax, expected, tolerance?}",
+                                      "items": {"type": "object", "properties": {
+                                          "name": {"type": "string"}, "dax": {"type": "string"},
+                                          "expected": {}, "tolerance": {"type": "number"}}, "required": ["dax"]}},
+                            "tests_path": {"type": "string", "description": "Path to a JSON file with the tests array (alternative to 'tests')"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "passed": {"type": "integer"}, "total": {"type": "integer"},
+                            "all_passed": {"type": "boolean"}, "results": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="verify_audit_integrity",
+                    description="Verify the tamper-evident hash chain of the audit log. Detects any edited, inserted, or deleted audit entries (compliance/forensics). Returns INTACT or TAMPERED with the first broken line.",
+                    inputSchema={"type": "object", "properties": {}, "required": []},
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "valid": {"type": "boolean"}, "checked": {"type": "integer"}, "message": {"type": "string"}
+                        }
                     }
                 )
             ]
@@ -3352,6 +3392,68 @@ class PowerBIMCPServer:
         out += ("\nNote: tests row-level (RLS) filters via role simulation. Object-level security "
                 "(OLS) visibility is not covered here; check object access separately.")
         return out
+
+    async def _handle_run_dax_tests(self, args: Dict[str, Any]):
+        """Run a suite of DAX test cases and report pass/fail vs expected results (regression testing)."""
+        try:
+            tests = args.get("tests")
+            tests_path = args.get("tests_path")
+            if not tests and tests_path:
+                try:
+                    with open(tests_path, "r", encoding="utf-8") as f:
+                        tests = json.load(f)
+                except Exception as e:
+                    return (f"Error reading tests_path: {e}", {"passed": 0, "total": 0, "error": str(e)})
+            if not tests or not isinstance(tests, list):
+                return ("Error: provide 'tests' (array of {name, dax, expected, tolerance?}) or 'tests_path'.",
+                        {"passed": 0, "total": 0})
+            run, rerr = await self._get_query_runner(args.get("source") or "desktop",
+                                                     args.get("workspace_name"), args.get("dataset_name"))
+            if rerr:
+                return (f"Error: {rerr}", {"passed": 0, "total": len(tests), "error": rerr})
+            loop = asyncio.get_event_loop()
+
+            results = []
+            passed = 0
+            for t in tests:
+                name = t.get("name", t.get("dax", "test")[:40])
+                dax = t.get("dax")
+                if not dax:
+                    results.append({"name": name, "status": "ERROR", "detail": "no dax"})
+                    continue
+                try:
+                    rows = await loop.run_in_executor(None, run, dax)
+                    actual = next(iter(rows[0].values()), None) if rows else None
+                except Exception as e:
+                    results.append({"name": name, "status": "ERROR", "detail": redact_secrets(str(e), [self.client_secret])[:200]})
+                    continue
+                if "expected" not in t:
+                    results.append({"name": name, "status": "INFO", "detail": f"actual={actual} (no expected given)"})
+                    continue
+                ok, detail = model_analysis.dax_test_verdict(actual, t.get("expected"), t.get("tolerance", 0))
+                results.append({"name": name, "status": "PASS" if ok else "FAIL", "detail": detail})
+                if ok:
+                    passed += 1
+
+            graded = [r for r in results if r["status"] in ("PASS", "FAIL")]
+            total = len(graded)
+            all_passed = total > 0 and passed == total
+            out = f"[{'PASS' if all_passed else 'FAIL'}] DAX tests: {passed}/{total} passed\n\n"
+            for r in results:
+                out += f"  [{r['status']}] {r['name']}: {r['detail']}\n"
+            return (out, {"passed": passed, "total": total, "all_passed": all_passed, "results": results})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error running DAX tests: {msg}", {"passed": 0, "total": 0, "error": msg})
+
+    async def _handle_verify_audit_integrity(self):
+        """Verify the tamper-evident hash chain of the audit log."""
+        res = self.security.verify_audit_integrity()
+        status = "INTACT" if res.get("valid") else "TAMPERED"
+        text = f"[{status}] Audit log integrity: {res.get('message', '')}\n  Entries checked: {res.get('checked', 0)}"
+        if not res.get("valid") and res.get("broken_line"):
+            text += f"\n  First problem at line {res['broken_line']}"
+        return (text, res)
 
     # ==================== MCP RESOURCES & COMPLETION (Bundle C) ====================
 

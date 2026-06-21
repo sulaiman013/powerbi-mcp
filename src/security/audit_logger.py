@@ -90,7 +90,75 @@ class AuditLogger:
         # Ensure log directory exists
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
+        # Tamper-evident hash chain: each entry hashes (prev_hash + its own content),
+        # so any insertion/deletion/edit is detectable via verify_chain().
+        self._last_hash = self._read_last_hash() or "GENESIS"
+
         logger.info(f"Audit logger initialized: {self.log_file}")
+
+    @staticmethod
+    def _hash_event(event: Dict[str, Any]) -> str:
+        """Deterministic hash of an event dict (caller must exclude 'entry_hash')."""
+        canonical = json.dumps(event, sort_keys=True, default=str)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _read_last_hash(self) -> Optional[str]:
+        """Read the entry_hash of the last line of the current log (to continue the chain)."""
+        if not self.log_file.exists():
+            return None
+        last = None
+        try:
+            with open(self.log_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        last = line
+            if last:
+                return json.loads(last).get("entry_hash")
+        except Exception:
+            pass
+        return None
+
+    def verify_chain(self) -> Dict[str, Any]:
+        """Verify the tamper-evident hash chain of the current audit log.
+
+        Returns {valid, checked, broken_line?, message}. Detects edits (hash mismatch)
+        and insertions/deletions (linkage break). Only the current (un-rotated) file is checked.
+        """
+        if not self.log_file.exists():
+            return {"valid": True, "checked": 0, "message": "No audit log file yet."}
+        checked = 0
+        prev_entry_hash = None
+        with self._lock:
+            try:
+                with open(self.log_file, 'r', encoding='utf-8') as f:
+                    for i, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except Exception:
+                            return {"valid": False, "checked": checked, "broken_line": i,
+                                    "message": f"Line {i} is not valid JSON (corrupted)."}
+                        stored = ev.get("entry_hash")
+                        if stored is None:
+                            # Pre-chain (legacy) entry: cannot verify; reset linkage.
+                            checked += 1
+                            prev_entry_hash = None
+                            continue
+                        recomputed = self._hash_event({k: v for k, v in ev.items() if k != "entry_hash"})
+                        if recomputed != stored:
+                            return {"valid": False, "checked": checked, "broken_line": i,
+                                    "message": f"Line {i} entry_hash mismatch - the entry was modified."}
+                        if prev_entry_hash is not None and ev.get("prev_hash") != prev_entry_hash:
+                            return {"valid": False, "checked": checked, "broken_line": i,
+                                    "message": f"Line {i} chain linkage broken - an entry was inserted or deleted."}
+                        prev_entry_hash = stored
+                        checked += 1
+            except Exception as e:
+                return {"valid": False, "checked": checked, "message": f"Verification error: {e}"}
+        return {"valid": True, "checked": checked, "message": f"Chain intact across {checked} entr(ies)."}
 
     def _generate_session_id(self) -> str:
         """Generate a unique session ID"""
@@ -132,13 +200,16 @@ class AuditLogger:
         return value
 
     def _write_log(self, event: Dict[str, Any]):
-        """Thread-safe log writing"""
+        """Thread-safe log writing with tamper-evident hash chaining."""
         with self._lock:
             self._rotate_if_needed()
-
             try:
+                chained = dict(event)
+                chained["prev_hash"] = self._last_hash
+                chained["entry_hash"] = self._hash_event(chained)
                 with open(self.log_file, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(event, default=str) + '\n')
+                    f.write(json.dumps(chained, default=str) + '\n')
+                self._last_hash = chained["entry_hash"]
             except Exception as e:
                 logger.error(f"Failed to write audit log: {e}")
 
