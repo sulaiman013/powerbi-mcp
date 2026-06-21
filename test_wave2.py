@@ -148,6 +148,38 @@ def test_impact():
         check("shows report files referencing Amount", "visual.json" in out, out)
 
 
+class RlsDesktop:
+    """Returns role-dependent counts: East sees 30, Admin sees all (100), Empty sees 0."""
+    current_port = 12345
+
+    def __init__(self):
+        self.active = None
+
+    def list_rls_roles(self):
+        return [{"name": "Sales_East"}, {"name": "Admin"}, {"name": "Empty"}]
+
+    def set_rls_role(self, role):
+        self.active = role
+        return True
+
+    def execute_dax(self, dax, max_rows=1000):
+        counts = {None: 100, "Sales_East": 30, "Admin": 100, "Empty": 0}
+        return [{"rows": counts.get(self.active, 0)}]
+
+
+def test_rls_harness():
+    print("\n== rls_test_harness (mock) ==")
+    srv = server.PowerBIMCPServer()
+    dt = RlsDesktop()
+    srv.desktop_connector = dt
+    out = run(srv._handle_rls_test_harness({"table_name": "Sales"}))
+    check("baseline shown", "baseline: 100" in out, out)
+    check("East is filtered", "Sales_East" in out and "filtered" in out)
+    check("Admin flagged sees everything", "EVERYTHING" in out)
+    check("Empty flagged sees nothing", "NOTHING" in out)
+    check("role restored to None after run", dt.active is None, f"active={dt.active}")
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  WAVE 2 (DIAGNOSTICS & OPS) TESTS")
@@ -156,6 +188,7 @@ if __name__ == "__main__":
     test_refresh_doctor()
     test_find_unused()
     test_impact()
+    test_rls_harness()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")
