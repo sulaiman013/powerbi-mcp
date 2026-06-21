@@ -4,6 +4,7 @@ cross-workspace lineage / inventory / RLS-coverage answers can be unit tested wi
 a tenant. The server orchestrates the (admin-gated) Scanner calls and passes the
 scanResult JSON in here.
 """
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 
@@ -57,3 +58,29 @@ def summarize_scan(scan: Dict[str, Any], dataset_name: Optional[str] = None) -> 
         summary["downstream_reports"] = downstream
 
     return summary
+
+
+def aggregate_activity(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate Admin Activity Events (M365 Power BI schema, PascalCase fields) into a usage
+    summary: counts by activity, top users, top viewed reports, distinct users."""
+    by_activity: Counter = Counter()
+    by_user: Counter = Counter()
+    report_views: Counter = Counter()
+    for e in events:
+        act = e.get("Activity") or e.get("Operation")
+        if act:
+            by_activity[act] += 1
+        user = e.get("UserId")
+        if user:
+            by_user[user] += 1
+        if act and "viewreport" in str(act).lower():
+            report = e.get("ReportName") or e.get("ReportId")
+            if report:
+                report_views[report] += 1
+    return {
+        "total_events": len(events),
+        "distinct_users": len(by_user),
+        "by_activity": by_activity.most_common(25),
+        "top_users": by_user.most_common(25),
+        "top_reports_by_views": report_views.most_common(25),
+    }

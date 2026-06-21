@@ -199,8 +199,10 @@ class PowerBIRestConnector:
         Returns {id: scanId, status,...}."""
         if not self.access_token and not self.authenticate():
             return {}
+        # datasourceDetails=false: governance summary uses roles/labels/lineage only, not
+        # datasource instances - keeps the scan payload small. lineage gives report->dataset links.
         url = (f"{self.BASE_URL}/admin/workspaces/getInfo"
-               f"?lineage={'true' if lineage else 'false'}&datasourceDetails=true"
+               f"?lineage={'true' if lineage else 'false'}&datasourceDetails=false"
                f"&datasetSchema=false&datasetExpressions=false&getArtifactUsers=false")
         response = requests.post(url, headers=self._get_headers(),
                                  json={"workspaces": workspace_ids[:100]}, timeout=30)
@@ -208,7 +210,9 @@ class PowerBIRestConnector:
         return response.json()
 
     def admin_get_scan_status(self, scan_id: str) -> Dict[str, Any]:
-        """GET /admin/workspaces/scanStatus/{scanId}. status: NotStarted|Running|Succeeded."""
+        """GET /admin/workspaces/scanStatus/{scanId}. status is a string (not a closed enum);
+        known values include NotStarted, Running, Succeeded, Failed - match case-insensitively
+        and treat anything else as still in progress. On Failed, inspect the .error object."""
         if not self.access_token and not self.authenticate():
             return {}
         url = f"{self.BASE_URL}/admin/workspaces/scanStatus/{scan_id}"
@@ -224,3 +228,44 @@ class PowerBIRestConnector:
         response = requests.get(url, headers=self._get_headers(), timeout=60)
         response.raise_for_status()
         return response.json()
+
+    def admin_get_activity_events(self, start_dt_iso: str, end_dt_iso: str,
+                                  filter_expr: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get audit Activity Events for a window (same UTC day, <=28 days old) via
+        GET /admin/activityevents. Datetimes are single-quoted UTC ISO. Pages by following
+        continuationUri verbatim while continuationToken is non-null (a page may be empty but
+        still have a token). Honors 429 Retry-After. Returns the accumulated entities."""
+        import time as _time
+        from urllib.parse import quote
+        if not self.access_token and not self.authenticate():
+            return []
+        url = (f"{self.BASE_URL}/admin/activityevents"
+               f"?startDateTime='{start_dt_iso}'&endDateTime='{end_dt_iso}'")
+        if filter_expr:
+            url += f"&$filter={quote(filter_expr)}"
+        entities: List[Dict[str, Any]] = []
+        for _ in range(1000):  # safety bound on pages
+            response = requests.get(url, headers=self._get_headers(), timeout=30)
+            if response.status_code == 429:
+                _time.sleep(int(response.headers.get("Retry-After", "10")))
+                continue
+            response.raise_for_status()
+            data = response.json()
+            entities.extend(data.get("activityEventEntities", []) or [])
+            token = data.get("continuationToken")
+            cont_uri = data.get("continuationUri")
+            if not token:
+                break
+            url = cont_uri  # complete, correctly-encoded URL - follow verbatim, no re-encoding
+        return entities
+
+    def admin_get_activity_events_for_day(self, date: str,
+                                          filter_expr: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Pull a full UTC day of activity events by looping 24 one-hour windows
+        (the raw API allows at most ~1 hour per request). date = 'YYYY-MM-DD'."""
+        events: List[Dict[str, Any]] = []
+        for h in range(24):
+            start = f"{date}T{h:02d}:00:00.000Z"
+            end = f"{date}T{h:02d}:59:59.999Z"
+            events.extend(self.admin_get_activity_events(start, end, filter_expr))
+        return events
