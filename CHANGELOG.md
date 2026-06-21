@@ -3,6 +3,23 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.4.0] - 2026-06-21 — PBIX onboarding
+
+Grew the server from **66 to 68 tools** so an agent can work with a real `.pbix` file, not just
+a saved `.pbip` project (the format most reports actually start in).
+
+### Added
+- **`pbix_inspect`** — inspect a `.pbix` (it is an OPC ZIP package) without extracting: classify
+  it as thick (imported VertiPaq model) vs thin (live connection), detect the report format
+  (legacy `Report/Layout` vs PBIR), count pages, and list every internal entry with its size.
+- **`pbix_extract`** — extract a `.pbix` to a folder with Zip-Slip path-traversal protection, and
+  decode the legacy UTF-16-LE `Report/Layout` into a readable UTF-8 `Report/Layout.json`.
+- New pure module `pbix_tools.py` (stdlib `zipfile` only) and `tests/test_pbix_tools.py`
+  (thin/thick classification, UTF-16-LE layout decoding, extraction, and a Zip-Slip guard, all on
+  synthetic `.pbix` packages).
+
+---
+
 ## [3.3.0] - 2026-06-21 — Authoring helpers: SVG micro-visuals + naming audit
 
 Grew the server from **64 to 66 tools** with two pure-Python authoring helpers.
