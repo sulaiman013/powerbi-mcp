@@ -1,6 +1,6 @@
 # Tool Reference
 
-The Power BI MCP server exposes **62 tools**, plus MCP **resources**, **prompts**, and
+The Power BI MCP server exposes **64 tools**, plus MCP **resources**, **prompts**, and
 **completion**. Every tool carries MCP annotations (`readOnlyHint` / `destructiveHint` /
 `idempotentHint` / `openWorldHint`) so clients can auto-approve reads and confirm writes.
 
@@ -105,6 +105,17 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 | `audit_ai_readiness` | 🟢 | Copilot/agent-readiness score + recommendations |
 | `analyze_model_storage` | 🟢 | VertiPaq-style table ranking (rows + sizes) |
 | `analyze_query_performance` | 🟢 | Time a DAX query + optimization hints |
+
+## DAX quality — 2
+| Tool | | Description |
+|------|--|-------------|
+| `dax_lint` | 🟢 | Static DAX anti-pattern + correctness linter (raw expression, one measure, or whole model); severity + line + rewrite hint per finding |
+| `dax_suggest_rewrite` | 🟢 | Concrete before/after rewrite hints for the auto-fixable anti-patterns |
+
+> Rules: DL001 FILTER-whole-table in CALCULATE, DL002 nested CALCULATE, DL003 `/` instead of
+> DIVIDE, DL004 IFERROR, DL005 `+ 0` blank suppression, DL006 EARLIER, DL007 SUMMARIZE used for
+> aggregation, DL008 unrecognized/hallucinated function. Pure-Python tokenizer, no external tool.
+> Pair `dax_suggest_rewrite` with `validate_dax` to confirm a rewrite still parses.
 
 ## Documentation, diff & CI — 5
 | Tool | | Description |

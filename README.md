@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue?style=flat-square" alt="MCP compatible"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-green?style=flat-square" alt="Python 3.10+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-62-purple?style=flat-square" alt="62 tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-64-purple?style=flat-square" alt="64 tools"></a>
   <a href="#"><img src="https://img.shields.io/badge/Live-Windows-lightgrey?style=flat-square" alt="Windows for live connectivity"></a>
   <a href="#"><img src="https://img.shields.io/badge/Offline-cross--platform-success?style=flat-square" alt="Offline cross-platform"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT license"></a>
@@ -30,8 +30,8 @@ Power BI content through one consistent interface. It talks to a local Power BI 
 a published Power BI Service dataset, or Power BI Project (PBIP) files on disk, and wraps every
 operation in a security and governance layer.
 
-It exposes **62 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-14 assert-based test suites.
+It exposes **64 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
+15 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
@@ -91,6 +91,11 @@ limit which rows a user can see).
   > "On the PBIP project, add an 'Overview' page with a bar chart of Sales by Region." Best Practice Analyzer (performance, DAX,
   naming, formatting), an AI-readiness score, storage/size analysis, and query-performance hints.
   > "Audit this model and give me the top issues to fix before I ship."
+- **Lint your DAX for performance traps.** A static analyzer flags the classic anti-patterns
+  (FILTER over a whole table inside CALCULATE, nested CALCULATE, `/` instead of DIVIDE, IFERROR,
+  EARLIER, SUMMARIZE used for aggregation, blank-suppressing `+ 0`, and unrecognized or
+  hallucinated function names) and hands back a concrete rewrite for each.
+  > "Lint every measure in my model and suggest rewrites for the worst offenders."
 - **Clean up dead weight.** Find columns and measures that nothing uses (not in any formula
   and not in any visual) so you can remove clutter safely.
 - **Test security roles properly.** Run a measure under every RLS role and get a pass/fail
@@ -207,7 +212,7 @@ docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
 
 ## Tools
 
-62 tools across the categories below. The full reference, with parameters and read / write /
+64 tools across the categories below. The full reference, with parameters and read / write /
 destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Category | Count | Highlights |
@@ -223,6 +228,7 @@ destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | PBIP diagnostics | 4 | fix broken visuals, fix DAX quoting, scan broken refs, validate |
 | Report authoring (PBIR, preview) | 4 | `pbir_add_page`, `pbir_add_visual`, `pbir_bind_fields`, `pbir_validate_report` |
 | Model quality and performance | 4 | `run_bpa`, `audit_ai_readiness`, `analyze_model_storage`, `analyze_query_performance` |
+| DAX quality | 2 | `dax_lint` (performance anti-patterns), `dax_suggest_rewrite` |
 | Documentation, diff, CI | 5 | `export_data_dictionary`, `model_snapshot`, `model_diff`, `pre_deploy_gate`, `run_dax_tests` |
 | Diagnostics and ops | 4 | `refresh_doctor`, `find_unused_objects`, `impact_analysis`, `rls_test_harness` |
 | Governance-ops fleet (admin) | 3 | `cross_workspace_lineage`, `fleet_refresh_monitor`, `usage_and_orphan_analytics` |
@@ -298,7 +304,7 @@ tables:
 
 | Doc | Contents |
 |-----|----------|
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 62 tools, resources, prompts, env vars |
+| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 64 tools, resources, prompts, env vars |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, security layer, registry pattern, verification methodology, file map |
 | [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
 | [CHANGELOG.md](CHANGELOG.md) | Everything that changed, by milestone |
@@ -326,7 +332,7 @@ those paths needs a Windows + Power BI / Fabric environment.
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server: 62 tools + resources/prompts/completion
+│   ├── server.py                    # MCP server: 64 tools + resources/prompts/completion
 │   ├── powerbi_desktop_connector.py # Desktop (ADOMD) + RLS + VertiPaq DMVs
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
 │   ├── powerbi_rest_connector.py    # REST: discovery, refresh, admin Scanner/Activity
@@ -335,6 +341,7 @@ powerbi-mcp/
 │   ├── pbir_authoring.py            # PBIR emitters: pages, visuals, field projections
 │   ├── adomd_loader.py             # Shared ADOMD.NET discovery (Desktop + XMLA)
 │   ├── model_analysis.py            # BPA, AI-readiness, data dictionary, diff, DAX tests
+│   ├── dax_lint.py                  # DAX anti-pattern linter + rewrite hints (tokenizer)
 │   ├── refresh_diagnostics.py       # Refresh error classification
 │   ├── governance.py                # Scanner summary + activity aggregation
 │   └── security/                    # security_layer, access_policy, pii_detector, audit_logger
