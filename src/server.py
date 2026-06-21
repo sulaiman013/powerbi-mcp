@@ -93,6 +93,8 @@ import model_analysis
 import refresh_diagnostics
 import governance
 import dax_lint
+import svg_measures
+import naming_audit
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -307,6 +309,9 @@ class PowerBIMCPServer:
             # DAX quality (Wave 4: reach + quality)
             "dax_lint": lambda a: self._handle_dax_lint(a),
             "dax_suggest_rewrite": lambda a: self._handle_dax_suggest_rewrite(a),
+            # Authoring helpers (Wave 4)
+            "generate_svg_measure": lambda a: self._handle_generate_svg_measure(a),
+            "audit_naming": lambda a: self._handle_audit_naming(a),
         }
 
     def _build_tool_annotations(self):
@@ -403,6 +408,9 @@ class PowerBIMCPServer:
             # DAX quality (Wave 4) - read-only static analysis
             "dax_lint": local_read,
             "dax_suggest_rewrite": local_read,
+            # Authoring helpers (Wave 4) - generate DAX / analyze names, no live mutation
+            "generate_svg_measure": ann(True, open_world=False),
+            "audit_naming": local_read,
         }
 
     def _setup_handlers(self):
@@ -1236,6 +1244,65 @@ class PowerBIMCPServer:
                         "type": "object",
                         "properties": {
                             "rewrites": {"type": "array"}
+                        }
+                    }
+                ),
+                # === AUTHORING HELPERS (Wave 4) ===
+                Tool(
+                    name="generate_svg_measure",
+                    description="Generate a ready-to-use DAX measure that returns an inline SVG micro-visual (progress bar, bullet chart, status pill, or sparkline) as a data:image/svg+xml URI. Set the measure's data category to 'Image URL' so Power BI renders it in a table/matrix column or card. Pure DAX, no custom visual.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["progress", "bullet", "status_pill", "sparkline"]},
+                            "name": {"type": "string", "description": "Optional name for the generated measure"},
+                            "value_measure": {"type": "string", "description": "The measure to visualize (progress/bullet/status_pill/sparkline)"},
+                            "target_measure": {"type": "string", "description": "Target measure (bullet)"},
+                            "max_value": {"type": "number", "description": "Scale maximum (progress/bullet)"},
+                            "min_value": {"type": "number", "description": "Scale minimum (progress)"},
+                            "axis_column": {"type": "string", "description": "Axis column to plot across, e.g. 'Date'[Month] (sparkline)"},
+                            "sort_column": {"type": "string", "description": "Column to order the sparkline x-axis by (defaults to axis_column)"},
+                            "thresholds": {"type": "array", "description": "status_pill bands: [{max, color, label}], last band uses max=null", "items": {"type": "object"}},
+                            "width": {"type": "integer"},
+                            "height": {"type": "integer"},
+                            "fill": {"type": "string"},
+                            "track": {"type": "string"},
+                            "target": {"type": "string"},
+                            "stroke": {"type": "string"}
+                        },
+                        "required": ["kind"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "dax": {"type": "string"},
+                            "notes": {"type": "string"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="audit_naming",
+                    description="Audit naming conventions across the connected model's tables, columns, and measures and return a rename PLAN (old -> new with reasons): snake_case/camelCase to spaced Title Case, strip warehouse DIM_/FACT_ prefixes, trim whitespace, optionally expand abbreviations. Apply the plan with the rename tools (batch_rename_* live, or pbip_rename_* for model + report).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "scope": {"type": "array", "items": {"type": "string", "enum": ["tables", "columns", "measures"]}, "description": "Which object types to audit (default all)"},
+                            "target_case": {"type": "string", "enum": ["title", "none"], "default": "title"},
+                            "strip_warehouse_prefixes": {"type": "boolean", "default": True},
+                            "expand_abbreviations": {"type": "boolean", "default": False},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "summary": {"type": "object"},
+                            "plan": {"type": "array"}
                         }
                     }
                 ),
@@ -3180,6 +3247,60 @@ class PowerBIMCPServer:
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (f"Error suggesting rewrites: {msg}", {"error": msg, "rewrites": []})
+
+    _SVG_PARAMS = {
+        "progress": ["value_measure", "max_value", "min_value", "fill", "track", "width", "height"],
+        "bullet": ["value_measure", "target_measure", "max_value", "fill", "target", "track", "width", "height"],
+        "status_pill": ["value_measure", "thresholds", "width", "height"],
+        "sparkline": ["axis_column", "value_measure", "sort_column", "stroke", "width", "height"],
+    }
+
+    async def _handle_generate_svg_measure(self, args: Dict[str, Any]):
+        """Generate an SVG micro-visual DAX measure. Returns (text, result)."""
+        try:
+            kind = (args.get("kind") or "").lower()
+            kind = "status_pill" if kind in ("status", "pill") else kind
+            allowed = self._SVG_PARAMS.get(kind)
+            if not allowed:
+                return (f"Error: unknown kind '{args.get('kind')}'. Use progress|bullet|status_pill|sparkline.",
+                        {"error": "unknown_kind"})
+            kwargs = {k: args[k] for k in allowed if args.get(k) is not None}
+            result = svg_measures.generate(kind, name=args.get("name"), **kwargs)
+            out = f"=== SVG measure: {result['name']} ({result['kind']}) ===\n\n{result['dax']}\n\n{result['notes']}\n"
+            return (out, result)
+        except TypeError as e:
+            return (f"Error: missing/invalid parameter for this kind: {e}", {"error": str(e)})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error generating SVG measure: {msg}", {"error": msg})
+
+    async def _handle_audit_naming(self, args: Dict[str, Any]):
+        """Audit naming conventions and return a rename plan. Returns (text, result)."""
+        try:
+            model, err = await self._gather_model_metadata(
+                args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name"))
+            if err:
+                return (f"Error: {err}", {"error": err, "summary": {"total_suggestions": 0}, "plan": []})
+            options = {k: args[k] for k in ("scope", "target_case", "strip_warehouse_prefixes", "expand_abbreviations")
+                       if k in args and args[k] is not None}
+            result = naming_audit.audit(model, options)
+            s = result["summary"]
+            out = "=== Naming Audit ===\n\n"
+            out += f"Suggestions: {s['total_suggestions']}"
+            if s.get("by_type"):
+                out += "  (" + ", ".join(f"{k}: {v}" for k, v in s["by_type"].items()) + ")"
+            out += f"\nDominant style: {s.get('dominant_style')}  (consistent: {s.get('consistent')})\n\n"
+            for p in result["plan"][:200]:
+                loc = f"{p['table']}[{p['old']}]" if p.get("table") else p["old"]
+                out += f"  {p['object_type']}: {loc}  ->  '{p['new']}'  ({', '.join(p['reasons'])})\n"
+            if not result["plan"]:
+                out += "No naming issues found.\n"
+            else:
+                out += "\nApply with the rename tools (pbip_rename_* updates model + report; batch_rename_* is live).\n"
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error auditing naming: {msg}", {"error": msg, "summary": {"total_suggestions": 0}, "plan": []})
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus
