@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue?style=flat-square" alt="MCP compatible"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-green?style=flat-square" alt="Python 3.10+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-68-purple?style=flat-square" alt="68 tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-70-purple?style=flat-square" alt="70 tools"></a>
   <a href="#"><img src="https://img.shields.io/badge/Live-Windows-lightgrey?style=flat-square" alt="Windows for live connectivity"></a>
   <a href="#"><img src="https://img.shields.io/badge/Offline-cross--platform-success?style=flat-square" alt="Offline cross-platform"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT license"></a>
@@ -30,8 +30,8 @@ Power BI content through one consistent interface. It talks to a local Power BI 
 a published Power BI Service dataset, or Power BI Project (PBIP) files on disk, and wraps every
 operation in a security and governance layer.
 
-It exposes **68 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-18 assert-based test suites.
+It exposes **70 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
+19 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
@@ -107,6 +107,10 @@ limit which rows a user can see).
   imported model or a live connection, which report format it uses, and how many pages, then
   extract it and get the report layout decoded to readable JSON.
   > "Inspect this .pbix and tell me if it has an imported model and how many pages."
+- **Author and govern your own quality rules.** Validate a custom Best Practice Analyzer rule
+  set (catch bad scopes, duplicate IDs, risky auto-deletes) and audit where rules actually live:
+  embedded in the model, ignored, or pulled from external files.
+  > "Validate our BPARules.json and tell me which rules this model is silently ignoring."
 - **Clean up dead weight.** Find columns and measures that nothing uses (not in any formula
   and not in any visual) so you can remove clutter safely.
 - **Test security roles properly.** Run a measure under every RLS role and get a pass/fail
@@ -223,7 +227,7 @@ docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
 
 ## Tools
 
-68 tools across the categories below. The full reference, with parameters and read / write /
+70 tools across the categories below. The full reference, with parameters and read / write /
 destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Category | Count | Highlights |
@@ -242,6 +246,7 @@ destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | DAX quality | 2 | `dax_lint` (performance anti-patterns), `dax_suggest_rewrite` |
 | Authoring helpers | 2 | `generate_svg_measure` (sparkline/bullet/progress/pill), `audit_naming` |
 | PBIX onboarding | 2 | `pbix_inspect`, `pbix_extract` (crack open a real `.pbix`) |
+| Custom BPA governance | 2 | `bpa_validate_rules`, `bpa_audit_rule_sources` |
 | Documentation, diff, CI | 5 | `export_data_dictionary`, `model_snapshot`, `model_diff`, `pre_deploy_gate`, `run_dax_tests` |
 | Diagnostics and ops | 4 | `refresh_doctor`, `find_unused_objects`, `impact_analysis`, `rls_test_harness` |
 | Governance-ops fleet (admin) | 3 | `cross_workspace_lineage`, `fleet_refresh_monitor`, `usage_and_orphan_analytics` |
@@ -317,7 +322,7 @@ tables:
 
 | Doc | Contents |
 |-----|----------|
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 68 tools, resources, prompts, env vars |
+| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 70 tools, resources, prompts, env vars |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, security layer, registry pattern, verification methodology, file map |
 | [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
 | [CHANGELOG.md](CHANGELOG.md) | Everything that changed, by milestone |
@@ -345,7 +350,7 @@ those paths needs a Windows + Power BI / Fabric environment.
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server: 68 tools + resources/prompts/completion
+│   ├── server.py                    # MCP server: 70 tools + resources/prompts/completion
 │   ├── powerbi_desktop_connector.py # Desktop (ADOMD) + RLS + VertiPaq DMVs
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
 │   ├── powerbi_rest_connector.py    # REST: discovery, refresh, admin Scanner/Activity
@@ -358,6 +363,7 @@ powerbi-mcp/
 │   ├── svg_measures.py             # SVG micro-visual DAX measure generators
 │   ├── naming_audit.py             # Naming-convention audit -> rename plan
 │   ├── pbix_tools.py               # PBIX (.pbix ZIP) inspect/extract + layout decode
+│   ├── bpa_authoring.py            # Custom BPA rule validation + rule-source audit
 │   ├── refresh_diagnostics.py       # Refresh error classification
 │   ├── governance.py                # Scanner summary + activity aggregation
 │   └── security/                    # security_layer, access_policy, pii_detector, audit_logger

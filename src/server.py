@@ -96,6 +96,7 @@ import dax_lint
 import svg_measures
 import naming_audit
 import pbix_tools
+import bpa_authoring
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -316,6 +317,9 @@ class PowerBIMCPServer:
             # PBIX onboarding (Wave 4)
             "pbix_inspect": lambda a: self._handle_pbix_inspect(a),
             "pbix_extract": lambda a: self._handle_pbix_extract(a),
+            # Custom BPA governance (Wave 4)
+            "bpa_validate_rules": lambda a: self._handle_bpa_validate_rules(a),
+            "bpa_audit_rule_sources": lambda a: self._handle_bpa_audit_rule_sources(a),
         }
 
     def _build_tool_annotations(self):
@@ -418,6 +422,9 @@ class PowerBIMCPServer:
             # PBIX onboarding (Wave 4) - read a file / write extracted files
             "pbix_inspect": ann(True, open_world=False),
             "pbix_extract": ann(False, destructive=False, idempotent=True, open_world=False),
+            # Custom BPA governance (Wave 4) - read-only validation/discovery
+            "bpa_validate_rules": local_read,
+            "bpa_audit_rule_sources": local_read,
         }
 
     def _setup_handlers(self):
@@ -1353,6 +1360,48 @@ class PowerBIMCPServer:
                             "file_count": {"type": "integer"},
                             "layout_decoded": {"type": "boolean"},
                             "files": {"type": "array"}
+                        }
+                    }
+                ),
+                # === CUSTOM BPA GOVERNANCE (Wave 4) ===
+                Tool(
+                    name="bpa_validate_rules",
+                    description="Validate a custom Best Practice Analyzer rules JSON (the public BPA rule shape): required fields (ID/Name/Category/Severity/Scope/Expression), valid Severity (1/2/3) and Scope values, duplicate IDs, destructive Delete() fixes on low-severity rules, and stray runtime-only fields. With fix=true also returns a cleaned copy. Pure validation, no external tool.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "rules": {"description": "The rules as a JSON string, array, or {Rules:[...]} object"},
+                            "rules_path": {"type": "string", "description": "Path to a BPARules.json file (alternative to 'rules')"},
+                            "fix": {"type": "boolean", "default": False, "description": "Also return a cleaned copy (runtime fields stripped, null FixExpression dropped)"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "valid": {"type": "boolean"},
+                            "rule_count": {"type": "integer"},
+                            "errors": {"type": "array"},
+                            "warnings": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="bpa_audit_rule_sources",
+                    description="Audit where BPA rules live for the loaded PBIP project: rules embedded in the model (BestPracticeAnalyzer annotation), external rule-file URLs, and ignored rule IDs, merged with any local user/machine BPARules.json found. Reveals shadow governance and ignored rules.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "model_text": {"type": "string", "description": "Optional raw model TMDL/BIM text to scan instead of the loaded project"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "embedded_rule_count": {"type": "integer"},
+                            "external_rule_files": {"type": "array"},
+                            "ignored_rule_ids": {"type": "array"}
                         }
                     }
                 ),
@@ -3387,6 +3436,83 @@ class PowerBIMCPServer:
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (f"Error extracting PBIX: {msg}", {"error": msg})
+
+    async def _handle_bpa_validate_rules(self, args: Dict[str, Any]):
+        """Validate a custom BPA rules JSON. Returns (text, result)."""
+        try:
+            rules = args.get("rules")
+            path = args.get("rules_path")
+            if rules is None and path:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    rules = f.read()
+            if rules is None:
+                return ("Error: provide 'rules' (JSON) or 'rules_path'.", {"error": "rules_required"})
+            result = bpa_authoring.validate_rules(rules, fix=bool(args.get("fix")))
+            out = "=== BPA Rules Validation ===\n\n"
+            out += f"Rules: {result['rule_count']}  |  Valid: {result['valid']}  |  "
+            out += f"Errors: {len(result['errors'])}  Warnings: {len(result['warnings'])}\n\n"
+            for e in result["errors"][:100]:
+                out += f"  [ERROR] {e.get('rule_id') or '(rule #' + str(e.get('index')) + ')'}: {e['message']}\n"
+            for w in result["warnings"][:100]:
+                out += f"  [WARN]  {w.get('rule_id') or '(rule #' + str(w.get('index')) + ')'}: {w['message']}\n"
+            if result["valid"] and not result["warnings"]:
+                out += "All rules conform.\n"
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error validating BPA rules: {msg}", {"error": msg, "valid": False})
+
+    @staticmethod
+    def _bpa_local_rule_paths() -> Dict[str, str]:
+        paths: Dict[str, str] = {}
+        la = os.environ.get("LOCALAPPDATA")
+        pd = os.environ.get("PROGRAMDATA")
+        if la:
+            paths["user (TE2)"] = os.path.join(la, "TabularEditor", "BPARules.json")
+            paths["user (TE3)"] = os.path.join(la, "TabularEditor3", "BPARules.json")
+        if pd:
+            paths["machine"] = os.path.join(pd, "TabularEditor", "BPARules.json")
+        return paths
+
+    async def _handle_bpa_audit_rule_sources(self, args: Dict[str, Any]):
+        """Audit where BPA rules live for the loaded project. Returns (text, result)."""
+        try:
+            model_text = args.get("model_text")
+            if not model_text:
+                connector = self._get_pbip_connector()
+                if not connector.current_project:
+                    return ("No PBIP project loaded and no 'model_text' provided. Load a project first.",
+                            {"error": "no_project"})
+                parts = []
+                for f in connector.current_project.tmdl_files:
+                    try:
+                        parts.append(connector._read_text(f))
+                    except Exception:
+                        continue
+                model_text = "\n".join(parts)
+            local: Dict[str, str] = {}
+            for label, p in self._bpa_local_rule_paths().items():
+                try:
+                    with open(p, "r", encoding="utf-8-sig") as fh:
+                        local[label] = fh.read()
+                except Exception:
+                    continue
+            result = bpa_authoring.audit_rule_sources(model_text, local_rule_files=local or None)
+            out = "=== BPA Rule Sources ===\n\n"
+            out += f"Embedded in model: {result['embedded_rule_count']} rule(s)\n"
+            out += f"External rule files: {len(result['external_rule_files'])}\n"
+            for u in result["external_rule_files"][:20]:
+                out += f"  - {u}\n"
+            out += f"Ignored rule IDs: {len(result['ignored_rule_ids'])}"
+            if result["ignored_rule_ids"]:
+                out += " (" + ", ".join(result["ignored_rule_ids"][:20]) + ")"
+            out += "\n"
+            for lf in result.get("local_rule_files", []):
+                out += f"  local {lf.get('source')}: {lf.get('rule_count', lf.get('error'))}\n"
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error auditing BPA rule sources: {msg}", {"error": msg})
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus
