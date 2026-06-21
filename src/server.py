@@ -279,6 +279,7 @@ class PowerBIMCPServer:
             "refresh_doctor": lambda a: self._handle_refresh_doctor(a),
             "find_unused_objects": lambda a: self._handle_find_unused_objects(a),
             "impact_analysis": lambda a: self._handle_impact_analysis(a),
+            "rls_test_harness": lambda a: self._handle_rls_test_harness(a),
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
@@ -360,6 +361,7 @@ class PowerBIMCPServer:
             "refresh_doctor": cloud_read,
             "find_unused_objects": local_read,
             "impact_analysis": local_read,
+            "rls_test_harness": local_read,
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
@@ -1222,6 +1224,20 @@ class PowerBIMCPServer:
                             "dataset_name": {"type": "string"}
                         },
                         "required": ["object_name"]
+                    }
+                ),
+                Tool(
+                    name="rls_test_harness",
+                    description="Evaluate a measure or table row count under EVERY RLS role and return a pass/fail matrix vs the unrestricted baseline, flagging roles that see everything (no filtering) or nothing. Tests row-level security systematically on the connected Desktop model. Always restores the cleared role afterward.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "table_name": {"type": "string", "description": "Table to COUNTROWS under each role"},
+                            "measure_name": {"type": "string", "description": "Measure to evaluate under each role"},
+                            "dax": {"type": "string", "description": "Custom EVALUATE query to run under each role (overrides table/measure)"},
+                            "roles": {"type": "array", "items": {"type": "string"}, "description": "Specific roles to test (default: all roles)"}
+                        },
+                        "required": []
                     }
                 )
             ]
@@ -3258,6 +3274,64 @@ class PowerBIMCPServer:
             return out
         except Exception as e:
             return f"Error in impact analysis: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_rls_test_harness(self, args: Dict[str, Any]) -> str:
+        """Evaluate a measure/table under every RLS role and return a pass/fail matrix."""
+        connector = self._get_desktop_connector()
+        if not connector.current_port:
+            return "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+        loop = asyncio.get_event_loop()
+
+        dax = args.get("dax")
+        table = args.get("table_name")
+        measure = args.get("measure_name")
+        if not dax:
+            if table:
+                dax = f"EVALUATE ROW(\"rows\", COUNTROWS('{table}'))"
+            elif measure:
+                dax = f"EVALUATE ROW(\"value\", [{measure}])"
+            else:
+                return "Error: provide one of dax, table_name, or measure_name"
+
+        all_roles = await loop.run_in_executor(None, connector.list_rls_roles)
+        role_names = args.get("roles") or [r.get("name") for r in all_roles if r.get("name")]
+        if not role_names:
+            return "No RLS roles found in the model (nothing to test)."
+
+        def metric(rows):
+            if not rows:
+                return None
+            return next(iter(rows[0].values()), None)
+
+        try:
+            await loop.run_in_executor(None, connector.set_rls_role, None)
+            baseline = metric(await loop.run_in_executor(None, connector.execute_dax, dax, 10))
+            results = []
+            for role in role_names:
+                ok = await loop.run_in_executor(None, connector.set_rls_role, role)
+                if not ok:
+                    results.append((role, None, "ERROR activating role"))
+                    continue
+                val = metric(await loop.run_in_executor(None, connector.execute_dax, dax, 10))
+                if val is None or val == 0:
+                    note = "sees NOTHING (verify the role filter)"
+                elif baseline is not None and val == baseline:
+                    note = "sees EVERYTHING (no row reduction - verify intended)"
+                else:
+                    note = "filtered"
+                results.append((role, val, note))
+        finally:
+            await loop.run_in_executor(None, connector.set_rls_role, None)  # always restore
+
+        out = "=== RLS Test Matrix ===\n"
+        out += f"Query: {dax}\nUnrestricted baseline: {baseline}\n\n"
+        out += f"{'Role':<32} {'Result':>14}  Note\n"
+        out += "-" * 70 + "\n"
+        for role, val, note in results:
+            out += f"{str(role)[:31]:<32} {str(val):>14}  {note}\n"
+        out += ("\nNote: tests row-level (RLS) filters via role simulation. Object-level security "
+                "(OLS) visibility is not covered here; check object access separately.")
+        return out
 
     # ==================== MCP RESOURCES & COMPLETION (Bundle C) ====================
 
