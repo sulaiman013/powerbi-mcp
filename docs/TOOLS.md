@@ -1,6 +1,6 @@
 # Tool Reference
 
-The Power BI MCP server exposes **58 tools**, plus MCP **resources**, **prompts**, and
+The Power BI MCP server exposes **62 tools**, plus MCP **resources**, **prompts**, and
 **completion**. Every tool carries MCP annotations (`readOnlyHint` / `destructiveHint` /
 `idempotentHint` / `openWorldHint`) so clients can auto-approve reads and confirm writes.
 
@@ -83,6 +83,20 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 | `pbip_fix_dax_quoting` | 🔴 | Quote unquoted table names in DAX |
 | `pbip_scan_broken_refs` | 🟢 | Compare model vs report references |
 | `pbip_validate` | 🟢 | Validate TMDL syntax / quoting |
+
+## Report authoring (PBIR, preview) — 4
+| Tool | | Description |
+|------|--|-------------|
+| `pbir_add_page` | 🔴 | Add a report page to a PBIR-Enhanced project; register it in `pages.json` |
+| `pbir_add_visual` | 🔴 | Add a visual (chart/card/table/slicer) and bind fields by role; validates fields exist |
+| `pbir_bind_fields` | 🔴 | Add/replace field projections on an existing visual (`add` or `replace`) |
+| `pbir_validate_report` | 🟢 | Report-wide check that every visual binding points at a real model field |
+
+> Emits Power-BI-faithful PBIR (each projection carries `nativeQueryRef`; a plain column on a
+> value well is wrapped in an `Aggregation` with the matching `Sum(...)`/`CountNonNull(...)`
+> `queryRef`, while explicit measures stay bare). `$schema` is inherited from a sibling file in
+> the project when present, else falls back to the current published version. Requires a loaded
+> PBIR-Enhanced PBIP project; writes are atomic and field existence is checked first.
 
 ## Model quality & performance — 4
 | Tool | | Description |

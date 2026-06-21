@@ -3,6 +3,40 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.1.0] - 2026-06-21 — PBIR report authoring (preview)
+
+Grew the server from **58 to 62 tools** by adding offline **report authoring** on PBIR-Enhanced
+PBIP projects, so an agent can build report pages and visuals, not just the semantic model.
+The emitted PBIR is verified against Microsoft's published JSON schemas
+(`github.com/microsoft/json-schemas`) and matches how Power BI Desktop itself writes files.
+
+### Added — report authoring
+- **`pbir_add_page`** — add a report page and register it in `pages.json` (active-page aware).
+- **`pbir_add_visual`** — add a visual (bar/column/line/pie/card/table/slicer/gauge/KPI...) and
+  bind fields by role in one call; field existence is validated against the model first.
+- **`pbir_bind_fields`** — add or replace field projections on an existing visual.
+- **`pbir_validate_report`** — report-wide check that every visual binding points at a real
+  model field (the #1 cause of blank visuals after external edits).
+- New pure module **`pbir_authoring.py`**: PBIR emitters (pages, visuals, field projections)
+  that are the verified inverse of the report-reference parser.
+
+### Desktop-fidelity (matches Power BI's own output, verified against published schemas)
+- Every projection now carries **`nativeQueryRef`** (the bare field name), as Power BI writes it,
+  keeping source-control diffs stable instead of letting Desktop rewrite the file on first save.
+- A plain **column dropped on a value well** (Y / Values / ...) is wrapped in an **`Aggregation`**
+  node with the matching **`Sum(...)` / `CountNonNull(...)` `queryRef`** (Sum for numeric columns,
+  CountNonNull for text), while explicit **measures stay bare** — chosen automatically from the
+  model field catalog (now data-type aware).
+- `$schema` is **inherited from a sibling file** in the same project when present; the fallback
+  defaults were refreshed to the current published versions (visualContainer 2.9.0, page 2.1.0).
+
+### Fixed
+- Report-reference scanning no longer mis-parses an aggregation-form `queryRef` such as
+  `Sum(Sales.Amount)` into a phantom `("Sum(Sales", "Amount)")` reference (which would have made
+  `pbir_validate_report` / `validate_report_bindings` report false missing tables).
+
+---
+
 ## [3.0.1] - 2026-06-21 — ADOMD.NET discovery fix (issue #12)
 
 ### Fixed
