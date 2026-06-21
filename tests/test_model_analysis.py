@@ -6,7 +6,7 @@ Run: python test_model_analysis.py
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from model_analysis import run_bpa, audit_ai_readiness, render_data_dictionary, diff_models  # noqa: E402
 
 _failures = []

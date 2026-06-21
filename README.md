@@ -221,6 +221,9 @@ We built a dedicated **PBIP Connector** that:
 
 ## Available Tools
 
+> The sections below summarize the surface. For the **complete, categorized reference of all
+> 58 tools** (plus resources, prompts, and environment variables), see **[docs/TOOLS.md](docs/TOOLS.md)**.
+
 ### Desktop Operations (7 tools)
 | Tool | Description |
 |------|-------------|
@@ -534,27 +537,37 @@ User: "Clear RLS role"
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server (58 tools + resources/prompts/completion)
-│   ├── powerbi_desktop_connector.py # Desktop + RLS
+│   ├── server.py                    # MCP server: 58 tools + resources/prompts/completion
+│   ├── powerbi_desktop_connector.py # Desktop (ADOMD) + RLS + VertiPaq DMVs
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
-│   ├── powerbi_rest_connector.py    # REST API
-│   ├── powerbi_tom_connector.py     # TOM write operations + relationships
-│   ├── powerbi_pbip_connector.py    # PBIP file editing (transactional)
-│   ├── model_analysis.py            # BPA + AI-readiness engine (pure Python)
-│   └── security/
-│       ├── pii_detector.py          # PII detection
-│       ├── audit_logger.py          # Audit logging
-│       ├── access_policy.py         # Policy engine (enforced)
-│       └── security_layer.py        # Unified security
-├── config/
-│   └── policies.yaml                # Access policies
-├── test_*.py                        # Assert-based tests (run without Power BI)
-├── AGENTS.md / CLAUDE.md            # Agent guidance
+│   ├── powerbi_rest_connector.py    # REST: discovery, refresh, admin Scanner/Activity
+│   ├── powerbi_tom_connector.py     # TOM writes: measures, relationships, transactions
+│   ├── powerbi_pbip_connector.py    # PBIP/TMDL/PBIR offline editing (transactional)
+│   ├── model_analysis.py            # BPA, AI-readiness, data dictionary, diff, DAX tests
+│   ├── refresh_diagnostics.py       # Refresh error classification
+│   ├── governance.py                # Scanner summary + activity aggregation
+│   └── security/                    # security_layer, access_policy, pii_detector, audit_logger
+├── config/policies.yaml             # Access policy definitions
+├── tests/                           # Assert-based suites (run without Power BI)
+├── docs/                            # TOOLS.md, ARCHITECTURE.md, TESTING.md
+├── run_tests.py                     # Run all test suites
+├── AGENTS.md / CLAUDE.md            # Agent playbook
 ├── Dockerfile / requirements-core.txt  # Cross-platform offline image
-├── .env.example
+├── pyproject.toml / .editorconfig   # Formatting conventions
+├── CHANGELOG.md
 ├── requirements.txt
 └── README.md
 ```
+
+## Documentation
+
+| Doc | What's in it |
+|-----|--------------|
+| [docs/TOOLS.md](docs/TOOLS.md) | Full reference of all 58 tools (by category), resources, prompts, env vars |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, security layer, registry pattern, verification methodology, file map |
+| [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
+| [CHANGELOG.md](CHANGELOG.md) | Everything that changed, by milestone |
+| [AGENTS.md](AGENTS.md) | Agent playbook (golden rules, workflows, DAX patterns) |
 
 ---
 

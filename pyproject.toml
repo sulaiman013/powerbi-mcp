@@ -1,0 +1,20 @@
+# Tooling configuration for the Power BI MCP server.
+# The project is run as a script server (python src/server.py), not installed as a package,
+# so this file only configures formatting/linting conventions.
+
+[tool.black]
+line-length = 110
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 110
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+# F811 (redefinition) is important here: it would have caught the duplicate-method bug.
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # long lines are allowed; black handles wrapping where it can
