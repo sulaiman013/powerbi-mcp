@@ -143,8 +143,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it fits together.
 ### Prerequisites
 
 **Live connectivity (Power BI Desktop / Service):** Windows 10/11, Power BI Desktop, Python 3.10+,
-and ADOMD.NET (ships with Power BI Desktop or SSMS). Cloud also needs an Azure AD service
-principal and, for some operations, a Premium / PPU / Fabric capacity.
+and the ADOMD.NET client library. Newer Power BI Desktop builds no longer ship ADOMD.NET, so
+install SQL Server Management Studio (SSMS) or the `Microsoft.AnalysisServices.AdomdClient`
+NuGet package, or point `ADOMD_DLL_PATH` at the folder containing
+`Microsoft.AnalysisServices.AdomdClient.dll`. The server searches Power BI Desktop, SSMS, the
+SQL Server SDK, and NuGet automatically. Cloud also needs an Azure AD service principal and,
+for some operations, a Premium / PPU / Fabric capacity.
 
 **Offline subset only (PBIP editing, BPA, analysis, security):** any OS, Python 3.10+, no .NET.
 
@@ -277,6 +281,7 @@ tables:
 | Variable | Purpose |
 |----------|---------|
 | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` | Azure AD service principal (cloud, REST, admin) |
+| `ADOMD_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.AdomdClient.dll`, if auto-discovery misses it |
 | `POWERBI_MCP_READONLY` | `true` refuses all write tools (lockdown mode) |
 | `ENABLE_PII_DETECTION`, `ENABLE_AUDIT`, `ENABLE_POLICIES` | Toggle security subsystems (default true) |
 | `LOG_LEVEL` | `DEBUG` enables redacted argument logging |

@@ -3,6 +3,24 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.0.1] - 2026-06-21 — ADOMD.NET discovery fix (issue #12)
+
+### Fixed
+- **ADOMD.NET not found on newer Power BI Desktop installs.** Recent Power BI Desktop (MSI)
+  builds no longer ship `Microsoft.AnalysisServices.AdomdClient.dll`, so Desktop/XMLA
+  connectivity failed even with Power BI Desktop installed. Discovery now also searches
+  **SSMS** (any version, x64 and x86), the **SQL Server SDK** and **Update Cache** (any
+  version, not hard-coded numbers), and **ADOMD.NET NuGet** packages, and honors an explicit
+  **`ADOMD_DLL_PATH`** environment variable (folder or full DLL path).
+
+### Changed
+- The Desktop and XMLA connectors now share one `adomd_loader.py` (removing the previous two
+  divergent discovery copies).
+- Clearer "ADOMD.NET not found" guidance in logs and the `desktop_discover_instances` error,
+  and corrected the README prerequisite note (ADOMD.NET no longer ships with Power BI Desktop).
+
+---
+
 ## [3.0.0] - 2026-06-21 — Agentic, Productivity & Governance overhaul
 
 Grew the server from **34 to 58 tools** and made it a first-class MCP citizen, while
