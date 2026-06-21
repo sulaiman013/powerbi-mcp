@@ -4,6 +4,7 @@ Enforces data access rules on queries and results
 """
 import hashlib
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -59,6 +60,7 @@ class PolicyAction(Enum):
     AGGREGATE_ONLY = "aggregate_only"  # Only allow in aggregations
     HASH = "hash"           # Return hashed value
     REDACT = "redact"       # Replace with [REDACTED]
+    NUMERIC_MASK = "numeric_mask"  # Scale numbers by a per-session coefficient (hide values, keep stats)
 
 
 class PolicyLevel(Enum):
@@ -192,6 +194,9 @@ class AccessPolicyEngine:
         self.global_policy = GlobalPolicy()
         self.table_policies: Dict[str, TablePolicy] = {}
         self._compiled_blocked_patterns: List[re.Pattern] = []
+        # Per-session coefficient for NUMERIC_MASK: scales numbers so absolute values are
+        # hidden but relative magnitudes/ratios (statistical structure) are preserved.
+        self.numeric_coefficient = round(random.uniform(0.5, 1.5), 4)
 
         if config_path:
             self.load_from_file(config_path)
@@ -320,6 +325,7 @@ class AccessPolicyEngine:
         PolicyAction.ALLOW: 0,
         PolicyAction.AGGREGATE_ONLY: 1,
         PolicyAction.MASK: 1,
+        PolicyAction.NUMERIC_MASK: 1,
         PolicyAction.REDACT: 2,
         PolicyAction.HASH: 2,
         PolicyAction.BLOCK: 3,
@@ -501,6 +507,14 @@ class AccessPolicyEngine:
 
                 elif col_policy.action == PolicyAction.MASK:
                     processed_row[col_name] = mask_value(value)
+                    masked_columns.add(col_name)
+
+                elif col_policy.action == PolicyAction.NUMERIC_MASK:
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        processed_row[col_name] = value  # only numbers are scaled
+                    else:
+                        scaled = value * self.numeric_coefficient
+                        processed_row[col_name] = int(round(scaled)) if isinstance(value, int) else round(scaled, 4)
                     masked_columns.add(col_name)
 
                 else:

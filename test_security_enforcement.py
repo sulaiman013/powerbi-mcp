@@ -99,6 +99,22 @@ def test_hash_and_redact_actions():
     check("id untouched", out["Users[Id]"] == 7, repr(out["Users[Id]"]))
 
 
+def test_numeric_mask():
+    print("\n== NUMERIC_MASK (session-randomized, stats-preserving) ==")
+    engine = AccessPolicyEngine()
+    wildcard = TablePolicy(name="*")
+    wildcard.columns["revenue"] = ColumnPolicy(name="revenue", action=PolicyAction.NUMERIC_MASK)
+    engine.table_policies["*"] = wildcard
+    engine.numeric_coefficient = 2.0  # deterministic for the test
+
+    rows = [{"Sales[Revenue]": 100, "Sales[City]": "Austin"},
+            {"Sales[Revenue]": 50, "Sales[City]": "Dallas"}]
+    out = engine.apply_to_results(rows)[0]
+    check("revenue scaled by coefficient", out[0]["Sales[Revenue]"] == 200, repr(out[0]["Sales[Revenue]"]))
+    check("ratios preserved (100:50 -> 200:100)", out[1]["Sales[Revenue]"] == 100, repr(out[1]["Sales[Revenue]"]))
+    check("non-numeric untouched", out[0]["Sales[City]"] == "Austin")
+
+
 def test_pre_query_check_blocks():
     print("\n== check_query blocks queries referencing blocked columns ==")
     engine = AccessPolicyEngine(config_path=CONFIG)
@@ -130,6 +146,7 @@ if __name__ == "__main__":
     test_extract_references()
     test_apply_to_results_shipped_config()
     test_hash_and_redact_actions()
+    test_numeric_mask()
     test_pre_query_check_blocks()
     test_security_layer_end_to_end()
 
