@@ -123,10 +123,18 @@ def audit_rule_sources(model_text: Optional[str] = None,
     text = model_text or ""
 
     def _extract_annotation(name: str) -> Optional[str]:
-        # TMDL: annotation NAME = VALUE   (VALUE may be a quoted/brace/bracket blob on the line)
-        m = re.search(rf"annotation\s+{re.escape(name)}\s*=\s*(.+)", text)
+        # TMDL: annotation NAME = VALUE. VALUE is often a multi-line JSON blob, so decode the
+        # whole balanced JSON value rather than just the first line.
+        m = re.search(rf"annotation\s+{re.escape(name)}\s*=\s*", text)
         if m:
-            return m.group(1).strip()
+            rest = text[m.end():].lstrip()
+            if rest[:1] in "[{":
+                try:
+                    val, _ = json.JSONDecoder().raw_decode(rest)
+                    return json.dumps(val)
+                except Exception:
+                    pass
+            return rest.splitlines()[0].strip() if rest else None
         # BIM JSON: {"name": "NAME", "value": "..."}
         m = re.search(rf'"name"\s*:\s*"{re.escape(name)}"\s*,\s*"value"\s*:\s*("(?:[^"\\]|\\.)*")', text)
         if m:

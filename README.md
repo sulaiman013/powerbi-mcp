@@ -31,7 +31,7 @@ a published Power BI Service dataset, or Power BI Project (PBIP) files on disk, 
 operation in a security and governance layer.
 
 It exposes **70 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-19 assert-based test suites.
+20 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
@@ -291,9 +291,14 @@ The rename cascade is transactional (it rolls every file back on failure) and wr
 - **Enforced column and table policies** from `config/policies.yaml`: `block`, `mask`, `hash`,
   `redact`, and `numeric_mask` (session-randomized scaling that hides values but preserves ratios).
 - **Audit logging** with a tamper-evident hash chain; verify it with `verify_audit_integrity`.
-- **Read-only / lockdown mode:** set `POWERBI_MCP_READONLY=true` to refuse every write tool while
-  reads and diagnostics keep working. Ideal for shared or autonomous agent use.
-- Connection-string secrets and PII are redacted from logs and error messages.
+  Set `POWERBI_MCP_AUDIT_KEY` to switch the chain to HMAC-SHA256 (cryptographically strong against
+  an attacker who edits the log); without a key it is a plain SHA-256 chain that still catches
+  accidental edits and naive tampering.
+- **Read-only / lockdown mode:** set `POWERBI_MCP_READONLY=true` to refuse every write tool
+  (model/report mutations **and** file-writing tools like snapshots, dictionaries, and PBIX
+  extraction) while reads and diagnostics keep working. Ideal for shared or autonomous agent use.
+- Connection-string secrets and PII are redacted from logs, error messages, the audit log, and
+  every tool response (redaction is applied at the response boundary, not just per-handler).
 
 ```yaml
 # config/policies.yaml (excerpt)
@@ -313,6 +318,7 @@ tables:
 | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` | Azure AD service principal (cloud, REST, admin) |
 | `ADOMD_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.AdomdClient.dll`, if auto-discovery misses it |
 | `POWERBI_MCP_READONLY` | `true` refuses all write tools (lockdown mode) |
+| `POWERBI_MCP_AUDIT_KEY` | Secret key that switches the audit hash chain to HMAC-SHA256 (stronger tamper-resistance) |
 | `ENABLE_PII_DETECTION`, `ENABLE_AUDIT`, `ENABLE_POLICIES` | Toggle security subsystems (default true) |
 | `LOG_LEVEL` | `DEBUG` enables redacted argument logging |
 

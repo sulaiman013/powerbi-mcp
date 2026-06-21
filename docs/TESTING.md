@@ -28,6 +28,14 @@ python tests/test_security_enforcement.py
 | `test_wave2.py` | PBIR reference scanner, refresh_doctor, find_unused_objects, impact_analysis, rls_test_harness |
 | `test_wave_extras.py` | Tamper-evident audit chain (tamper + deletion detection), DAX regression runner |
 | `test_wave3.py` | Scanner summary, cross_workspace_lineage (cached), fleet refresh monitor, usage analytics |
+| `test_adomd_loader.py` | ADOMD.NET discovery (GAC/SSMS/SDK/NuGet/env) for issue #12 |
+| `test_pbir_authoring.py` | PBIR emit/parse symmetry, add page/visual/bind, aggregation + nativeQueryRef fidelity |
+| `test_dax_lint.py` | DAX anti-pattern rules fire + stay silent on clean DAX; comment/string handling |
+| `test_svg_measures.py` | SVG micro-visual generators emit well-formed, self-lint-clean DAX |
+| `test_naming_audit.py` | Naming convention detection -> rename plan; acronyms preserved; opt-in abbreviations |
+| `test_pbix_tools.py` | PBIX inspect/extract: thin/thick, UTF-16-LE layout decode, Zip-Slip guard |
+| `test_bpa_authoring.py` | Custom BPA rule validation + rule-source audit (single- and multi-line annotations) |
+| `test_security_audit_fixes.py` | Regression: secret redaction, audit-chain tamper + HMAC, error scrubbing, ReDoS-safe refs, PII summary, status_pill guard |
 
 ## Coverage philosophy
 - **Offline / pure logic** (security, PBIP rename, model analysis, diff, refresh

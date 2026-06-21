@@ -156,6 +156,27 @@ def test_aggregation_and_native_ref():
         check("measure queryRef is Table.Field", m["queryRef"] == "Sales.Total Sales", m["queryRef"])
 
 
+def test_emit_projection_aggregation_unit():
+    print("\n== emit_projection aggregation shape + queryRef (pure module) ==")
+    cases = {
+        pbir_authoring.AGG_SUM: "Sum", pbir_authoring.AGG_AVERAGE: "Average",
+        pbir_authoring.AGG_MIN: "Min", pbir_authoring.AGG_MAX: "Max",
+        pbir_authoring.AGG_COUNT_NONNULL: "CountNonNull",
+    }
+    for fn, qname in cases.items():
+        p = pbir_authoring.emit_projection("Sales", "Amount", aggregation=fn)
+        agg = p["field"].get("Aggregation", {})
+        check(f"agg {qname}: Aggregation node + Function", agg.get("Function") == fn, str(p["field"]))
+        check(f"agg {qname}: inner Column ref", agg.get("Expression", {}).get("Column", {}).get("Property") == "Amount")
+        check(f"agg {qname}: queryRef form", p["queryRef"] == f"{qname}(Sales.Amount)", p["queryRef"])
+        check(f"agg {qname}: nativeQueryRef bare", p["nativeQueryRef"] == "Amount")
+    # parser must still recover the underlying column from an aggregated projection
+    refs = set()
+    PowerBIPBIPConnector._walk_report_refs(
+        pbir_authoring.emit_projection("Sales", "Amount", aggregation=pbir_authoring.AGG_SUM), refs)
+    check("aggregated column parses back", ("Sales", "Amount") in refs, str(refs))
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  PBIR REPORT AUTHORING TESTS")
@@ -164,6 +185,7 @@ if __name__ == "__main__":
     test_catalog_and_authoring()
     test_report_validator()
     test_aggregation_and_native_ref()
+    test_emit_projection_aggregation_unit()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

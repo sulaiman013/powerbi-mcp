@@ -94,8 +94,14 @@ def status_pill(value_measure: str, thresholds: Optional[List[Dict[str, Any]]] =
         color_branches.append(f"        _v <= {th['max']}, {_q(th['color'])}")
         label_branches.append(f"        _v <= {th['max']}, {_q(th.get('label', ''))}")
     top = thresholds[-1]
-    color_switch = "SWITCH( TRUE(),\n" + ",\n".join(color_branches) + f",\n        {_q(top.get('color', '#3FA34D'))} )"
-    label_switch = "SWITCH( TRUE(),\n" + ",\n".join(label_branches) + f",\n        {_q(top.get('label', ''))} )"
+    if color_branches:
+        color_switch = "SWITCH( TRUE(),\n" + ",\n".join(color_branches) + f",\n        {_q(top.get('color', '#3FA34D'))} )"
+        label_switch = "SWITCH( TRUE(),\n" + ",\n".join(label_branches) + f",\n        {_q(top.get('label', ''))} )"
+    else:
+        # No numeric bands: a single constant color/label (a SWITCH with no condition pairs
+        # would be invalid DAX).
+        color_switch = _q(top.get('color', '#3FA34D'))
+        label_switch = _q(top.get('label', ''))
     body = _join([
         _q(URI_PREFIX),
         _q(f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}'>"),

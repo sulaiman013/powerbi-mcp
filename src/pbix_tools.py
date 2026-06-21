@@ -59,7 +59,7 @@ def inspect(path: str) -> Dict[str, Any]:
         has_dm = "DataModel" in names
         has_conn = "Connections" in names
         layout = _layout_name(names)
-        has_pbir = any(n.startswith("definition/") or "/definition/" in n for n in names)
+        has_pbir = any(n.startswith("definition/") or n.startswith("Report/definition/") for n in names)
 
         report_format = ("PBIR (enhanced)" if has_pbir
                          else "legacy (Report/Layout)" if layout else "unknown")

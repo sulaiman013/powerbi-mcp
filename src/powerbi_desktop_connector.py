@@ -281,14 +281,15 @@ class PowerBIDesktopConnector:
         Returns:
             List of columns with name and type
         """
-        # Use INFO.VIEW.COLUMNS() and filter by table
-        # Column names: [Name], [Table], [DataType], [IsHidden], [Description]
+        # Use INFO.VIEW.COLUMNS() and filter by table. Escape double quotes so a table name
+        # cannot break out of the DAX string literal (DAX escapes " by doubling it).
+        safe_table = str(table_name).replace('"', '""')
         query = f"""
             EVALUATE
             SELECTCOLUMNS(
                 FILTER(
                     INFO.VIEW.COLUMNS(),
-                    [Table] = "{table_name}"
+                    [Table] = "{safe_table}"
                 ),
                 "Name", [Name],
                 "DataType", [DataType],

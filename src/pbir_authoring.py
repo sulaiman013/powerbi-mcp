@@ -116,9 +116,11 @@ def split_table_field(ref: str):
     if s.startswith("'"):
         end = s.find("'", 1)
         if end != -1:
-            table = s[1:end]
+            table = s[1:end].replace("''", "'")
             rest = s[end + 1:].lstrip(".")
             return table, rest
+        # Unterminated quote: drop the stray leading quote rather than leak it into the Entity.
+        s = s[1:]
     table, _, field = s.partition(".")
     return table, field
 

@@ -362,8 +362,13 @@ class PowerBIXmlaConnector:
             return rows
 
         except Exception as e:
-            logger.error(f"DAX query execution failed: {str(e)}")
-            raise Exception(f"DAX query failed: {str(e)}")
+            # The connection string embeds the service-principal secret; a provider error can
+            # echo it. Strip it before logging or re-raising so it never reaches a caller/model.
+            safe = str(e)
+            if getattr(self, "client_secret", None) and len(self.client_secret) >= 6:
+                safe = safe.replace(self.client_secret, "***")
+            logger.error(f"DAX query execution failed: {safe}")
+            raise Exception(f"DAX query failed: {safe}")
 
     def get_sample_data(self, table_name: str, num_rows: int = 5) -> List[Dict[str, Any]]:
         """
@@ -377,13 +382,10 @@ class PowerBIXmlaConnector:
             List of row dictionaries
         """
         try:
-            # Quote table name if it contains spaces or special characters
-            if ' ' in table_name or '&' in table_name or table_name.startswith('_'):
-                quoted_name = f"'{table_name}'"
-            else:
-                quoted_name = table_name
-
-            dax_query = f"EVALUATE TOPN({num_rows}, {quoted_name})"
+            # Always single-quote and escape inner quotes so a name like O'Brien cannot break
+            # out of the table reference (DAX escapes a single quote by doubling it).
+            quoted_name = "'" + str(table_name).replace("'", "''") + "'"
+            dax_query = f"EVALUATE TOPN({int(num_rows)}, {quoted_name})"
             return self.execute_dax(dax_query)
 
         except Exception as e:
