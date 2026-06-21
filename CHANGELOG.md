@@ -8,10 +8,13 @@ All notable changes to the Power BI MCP Server. Format based on
 ### Fixed
 - **ADOMD.NET not found on newer Power BI Desktop installs.** Recent Power BI Desktop (MSI)
   builds no longer ship `Microsoft.AnalysisServices.AdomdClient.dll`, so Desktop/XMLA
-  connectivity failed even with Power BI Desktop installed. Discovery now also searches
-  **SSMS** (any version, x64 and x86), the **SQL Server SDK** and **Update Cache** (any
-  version, not hard-coded numbers), and **ADOMD.NET NuGet** packages, and honors an explicit
-  **`ADOMD_DLL_PATH`** environment variable (folder or full DLL path).
+  connectivity failed even with Power BI Desktop installed. Discovery now also searches the
+  **GAC** (`GAC_MSIL\Microsoft.AnalysisServices.AdomdClient`, where Power BI Desktop and SSMS
+  actually register the standard assembly), **SSMS** (any version, x64 and x86), the **SQL
+  Server SDK** and **Update Cache** (any version, not hard-coded numbers), the legacy
+  ADOMD.NET MSI folder, and **ADOMD.NET NuGet** packages, and honors an explicit
+  **`ADOMD_DLL_PATH`** environment variable (folder or full DLL path). (Power BI Desktop ships
+  its own `Microsoft.PowerBI.AdomdClient.dll` in `bin`, not the standard assembly pyadomd needs.)
 
 ### Changed
 - The Desktop and XMLA connectors now share one `adomd_loader.py` (removing the previous two
