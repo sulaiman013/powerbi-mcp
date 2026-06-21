@@ -3,6 +3,26 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.3.0] - 2026-06-21 — Authoring helpers: SVG micro-visuals + naming audit
+
+Grew the server from **64 to 66 tools** with two pure-Python authoring helpers.
+
+### Added
+- **`generate_svg_measure`** — generate a ready-to-use DAX measure that returns an inline
+  `data:image/svg+xml` micro-visual: a **progress bar**, **bullet chart**, **status pill**, or
+  **sparkline**. Set the measure's data category to "Image URL" and it renders inside a table,
+  matrix, or card with no custom visual. SVG attributes are single-quoted so they sit inside the
+  DAX string literal without escaping. (New module `svg_measures.py`.)
+- **`audit_naming`** — audit table, column, and measure names and return a rename PLAN
+  (snake_case and camelCase to spaced Title Case, strip warehouse DIM_/FACT_ prefixes, trim
+  whitespace, optionally expand abbreviations; acronyms up to 4 chars preserved). Feed the plan
+  to the existing rename engine (`pbip_rename_*` for model + report, or live `batch_rename_*`).
+  (New module `naming_audit.py`.)
+- New tests `tests/test_svg_measures.py` (every kind emits well-formed DAX, and the generated DAX
+  is itself clean under `dax_lint`) and `tests/test_naming_audit.py`.
+
+---
+
 ## [3.2.0] - 2026-06-21 — DAX performance linter
 
 Grew the server from **62 to 64 tools** with a pure-Python DAX static analyzer ("BPA for DAX").

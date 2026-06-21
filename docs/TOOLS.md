@@ -1,6 +1,6 @@
 # Tool Reference
 
-The Power BI MCP server exposes **64 tools**, plus MCP **resources**, **prompts**, and
+The Power BI MCP server exposes **66 tools**, plus MCP **resources**, **prompts**, and
 **completion**. Every tool carries MCP annotations (`readOnlyHint` / `destructiveHint` /
 `idempotentHint` / `openWorldHint`) so clients can auto-approve reads and confirm writes.
 
@@ -116,6 +116,12 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 > DIVIDE, DL004 IFERROR, DL005 `+ 0` blank suppression, DL006 EARLIER, DL007 SUMMARIZE used for
 > aggregation, DL008 unrecognized/hallucinated function. Pure-Python tokenizer, no external tool.
 > Pair `dax_suggest_rewrite` with `validate_dax` to confirm a rewrite still parses.
+
+## Authoring helpers — 2
+| Tool | | Description |
+|------|--|-------------|
+| `generate_svg_measure` | 🟢 | Generate a DAX measure returning an inline SVG micro-visual (progress / bullet / status_pill / sparkline); set the measure's data category to "Image URL" to render it |
+| `audit_naming` | 🟢 | Audit table/column/measure names and return a rename plan (snake_case & camelCase to Title Case, strip DIM_/FACT_ prefixes, trim); apply with the rename tools |
 
 ## Documentation, diff & CI — 5
 | Tool | | Description |
