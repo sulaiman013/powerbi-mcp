@@ -47,6 +47,77 @@ It exposes **58 tools** plus MCP **resources**, **prompts**, and **completion**,
 
 ---
 
+## What you can do with it (in plain words)
+
+This server is a bridge. On its own an AI assistant can only talk. This gives it a set of
+"hands" so it can reach into Power BI and actually do the work for you. You ask in plain
+English, the assistant picks the right tool, and you get an answer or a change.
+
+It plugs into three places:
+
+1. **Power BI Desktop**: the app open on your PC. It talks to the live model inside it.
+2. **Power BI Service**: the cloud, your published datasets and workspaces.
+3. **PBIP files**: when you save a "Power BI Project", the model and report become text files
+   on disk that it can edit directly, even with Desktop closed.
+
+A few terms used below: a **semantic model** (dataset) is the data brain behind a report
+(its tables, columns, relationships, and measures). A **measure** is a saved calculation
+written in **DAX** (Power BI's formula language). **RLS** is row-level security (rules that
+limit which rows a user can see).
+
+### Things you can ask it to do
+
+- **Understand a model you have never seen.** List tables, columns, measures (with formulas),
+  and relationships, or get the whole picture at once.
+  > "Connect to my Power BI Desktop and summarize the model."
+- **Query your data in plain English.** It turns the question into DAX and runs it.
+  > "What were the top 10 products by sales last quarter?"
+- **Write, fix, and optimize measures safely.** It validates the DAX against your model
+  *before* saving, so broken formulas are caught early. It can also explain or speed up a measure.
+  > "Create a 'Margin %' measure as profit divided by sales, formatted as a percentage."
+- **Rename tables, columns, or measures without breaking the report.** Normal tools fix only
+  the model and leave visuals broken. This updates the model and the report visuals together,
+  as one transaction that rolls back if anything fails.
+  > "Rename the table 'Salesforce_Data' to 'Sales Force Data' everywhere."
+- **See what will break before you change anything.** The full blast radius: every measure
+  that depends on an object and every report visual that uses it.
+  > "If I delete the 'Old Revenue' measure, what depends on it?"
+- **Manage relationships** between tables (cardinality and filter direction).
+- **Check model quality like a senior reviewer.** Best Practice Analyzer (performance, DAX,
+  naming, formatting), an AI-readiness score, storage/size analysis, and query-performance hints.
+  > "Audit this model and give me the top issues to fix before I ship."
+- **Clean up dead weight.** Find columns and measures that nothing uses (not in any formula
+  and not in any visual) so you can remove clutter safely.
+- **Test security roles properly.** Run a measure under every RLS role and get a pass/fail
+  matrix that flags roles seeing too much or nothing.
+- **Document the model automatically.** Generate a data dictionary (Markdown or HTML) with a
+  documentation-coverage score, re-runnable any time.
+- **Compare versions and gate deployments.** Snapshot the model, diff it later for a readable
+  "what changed" list, run a pre-deploy PASS/FAIL quality gate, and run DAX regression tests.
+- **Troubleshoot refreshes (cloud).** When a refresh fails it classifies the cause (expired
+  credentials, gateway down, throttling, out of memory, timeout, bad source query) and tells
+  you the fix.
+- **Govern access and stay compliant.** Mask PII before the AI sees it, block/mask/hash/redact
+  specific columns, keep a tamper-evident audit log, and flip on read-only mode so an agent can
+  look but not touch.
+- **See across the whole tenant (admins).** Inventory every workspace, find datasets with no
+  security or no sensitivity label, trace which reports use a dataset, monitor refresh health,
+  and view usage analytics.
+
+### A realistic end-to-end example
+
+> 1. "Connect to my Power BI Desktop model."
+> 2. "Audit it and list the worst issues."
+> 3. "What would break if I rename the 'Customer ID' column?"
+> 4. "Rename it to 'CustomerKey' across model and report."
+> 5. "Create a 'YoY Sales %' measure, validate it, and format as a percentage."
+> 6. "Export a data dictionary so the team has docs."
+> 7. "Run the pre-deploy quality gate before I publish."
+
+Each step is one sentence; the server does the real Power BI work behind it.
+
+---
+
 ## Why this server
 
 Microsoft now ships official Power BI MCP servers (public preview): a remote one for
