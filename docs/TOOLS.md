@@ -131,6 +131,7 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 | Variable | Purpose |
 |----------|---------|
 | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` | Azure AD service principal for cloud/REST/admin |
+| `ADOMD_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.AdomdClient.dll` if auto-discovery misses it |
 | `POWERBI_MCP_READONLY` | `true` → refuse all write tools (lockdown mode) |
 | `ENABLE_PII_DETECTION`, `ENABLE_AUDIT`, `ENABLE_POLICIES` | Toggle security subsystems (default true) |
 | `LOG_LEVEL` | `DEBUG` enables (redacted) argument logging |

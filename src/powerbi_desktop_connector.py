@@ -19,53 +19,17 @@ except ImportError:
     logger.warning("psutil not installed - run: pip install psutil")
     _psutil_available = False
 
-# Find and load ADOMD.NET
-def _find_adomd_dll() -> Optional[Path]:
-    """Find ADOMD.NET DLL from Power BI Desktop or SQL Server installations"""
-    possible_paths = [
-        # Power BI Desktop installation (preferred for Desktop connectivity)
-        Path(r"C:\Program Files\Microsoft Power BI Desktop\bin"),
-        Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Power BI Desktop\bin")),
-        # Windows Store version
-        Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps")),
-        # SQL Server installations
-        Path(r"C:\Program Files\Microsoft SQL Server\160\SDK\Assemblies"),
-        Path(r"C:\Program Files\Microsoft SQL Server\150\SDK\Assemblies"),
-        Path(r"C:\Program Files (x86)\Microsoft SQL Server\160\SDK\Assemblies"),
-        # SQL Server Update Cache
-        Path(r"C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Update Cache"),
-    ]
+# Find and load ADOMD.NET (shared, robust discovery: env var + SSMS + SQL SDK + NuGet)
+from adomd_loader import find_adomd_dll, ensure_adomd_on_path, NOT_FOUND_HELP
 
-    # Check Update Cache for latest version
-    update_cache = Path(r"C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Update Cache")
-    if update_cache.exists():
-        update_folders = list(update_cache.glob("*/GDR/x64"))
-        if update_folders:
-            possible_paths.insert(0, sorted(update_folders)[-1])
-
-    for path in possible_paths:
-        if path.exists():
-            dll_file = path / "Microsoft.AnalysisServices.AdomdClient.dll"
-            if dll_file.exists():
-                return path
-            # Also check subdirectories
-            for dll in path.glob("**/Microsoft.AnalysisServices.AdomdClient.dll"):
-                return dll.parent
-
-    return None
-
+# Backwards-compatible alias (older code/tests referenced this name)
+_find_adomd_dll = find_adomd_dll
 
 # Initialize ADOMD.NET
-_adomd_path = _find_adomd_dll()
+_adomd_path = ensure_adomd_on_path()
 _adomd_available = False
 
 if _adomd_path:
-    path_str = str(_adomd_path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
-    if path_str not in os.environ.get('PATH', ''):
-        os.environ['PATH'] = path_str + os.pathsep + os.environ.get('PATH', '')
-
     try:
         import clr
         clr.AddReference("Microsoft.AnalysisServices.AdomdClient")
@@ -75,7 +39,7 @@ if _adomd_path:
     except Exception as e:
         logger.error(f"Failed to load ADOMD.NET: {e}")
 else:
-    logger.warning("ADOMD.NET not found - Desktop connectivity unavailable")
+    logger.warning(NOT_FOUND_HELP)
 
 
 class PowerBIDesktopConnector:

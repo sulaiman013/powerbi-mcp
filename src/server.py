@@ -1463,7 +1463,13 @@ class PowerBIMCPServer:
             connector = self._get_desktop_connector()
 
             if not connector.is_available():
-                return "Error: Desktop connectivity unavailable. Ensure psutil and ADOMD.NET are installed."
+                return (
+                    "Error: Desktop connectivity unavailable. Ensure 'psutil' is installed and "
+                    "the ADOMD.NET client library can be found. Newer Power BI Desktop builds no "
+                    "longer ship it, so install SSMS or the Microsoft.AnalysisServices.AdomdClient "
+                    "NuGet package, or set ADOMD_DLL_PATH to the folder containing "
+                    "Microsoft.AnalysisServices.AdomdClient.dll."
+                )
 
             instances = await asyncio.get_event_loop().run_in_executor(
                 None, connector.discover_instances

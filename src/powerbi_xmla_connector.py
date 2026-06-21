@@ -11,50 +11,20 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Add ADOMD.NET DLL path before importing pyadomd
-def _add_adomd_to_path():
-    """Find and add ADOMD.NET DLL directory to system path"""
-    possible_paths = [
-        # NuGet package locations
-        Path(os.path.expandvars(r"%USERPROFILE%\.nuget\packages\microsoft.analysisservices.adomdclient.retail.amd64")),
-        # SQL Server Management Studio installations
-        Path(r"C:\Program Files\Microsoft SQL Server\160\SDK\Assemblies"),
-        Path(r"C:\Program Files\Microsoft SQL Server\150\SDK\Assemblies"),
-        Path(r"C:\Program Files\Microsoft SQL Server\140\SDK\Assemblies"),
-        # x86 versions
-        Path(r"C:\Program Files (x86)\Microsoft SQL Server\160\SDK\Assemblies"),
-        Path(r"C:\Program Files (x86)\Microsoft SQL Server\150\SDK\Assemblies"),
-        Path(r"C:\Program Files (x86)\Microsoft SQL Server\140\SDK\Assemblies"),
-    ]
+# Add ADOMD.NET DLL path before importing pyadomd (shared, robust discovery:
+# env var + Power BI Desktop + SSMS + SQL SDK + Update Cache + NuGet)
+from adomd_loader import ensure_adomd_on_path, NOT_FOUND_HELP
 
-    # Also search in Program Files recursively (from our earlier search)
-    update_cache_path = Path(r"C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Update Cache")
-    if update_cache_path.exists():
-        # Get latest update folder
-        update_folders = list(update_cache_path.glob("*/GDR/x64"))
-        if update_folders:
-            # Sort by folder name (KB number) and get the latest
-            possible_paths.insert(0, sorted(update_folders)[-1])
 
-    for path in possible_paths:
-        if path.exists():
-            dll_file = path / "Microsoft.AnalysisServices.AdomdClient.dll"
-            if dll_file.exists():
-                logger.info(f"Found ADOMD.NET DLL at: {path}")
-                # Add to system path
-                path_str = str(path)
-                if path_str not in sys.path:
-                    sys.path.insert(0, path_str)
-                if path_str not in os.environ.get('PATH', ''):
-                    os.environ['PATH'] = path_str + os.pathsep + os.environ.get('PATH', '')
-                return True
-
-    logger.error("ADOMD.NET client DLL not found")
-    logger.error("Please install one of the following:")
-    logger.error("1. SQL Server Management Studio (SSMS)")
-    logger.error("2. Microsoft ADOMD.NET NuGet package")
-    logger.error("3. Download from: https://docs.microsoft.com/sql/analysis-services/client-libraries")
+def _add_adomd_to_path() -> bool:
+    """Find ADOMD.NET and add its directory to sys.path / PATH."""
+    found = ensure_adomd_on_path()
+    if found:
+        logger.info(f"Found ADOMD.NET DLL at: {found}")
+        return True
+    logger.error(NOT_FOUND_HELP)
     return False
+
 
 # Configure ADOMD path
 _adomd_available = _add_adomd_to_path()
