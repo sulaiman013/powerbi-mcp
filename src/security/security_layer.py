@@ -270,6 +270,12 @@ class SecurityLayer:
                 query=query
             )
 
+    def verify_audit_integrity(self) -> Dict[str, Any]:
+        """Verify the tamper-evident hash chain of the audit log."""
+        if not self.enable_audit or not self.audit_logger:
+            return {"valid": True, "checked": 0, "message": "Audit logging is disabled."}
+        return self.audit_logger.verify_chain()
+
     def get_status(self) -> Dict[str, Any]:
         """Get current security layer status"""
         status = {
