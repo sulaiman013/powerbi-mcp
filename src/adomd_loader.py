@@ -69,10 +69,20 @@ def find_adomd_dll() -> Optional[Path]:
 
     candidates: List[Path] = []
 
-    # 2. Power BI Desktop (MSI, per-user, and Microsoft Store)
+    # 2. Power BI Desktop (MSI, per-user, and Microsoft Store). Note: Power BI Desktop ships
+    #    its own Microsoft.PowerBI.AdomdClient.dll in bin, NOT the standard assembly pyadomd
+    #    needs, and installs the standard ADOMD into the GAC instead (see below).
     candidates.append(Path(r"C:\Program Files\Microsoft Power BI Desktop\bin"))
     candidates.append(Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Power BI Desktop\bin")))
     candidates.append(Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps")))
+
+    # 2b. The Global Assembly Cache: where Power BI Desktop and SSMS actually register the
+    #     standard Microsoft.AnalysisServices.AdomdClient assembly (per Microsoft Learn).
+    candidates.append(Path(os.path.expandvars(
+        r"%WINDIR%\Microsoft.NET\assembly\GAC_MSIL\Microsoft.AnalysisServices.AdomdClient")))
+    # 2c. Legacy standalone ADOMD.NET MSI install location.
+    for pf in _program_files_roots():
+        candidates.append(Path(pf) / "Microsoft.NET" / "ADOMD.NET")
 
     for pf in _program_files_roots():
         root = Path(pf)
