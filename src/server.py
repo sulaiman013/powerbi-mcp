@@ -95,6 +95,7 @@ import governance
 import dax_lint
 import svg_measures
 import naming_audit
+import pbix_tools
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -312,6 +313,9 @@ class PowerBIMCPServer:
             # Authoring helpers (Wave 4)
             "generate_svg_measure": lambda a: self._handle_generate_svg_measure(a),
             "audit_naming": lambda a: self._handle_audit_naming(a),
+            # PBIX onboarding (Wave 4)
+            "pbix_inspect": lambda a: self._handle_pbix_inspect(a),
+            "pbix_extract": lambda a: self._handle_pbix_extract(a),
         }
 
     def _build_tool_annotations(self):
@@ -411,6 +415,9 @@ class PowerBIMCPServer:
             # Authoring helpers (Wave 4) - generate DAX / analyze names, no live mutation
             "generate_svg_measure": ann(True, open_world=False),
             "audit_naming": local_read,
+            # PBIX onboarding (Wave 4) - read a file / write extracted files
+            "pbix_inspect": ann(True, open_world=False),
+            "pbix_extract": ann(False, destructive=False, idempotent=True, open_world=False),
         }
 
     def _setup_handlers(self):
@@ -1303,6 +1310,49 @@ class PowerBIMCPServer:
                         "properties": {
                             "summary": {"type": "object"},
                             "plan": {"type": "array"}
+                        }
+                    }
+                ),
+                # === PBIX ONBOARDING (Wave 4) ===
+                Tool(
+                    name="pbix_inspect",
+                    description="Inspect a .pbix file (an OPC ZIP package) without extracting: classify it as thick (imported model) vs thin (live connection), detect the report format (legacy Report/Layout vs PBIR), count pages, and list every internal entry with size. The first step to working with a real .pbix.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to the .pbix file"}
+                        },
+                        "required": ["path"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "report_format": {"type": "string"},
+                            "page_count": {"type": ["integer", "null"]},
+                            "entries": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="pbix_extract",
+                    description="Extract a .pbix package to a folder (Zip-Slip protected). Also decodes the legacy UTF-16-LE Report/Layout into a readable UTF-8 Report/Layout.json so an agent can inspect or edit the report structure. Returns the list of extracted files.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to the .pbix file"},
+                            "dest": {"type": "string", "description": "Destination folder to extract into"},
+                            "decode_layout": {"type": "boolean", "default": True, "description": "Also write a decoded Report/Layout.json"}
+                        },
+                        "required": ["path", "dest"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "dest": {"type": "string"},
+                            "file_count": {"type": "integer"},
+                            "layout_decoded": {"type": "boolean"},
+                            "files": {"type": "array"}
                         }
                     }
                 ),
@@ -3301,6 +3351,42 @@ class PowerBIMCPServer:
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (f"Error auditing naming: {msg}", {"error": msg, "summary": {"total_suggestions": 0}, "plan": []})
+
+    async def _handle_pbix_inspect(self, args: Dict[str, Any]):
+        """Inspect a .pbix package. Returns (text, result)."""
+        try:
+            path = args.get("path")
+            if not path:
+                return ("Error: 'path' is required.", {"error": "path_required"})
+            result = pbix_tools.inspect(path)
+            out = f"=== PBIX: {result['path']} ===\n\n"
+            out += f"Type: {result['type']}\nReport format: {result['report_format']}\n"
+            out += f"Pages: {result['page_count']}\nEntries: {result['entry_count']}\n\n"
+            out += "Largest entries:\n"
+            for e in result["entries"][:15]:
+                out += f"  {e['size']:>12,}  {e['name']}\n"
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error inspecting PBIX: {msg}", {"error": msg})
+
+    async def _handle_pbix_extract(self, args: Dict[str, Any]):
+        """Extract a .pbix package (Zip-Slip protected). Returns (text, result)."""
+        try:
+            path, dest = args.get("path"), args.get("dest")
+            if not path or not dest:
+                return ("Error: 'path' and 'dest' are required.", {"error": "path_and_dest_required"})
+            result = pbix_tools.extract(path, dest, decode_layout=args.get("decode_layout", True))
+            out = f"=== Extracted {result['file_count']} file(s) to {result['dest']} ===\n"
+            if result["layout_decoded"]:
+                out += "Decoded legacy layout to Report/Layout.json\n"
+            out += "\n" + "\n".join(f"  {f}" for f in result["files"][:50])
+            if result["file_count"] > 50:
+                out += f"\n  ... and {result['file_count'] - 50} more"
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error extracting PBIX: {msg}", {"error": msg})
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus

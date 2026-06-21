@@ -1,6 +1,6 @@
 # Tool Reference
 
-The Power BI MCP server exposes **66 tools**, plus MCP **resources**, **prompts**, and
+The Power BI MCP server exposes **68 tools**, plus MCP **resources**, **prompts**, and
 **completion**. Every tool carries MCP annotations (`readOnlyHint` / `destructiveHint` /
 `idempotentHint` / `openWorldHint`) so clients can auto-approve reads and confirm writes.
 
@@ -122,6 +122,12 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 |------|--|-------------|
 | `generate_svg_measure` | 🟢 | Generate a DAX measure returning an inline SVG micro-visual (progress / bullet / status_pill / sparkline); set the measure's data category to "Image URL" to render it |
 | `audit_naming` | 🟢 | Audit table/column/measure names and return a rename plan (snake_case & camelCase to Title Case, strip DIM_/FACT_ prefixes, trim); apply with the rename tools |
+
+## PBIX onboarding — 2
+| Tool | | Description |
+|------|--|-------------|
+| `pbix_inspect` | 🟢 | Inspect a `.pbix` (ZIP/OPC) package: thick vs thin, report format, page count, entry list. No extraction |
+| `pbix_extract` | 🟡 | Extract a `.pbix` to a folder (Zip-Slip protected) and decode the legacy UTF-16-LE `Report/Layout` to readable `Report/Layout.json` |
 
 ## Documentation, diff & CI — 5
 | Tool | | Description |
