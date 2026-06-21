@@ -3,6 +3,46 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.5.1] - 2026-06-22 — Security + UAT hardening
+
+A full UAT and security audit (adversarially verified) of the 70-tool surface. No new tools; the
+fixes below close confirmed findings. All 20 test suites pass, including a new
+`tests/test_security_audit_fixes.py` regression suite.
+
+### Security
+- **Secret leakage (HIGH):** cloud `execute_dax` could return a raw provider exception (which can
+  echo the connection string, including `Password=<client secret>`) to the model and the audit
+  log. Now redacted at three layers: the handler, a new redaction at the tool-response boundary
+  (covers every handler that returns an error string), and inside the XMLA connector before it
+  re-raises.
+- **Audit log:** error messages and query text are scrubbed of connection-string secrets before
+  being written; the failed-query INFO summary no longer interpolates the raw error.
+- **Audit chain tamper detection:** `verify_chain` now flags an entry whose `entry_hash` was
+  stripped (previously a stripped first entry could masquerade as a legacy pre-chain entry).
+- **Audit chain strength:** set `POWERBI_MCP_AUDIT_KEY` to make the chain HMAC-SHA256
+  (cryptographically strong); without it, the plain SHA-256 chain still catches accidental edits
+  and naive tampering. Tool/description wording corrected to match.
+- **ReDoS:** the DAX reference-extraction regex was quadratic via `finditer` on a long token run;
+  reference extraction is now bracket-first with a bounded table lookback (linear).
+- **DAX injection:** desktop `list_columns` and XMLA `get_sample_data` now escape the table name
+  before interpolating it into a DAX string/identifier.
+- **PII summary:** the detection summary no longer retains the raw matched value.
+- **Read-only mode** now also refuses the file-writing tools (`export_data_dictionary`,
+  `model_snapshot`, `pbix_extract`), matching the documented "refuse every write tool" contract.
+- **Docker** image runs as a non-root user; `requirements*.txt` mcp floor corrected to `>=1.9.0`
+  (the version that ships `outputSchema`/`structuredContent`) with a note to pin for production.
+
+### Fixed (UAT)
+- `status_pill` SVG generator emitted invalid DAX when no numeric threshold band was given.
+- `pbix_inspect` PBIR detection no longer false-positives on any `/definition/` substring.
+- `bpa_audit_rule_sources` now parses multi-line embedded BPA annotations, not just single-line.
+- `naming_audit`: dropped ambiguous default abbreviations (no/cat/dt/tot/rev), distinguished
+  PascalCase from camelCase in the style summary, and renamed the misleading `consistent` flag to
+  `single_style`.
+- `pbir_authoring.split_table_field` no longer leaks a stray quote on an unterminated quoted name.
+
+---
+
 ## [3.5.0] - 2026-06-21 — Custom BPA governance
 
 Grew the server from **68 to 70 tools**. We already RUN a built-in Best Practice Analyzer; now

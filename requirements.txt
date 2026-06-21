@@ -1,7 +1,11 @@
 # Power BI MCP Server V2 Dependencies
+#
+# These are minimum floors. For a reproducible production deploy, generate a pinned, hashed
+# lock file from this file (e.g. `pip-compile --generate-hashes`) and install from that instead.
 
-# MCP SDK
-mcp>=1.0.0
+# MCP SDK. >=1.9.0 is required for tool outputSchema + structuredContent (and ToolAnnotations);
+# the server is developed and tested against 1.27.0.
+mcp>=1.9.0
 
 # Power BI Cloud connectivity
 msal>=1.24.0

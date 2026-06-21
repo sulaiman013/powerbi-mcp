@@ -80,6 +80,14 @@ def test_audit_sources():
     check("local file summarized", res["local_rule_files"][0]["rule_count"] == 1)
 
 
+def test_audit_multiline_annotation():
+    print("\n== audit_rule_sources parses a MULTI-LINE embedded rules annotation ==")
+    embedded = json.dumps([{"ID": "EMB1"}, {"ID": "EMB2"}, {"ID": "EMB3"}], indent=2)  # multi-line
+    model_tmdl = "model Model\n\tannotation BestPracticeAnalyzer = " + embedded + "\n\tannotation Foo = bar\n"
+    res = bpa_authoring.audit_rule_sources(model_tmdl)
+    check("multi-line embedded rules parsed", res["embedded_rule_count"] == 3, str(res["embedded_rule_ids"]))
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  BPA AUTHORING TESTS")
@@ -88,6 +96,7 @@ if __name__ == "__main__":
     test_catches_problems()
     test_warnings_and_fix()
     test_audit_sources()
+    test_audit_multiline_annotation()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

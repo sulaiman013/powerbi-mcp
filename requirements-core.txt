@@ -7,7 +7,7 @@
 # fine without them; the live-connection tools simply report that they are unavailable.
 # For full connectivity install requirements.txt on Windows instead.
 
-mcp>=1.0.0
+mcp>=1.9.0  # outputSchema/structuredContent + ToolAnnotations; tested on 1.27.0
 pyyaml>=6.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0

@@ -290,10 +290,10 @@ class PIIDetector:
             )
 
             if column_pii_type and column_pii_type in self.enabled_types:
+                # Do NOT store the raw value: this record flows into the returned summary.
                 detections.append({
                     'type': column_pii_type.value,
                     'source': 'column_name',
-                    'original': value,
                     'column': column_name
                 })
                 processed_value = self.mask_value(value, column_pii_type, strategy)
@@ -315,10 +315,10 @@ class PIIDetector:
                 masked = self.mask_value(matched, pii_type, strategy)
                 processed_value = processed_value[:start] + masked + processed_value[end:]
 
+                # Store only the masked form (non-sensitive); never the raw matched value.
                 detections.append({
                     'type': pii_type.value,
                     'source': 'pattern',
-                    'original': matched,
                     'masked': masked,
                     'column': column_name
                 })

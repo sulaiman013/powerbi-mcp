@@ -18,9 +18,12 @@ logger = logging.getLogger(__name__)
 # DAX result columns arrive as keys like "Sales[Amount]", "'Sales Data'[Amt]" or "[Total Sales]".
 _COL_KEY_RE = re.compile(r"^\s*'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*$")
 _MEASURE_KEY_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
-# Table/column references inside a DAX query body.
-_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][\w ]*?))\s*\[([^\]]+)\]")
-_BARE_MEASURE_RE = re.compile(r"(?<![\w'\]])\[([^\]]+)\]")
+# Column/measure brackets in a DAX query body. Reference extraction is bracket-first and linear:
+# find each [..] (bounded by ']'), then look back a short, bounded window for the owning table.
+# This avoids the O(n^2) finditer scanning that a single "table-then-bracket" regex incurs on a
+# long run of word characters with no bracket (a ReDoS-style worst case).
+_COLREF_RE = re.compile(r"\[([^\]]+)\]")
+_TABLE_BEFORE_RE = re.compile(r"(?:'([^']*)'|([A-Za-z_]\w*))\s*$")
 
 
 def parse_column_key(key: str) -> Tuple[Optional[str], str]:
@@ -311,13 +314,15 @@ class AccessPolicyEngine:
         columns: Set[str] = set()
         if not query:
             return [], []
-        for m in _REF_RE.finditer(query):
-            tbl = m.group(1) or m.group(2)
-            if tbl and tbl.strip():
-                tables.add(tbl.strip())
-            columns.add(m.group(3).strip())
-        for m in _BARE_MEASURE_RE.finditer(query):
+        for m in _COLREF_RE.finditer(query):
             columns.add(m.group(1).strip())
+            # Table names are short; a bounded lookback keeps this linear (ReDoS-safe).
+            before = query[max(0, m.start() - 256):m.start()]
+            tm = _TABLE_BEFORE_RE.search(before)
+            if tm:
+                tbl = (tm.group(1) or tm.group(2) or "").strip()
+                if tbl:
+                    tables.add(tbl)
         return sorted(tables), sorted(columns)
 
     # Restrictiveness ordering so the strongest policy wins when several match a column.

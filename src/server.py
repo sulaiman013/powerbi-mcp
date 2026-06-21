@@ -142,9 +142,15 @@ class PowerBIMCPServer:
         # Read-only / lockdown mode: when POWERBI_MCP_READONLY=true, every write tool is
         # refused. Write tools = destructive ops plus the non-destructive creates/commit.
         self._read_only = os.getenv("POWERBI_MCP_READONLY", "false").lower() == "true"
+        # Tools refused in read-only/lockdown mode = anything that mutates a model/report
+        # (destructive-hinted) plus the non-destructive creates/commit, plus the tools that
+        # WRITE FILES to disk (a data dictionary, a snapshot, an extracted PBIX). Session-only
+        # tools (desktop_connect, desktop_set_rls_role) are intentionally NOT refused: they let
+        # an agent connect and read under lockdown without persisting any change.
         self._write_tools = (
             {n for n, a in self._tool_annotations.items() if a.destructiveHint}
             | {"create_measure", "create_relationship", "tom_commit_transaction"}
+            | {"export_data_dictionary", "model_snapshot", "pbix_extract"}
         )
 
         self._setup_handlers()
@@ -1569,7 +1575,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="verify_audit_integrity",
-                    description="Verify the tamper-evident hash chain of the audit log. Detects any edited, inserted, or deleted audit entries (compliance/forensics). Returns INTACT or TAMPERED with the first broken line.",
+                    description="Verify the audit-log hash chain (compliance/forensics). Detects edited, inserted, deleted, or hash-stripped entries; returns INTACT or TAMPERED with the first broken line. The chain is HMAC-keyed (cryptographically strong) when POWERBI_MCP_AUDIT_KEY is set, otherwise a plain SHA-256 chain that catches accidental edits and naive tampering.",
                     inputSchema={"type": "object", "properties": {}, "required": []},
                     outputSchema={
                         "type": "object",
@@ -1651,9 +1657,16 @@ class PowerBIMCPServer:
                 # Handlers return either a plain string (text only) or a
                 # (text, structured_dict) tuple for tools that declare an outputSchema.
                 # The MCP SDK puts the dict in structuredContent for typed, chainable results.
+                # Defense in depth: redact connection-string secrets from the text at the
+                # boundary, so a handler that swallows an exception and returns its raw message
+                # cannot leak the service-principal secret to the model.
                 if isinstance(result, tuple) and len(result) == 2:
                     text, structured = result
+                    if isinstance(text, str):
+                        text = redact_secrets(text, [self.client_secret])
                     return [TextContent(type="text", text=text)], structured
+                if isinstance(result, str):
+                    result = redact_secrets(result, [self.client_secret])
                 return [TextContent(type="text", text=result)]
 
             except Exception as e:
@@ -2228,16 +2241,17 @@ class PowerBIMCPServer:
             return result
 
         except Exception as e:
-            logger.error(f"Execute DAX error: {e}")
-            # Log failed query to audit
+            safe = redact_secrets(str(e), [self.client_secret])
+            logger.error(f"Execute DAX error: {safe}")
+            # Log failed query to audit (redacted: a connection-string error can carry the secret)
             self.security.process_results(
                 results=[],
                 query=args.get("dax_query", ""),
                 source="cloud",
                 success=False,
-                error_message=str(e)
+                error_message=safe
             )
-            return f"Error executing DAX: {str(e)}"
+            return f"Error executing DAX: {safe}"
 
     async def _handle_get_model_info(self, args: Dict[str, Any]) -> str:
         """Get model info from Cloud dataset using INFO.VIEW functions"""

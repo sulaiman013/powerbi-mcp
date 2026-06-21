@@ -25,5 +25,12 @@ COPY config/ ./config/
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1
 
+# Run as a non-root user. Create the audit-log dir up front and hand /app to that
+# user so the security layer can write logs/audit.log without root.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
+USER appuser
+
 # stdio MCP server
 ENTRYPOINT ["python", "src/server.py"]

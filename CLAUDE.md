@@ -13,8 +13,8 @@ Quick reminders:
 ## Developer notes
 
 - Source: `src/` (server.py + connectors + `security/` + `model_analysis.py`).
-- Tests: `test_*.py` at the repo root are assert-based and run without Power BI
-  (pure-Python paths). Run them after changes: `python test_<name>.py`.
+- Tests: `tests/test_*.py` are assert-based and run without Power BI (pure-Python
+  paths). Run them after changes: `python run_tests.py` (or `python tests/test_<name>.py`).
 - Every tool registers in one place (`_build_tool_dispatch` + `_build_tool_annotations`
   + `handle_list_tools` in `src/server.py`); keep the three in sync (a parity test
   guards this).

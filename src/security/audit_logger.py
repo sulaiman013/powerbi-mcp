@@ -5,14 +5,33 @@ Logs all queries with metadata for compliance and security monitoring
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from enum import Enum
 import hashlib
+import hmac
 
 logger = logging.getLogger(__name__)
+
+# Connection-string / credential patterns scrubbed from any text persisted to the audit log,
+# so a raw connection error (e.g. "...Password=abc123;...") can never become an on-disk secret.
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)(password\s*=\s*)[^;]+"),
+    re.compile(r"(?i)(client_secret\s*=\s*)[^;&\s]+"),
+    re.compile(r"(?i)(\bsecret\s*=\s*)[^;&\s]+"),
+]
+
+
+def _scrub_secrets(text: Optional[str]) -> Optional[str]:
+    """Mask connection-string secrets in a string before it is written to the log."""
+    if not text or not isinstance(text, str):
+        return text
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub(r"\1***", text)
+    return text
 
 
 class AuditEventType(Enum):
@@ -87,6 +106,13 @@ class AuditLogger:
         self._session_id = self._generate_session_id()
         self._query_count = 0
 
+        # Optional keyed (HMAC) chain. When POWERBI_MCP_AUDIT_KEY is set, entries are chained
+        # with HMAC-SHA256 so the chain cannot be silently recomputed by someone who edits the
+        # file but does not know the key. Without a key it is a plain SHA-256 chain that still
+        # detects accidental edits and naive tampering.
+        key = os.getenv("POWERBI_MCP_AUDIT_KEY")
+        self._hmac_key = key.encode() if key else None
+
         # Ensure log directory exists
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -96,11 +122,13 @@ class AuditLogger:
 
         logger.info(f"Audit logger initialized: {self.log_file}")
 
-    @staticmethod
-    def _hash_event(event: Dict[str, Any]) -> str:
-        """Deterministic hash of an event dict (caller must exclude 'entry_hash')."""
-        canonical = json.dumps(event, sort_keys=True, default=str)
-        return hashlib.sha256(canonical.encode()).hexdigest()
+    def _hash_event(self, event: Dict[str, Any]) -> str:
+        """Deterministic hash of an event dict (caller must exclude 'entry_hash').
+        Uses HMAC-SHA256 when an audit key is configured, else plain SHA-256."""
+        canonical = json.dumps(event, sort_keys=True, default=str).encode()
+        if self._hmac_key:
+            return hmac.new(self._hmac_key, canonical, hashlib.sha256).hexdigest()
+        return hashlib.sha256(canonical).hexdigest()
 
     def _read_last_hash(self) -> Optional[str]:
         """Read the entry_hash of the last line of the current log (to continue the chain)."""
@@ -127,37 +155,44 @@ class AuditLogger:
         """
         if not self.log_file.exists():
             return {"valid": True, "checked": 0, "message": "No audit log file yet."}
-        checked = 0
-        prev_entry_hash = None
         with self._lock:
             try:
                 with open(self.log_file, 'r', encoding='utf-8') as f:
-                    for i, line in enumerate(f, 1):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            ev = json.loads(line)
-                        except Exception:
-                            return {"valid": False, "checked": checked, "broken_line": i,
-                                    "message": f"Line {i} is not valid JSON (corrupted)."}
-                        stored = ev.get("entry_hash")
-                        if stored is None:
-                            # Pre-chain (legacy) entry: cannot verify; reset linkage.
-                            checked += 1
-                            prev_entry_hash = None
-                            continue
-                        recomputed = self._hash_event({k: v for k, v in ev.items() if k != "entry_hash"})
-                        if recomputed != stored:
-                            return {"valid": False, "checked": checked, "broken_line": i,
-                                    "message": f"Line {i} entry_hash mismatch - the entry was modified."}
-                        if prev_entry_hash is not None and ev.get("prev_hash") != prev_entry_hash:
-                            return {"valid": False, "checked": checked, "broken_line": i,
-                                    "message": f"Line {i} chain linkage broken - an entry was inserted or deleted."}
-                        prev_entry_hash = stored
-                        checked += 1
+                    raw = [(i, ln.strip()) for i, ln in enumerate(f, 1) if ln.strip()]
             except Exception as e:
-                return {"valid": False, "checked": checked, "message": f"Verification error: {e}"}
+                return {"valid": False, "checked": 0, "message": f"Verification error: {e}"}
+
+        events = []
+        for i, ln in raw:
+            try:
+                events.append((i, json.loads(ln)))
+            except Exception:
+                return {"valid": False, "checked": len(events), "broken_line": i,
+                        "message": f"Line {i} is not valid JSON (corrupted)."}
+
+        # If ANY entry carries a hash, the file is a chained log and EVERY entry must carry a
+        # valid hash. This closes the bypass where stripping a single entry's hash (even the
+        # first one) would otherwise masquerade as a legacy pre-chain entry.
+        chain_active = any("entry_hash" in ev for _, ev in events)
+        checked = 0
+        prev_entry_hash = None
+        for i, ev in events:
+            stored = ev.get("entry_hash")
+            if stored is None:
+                if chain_active:
+                    return {"valid": False, "checked": checked, "broken_line": i,
+                            "message": f"Line {i} is missing entry_hash (tampering: stripped from a chained log)."}
+                checked += 1  # genuine legacy file: no hashes anywhere
+                continue
+            recomputed = self._hash_event({k: v for k, v in ev.items() if k != "entry_hash"})
+            if recomputed != stored:
+                return {"valid": False, "checked": checked, "broken_line": i,
+                        "message": f"Line {i} entry_hash mismatch - the entry was modified."}
+            if prev_entry_hash is not None and ev.get("prev_hash") != prev_entry_hash:
+                return {"valid": False, "checked": checked, "broken_line": i,
+                        "message": f"Line {i} chain linkage broken - an entry was inserted or deleted."}
+            prev_entry_hash = stored
+            checked += 1
         return {"valid": True, "checked": checked, "message": f"Chain intact across {checked} entr(ies)."}
 
     def _generate_session_id(self) -> str:
@@ -297,8 +332,9 @@ class AuditLogger:
         if pii_detected:
             severity = AuditSeverity.WARNING
 
-        query_text = query if self.include_query_text else "[REDACTED]"
+        query_text = _scrub_secrets(query) if self.include_query_text else "[REDACTED]"
         query_fingerprint = self._generate_query_fingerprint(query)
+        safe_error = _scrub_secrets(error_message)
 
         event = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -319,7 +355,7 @@ class AuditLogger:
                 'success': success,
                 'row_count': result_count,
                 'duration_ms': duration_ms,
-                'error': error_message
+                'error': safe_error
             },
             'access': {
                 'tables': tables_accessed or [],
@@ -336,8 +372,9 @@ class AuditLogger:
 
         self._write_log(event)
 
-        # Log summary to standard logger
-        status = "SUCCESS" if success else f"FAILED: {error_message}"
+        # Log summary to standard logger. Do NOT interpolate the raw error here (it can carry a
+        # connection-string secret); the scrubbed detail is in the structured event above.
+        status = "SUCCESS" if success else "FAILED"
         pii_info = f", PII: {pii_count} instances" if pii_detected else ""
         logger.info(f"Query [{query_fingerprint}]: {result_count or 0} rows, {duration_ms or 0:.0f}ms, {status}{pii_info}")
 

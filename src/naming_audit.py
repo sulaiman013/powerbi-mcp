@@ -17,12 +17,14 @@ import re
 from typing import Any, Dict, List, Optional
 
 # Common abbreviation -> expansion (word-wise, case-insensitive match on a whole word).
+# Deliberately excludes high-collision tokens that are also real words (no, cat, dt, tot, rev),
+# so opt-in expansion does not mangle names like "No Show" or "Cat 5".
 ABBREVIATIONS = {
-    "qty": "Quantity", "amt": "Amount", "nbr": "Number", "no": "Number", "num": "Number",
+    "qty": "Quantity", "amt": "Amount", "nbr": "Number", "num": "Number",
     "cust": "Customer", "prod": "Product", "desc": "Description", "addr": "Address",
-    "dt": "Date", "yr": "Year", "mth": "Month", "cat": "Category", "dept": "Department",
+    "yr": "Year", "mth": "Month", "dept": "Department",
     "mgr": "Manager", "emp": "Employee", "org": "Organization", "txn": "Transaction",
-    "avg": "Average", "tot": "Total", "pct": "Percent", "rev": "Revenue",
+    "avg": "Average", "pct": "Percent",
 }
 # Short tokens kept verbatim (legitimate acronyms / units).
 _KEEP_ACRONYM = re.compile(r"^[A-Z0-9]{1,4}$")
@@ -93,8 +95,12 @@ def _classify(name: str) -> str:
         return "untrimmed"
     if "_" in name:
         return "snake_case"
+    if " " in name:
+        return "spaced"
     if re.search(r"[a-z0-9][A-Z]", name):
-        return "camelCase"
+        # Internal caps: leading-lower is true camelCase; leading-upper is PascalCase
+        # (e.g. a proper noun / table name), which should not be lumped in with camelCase.
+        return "camelCase" if name[:1].islower() else "PascalCase"
     if name.isupper() and len(name) > 4:
         return "UPPERCASE"
     return "spaced"
@@ -144,7 +150,8 @@ def audit(model: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> Di
             "by_reason": by_reason,
             "observed_styles": styles,
             "dominant_style": dominant,
-            "consistent": len([s for s, n in styles.items() if n]) <= 1,
+            # Whether the model uses a single naming style (not a conformance verdict).
+            "single_style": len(styles) <= 1,
         },
         "plan": plan,
     }
