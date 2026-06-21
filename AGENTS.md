@@ -38,6 +38,8 @@ Best Practice Analyzer, AI-readiness, security) even without ADOMD/.NET.
   -> `analyze_query_performance` to sanity-check.
 - **Optimize a model:** `run_bpa` -> `audit_ai_readiness` -> `analyze_model_storage`
   -> remediate top issues -> re-run.
+- **Improve DAX:** `dax_lint` (whole model or one measure) -> `dax_suggest_rewrite` ->
+  apply the rewrite with `create_measure`/`batch_update_measures` (which `validate_dax` first).
 - **Safe rename:** `scan_measure_dependencies` + `pbip_scan_broken_refs` ->
   `pbip_load_project` -> `pbip_rename_*` -> `pbip_validate`.
 - **Author a report (PBIR, preview):** `pbip_load_project` -> `pbir_add_page` ->

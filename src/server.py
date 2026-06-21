@@ -92,6 +92,7 @@ from powerbi_pbip_connector import PowerBIPBIPConnector
 import model_analysis
 import refresh_diagnostics
 import governance
+import dax_lint
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -303,6 +304,9 @@ class PowerBIMCPServer:
             # Relationship management (Bundle D)
             "create_relationship": lambda a: self._handle_create_relationship(a),
             "delete_relationship": lambda a: self._handle_delete_relationship(a),
+            # DAX quality (Wave 4: reach + quality)
+            "dax_lint": lambda a: self._handle_dax_lint(a),
+            "dax_suggest_rewrite": lambda a: self._handle_dax_suggest_rewrite(a),
         }
 
     def _build_tool_annotations(self):
@@ -396,6 +400,9 @@ class PowerBIMCPServer:
             # Relationship management (Bundle D) - mutate the live model
             "create_relationship": ann(False, destructive=False, idempotent=False, open_world=False),
             "delete_relationship": local_destructive,
+            # DAX quality (Wave 4) - read-only static analysis
+            "dax_lint": local_read,
+            "dax_suggest_rewrite": local_read,
         }
 
     def _setup_handlers(self):
@@ -1183,6 +1190,53 @@ class PowerBIMCPServer:
                             "name": {"type": "string", "description": "Relationship name (alternative to from/to)"}
                         },
                         "required": []
+                    }
+                ),
+                # === DAX QUALITY (Wave 4) ===
+                Tool(
+                    name="dax_lint",
+                    description="Static-analyze DAX for performance anti-patterns and correctness traps (FILTER over a whole table in CALCULATE, nested CALCULATE, '/' instead of DIVIDE, IFERROR, EARLIER, SUMMARIZE used for aggregation, '+ 0' blank suppression, unrecognized/likely-hallucinated functions). Lint a raw expression, one measure, or every measure in the connected model. Each finding carries a severity, line, and a concrete rewrite hint.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "expression": {"type": "string", "description": "A raw DAX expression to lint (takes precedence over the model)"},
+                            "name": {"type": "string", "description": "Optional label for the expression in findings"},
+                            "measure_name": {"type": "string", "description": "Lint just this measure from the connected model"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "min_severity": {"type": "string", "enum": ["info", "warning", "error"], "default": "info"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "summary": {"type": "object"},
+                            "findings": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="dax_suggest_rewrite",
+                    description="For the auto-fixable DAX anti-patterns (bare '/' -> DIVIDE, FILTER(whole table) -> boolean filter, SUMMARIZE-aggregation -> SUMMARIZECOLUMNS), return concrete before/after rewrite hints for a raw expression or a named measure. Pair with validate_dax to confirm the rewrite is still valid.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "expression": {"type": "string", "description": "A raw DAX expression (takes precedence over the model)"},
+                            "name": {"type": "string"},
+                            "measure_name": {"type": "string", "description": "Suggest rewrites for this measure from the connected model"},
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "rewrites": {"type": "array"}
+                        }
                     }
                 ),
                 # === DOCUMENTATION (Wave 1) ===
@@ -3047,6 +3101,85 @@ class PowerBIMCPServer:
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (f"Error auditing AI-readiness: {msg}", {"error": msg, "score": 0})
+
+    def _measures_from_model(self, model: Dict[str, Any], measure_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Flatten {name, expression} for every measure in a gathered model, optionally filtered."""
+        out: List[Dict[str, Any]] = []
+        for t in model.get("tables", []):
+            for m in t.get("measures", []):
+                if measure_name and m.get("name") != measure_name:
+                    continue
+                out.append({"name": m.get("name"), "expression": m.get("expression") or ""})
+        return out
+
+    async def _handle_dax_lint(self, args: Dict[str, Any]):
+        """Static DAX anti-pattern linter (raw expression, one measure, or whole model).
+        Returns (text, result)."""
+        try:
+            min_rank = dax_lint.SEVERITY_RANK.get((args.get("min_severity") or "info").lower(), 1)
+            expr = args.get("expression")
+            if expr:
+                measures = [{"name": args.get("name") or "(expression)", "expression": expr}]
+            else:
+                model, err = await self._gather_model_metadata(
+                    args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name"))
+                if err:
+                    return (f"Error: {err}", {"error": err, "summary": {"total": 0}, "findings": []})
+                measures = self._measures_from_model(model, args.get("measure_name"))
+                if args.get("measure_name") and not measures:
+                    return (f"Measure '{args.get('measure_name')}' not found in the model.",
+                            {"error": "measure_not_found", "summary": {"total": 0}, "findings": []})
+            result = dax_lint.lint_measures(measures)
+            result["findings"] = [f for f in result["findings"]
+                                  if dax_lint.SEVERITY_RANK.get(f["severity"], 0) >= min_rank]
+            s = result["summary"]
+            out = "=== DAX Lint ===\n\n"
+            out += f"Scanned {s['measures_scanned']} expression(s); {len(result['findings'])} finding(s)"
+            if s.get("by_severity"):
+                out += "  (" + ", ".join(f"{k}: {v}" for k, v in s["by_severity"].items()) + ")"
+            out += "\n\n"
+            cur = None
+            for f in result["findings"][:200]:
+                if f.get("object") != cur:
+                    cur = f.get("object")
+                    out += f"--- {cur} ---\n"
+                out += f"  [{f['severity'].upper()}] {f['rule_id']} (line {f['line']}): {f['message']}\n"
+                out += f"      fix: {f['suggestion']}\n"
+            if not result["findings"]:
+                out += "No issues found.\n"
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error linting DAX: {msg}", {"error": msg, "summary": {"total": 0}, "findings": []})
+
+    async def _handle_dax_suggest_rewrite(self, args: Dict[str, Any]):
+        """Concrete before/after rewrite hints for auto-fixable DAX anti-patterns.
+        Returns (text, result)."""
+        try:
+            expr = args.get("expression")
+            rewrites: List[Dict[str, Any]] = []
+            if expr:
+                rewrites = dax_lint.suggest_rewrites(args.get("name") or "(expression)", expr)
+            else:
+                model, err = await self._gather_model_metadata(
+                    args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name"))
+                if err:
+                    return (f"Error: {err}", {"error": err, "rewrites": []})
+                for m in self._measures_from_model(model, args.get("measure_name")):
+                    for h in dax_lint.suggest_rewrites(m["name"], m["expression"]):
+                        h["object"] = m["name"]
+                        rewrites.append(h)
+            out = "=== DAX Rewrite Suggestions ===\n\n"
+            if not rewrites:
+                out += "No auto-fixable anti-patterns detected.\n"
+            for h in rewrites[:100]:
+                label = (h.get("object") + ": ") if h.get("object") else ""
+                out += f"--- {label}{h['rule_id']} (line {h['line']}) ---\n"
+                out += f"  before: {h['before']}\n  after:  {h['after']}\n  note:   {h['note']}\n\n"
+            return (out, {"rewrites": rewrites})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error suggesting rewrites: {msg}", {"error": msg, "rewrites": []})
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus

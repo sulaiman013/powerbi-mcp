@@ -3,6 +3,32 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.2.0] - 2026-06-21 — DAX performance linter
+
+Grew the server from **62 to 64 tools** with a pure-Python DAX static analyzer ("BPA for DAX").
+No external tool, no DAX engine required: it tokenizes an expression and runs an original rule
+set, so it works fully offline and on raw expressions, a single measure, or every measure in the
+connected model.
+
+### Added
+- **`dax_lint`** — flags performance anti-patterns and correctness traps with a severity, line,
+  and concrete rewrite hint each:
+  - DL001 FILTER over a whole table inside CALCULATE
+  - DL002 nested CALCULATE (extra context transition)
+  - DL003 `/` division instead of DIVIDE (divide-by-zero risk)
+  - DL004 IFERROR (optimizer fence)
+  - DL005 `+ 0` blank-to-zero suppression
+  - DL006 EARLIER (legacy; prefer VAR)
+  - DL007 SUMMARIZE used to host an aggregation (wrong-result/perf trap)
+  - DL008 unrecognized / likely-hallucinated function name
+- **`dax_suggest_rewrite`** — before/after rewrite hints for the auto-fixable rules
+  (`/` to DIVIDE, FILTER-whole-table to a boolean filter, SUMMARIZE to SUMMARIZECOLUMNS).
+- New pure module **`dax_lint.py`** (comment/string-aware tokenizer + balanced-paren rule engine)
+  and **`tests/test_dax_lint.py`** (each rule fires on its anti-pattern and stays silent on the
+  clean equivalent; comments and string literals never create false positives).
+
+---
+
 ## [3.1.0] - 2026-06-21 — PBIR report authoring (preview)
 
 Grew the server from **58 to 62 tools** by adding offline **report authoring** on PBIR-Enhanced
