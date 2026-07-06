@@ -97,6 +97,9 @@ import svg_measures
 import naming_audit
 import pbix_tools
 import bpa_authoring
+import dax_generator
+import star_schema
+import tmdl_authoring
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -149,9 +152,12 @@ class PowerBIMCPServer:
         # an agent connect and read under lockdown without persisting any change.
         self._write_tools = (
             {n for n, a in self._tool_annotations.items() if a.destructiveHint}
-            | {"create_measure", "create_relationship", "tom_commit_transaction"}
+            | {"create_measure", "create_relationship", "tom_commit_transaction",
+               "batch_create_measures"}
             | {"export_data_dictionary", "model_snapshot", "pbix_extract"}
         )
+        # generate_measure_suite is generation-only by default; its write targets
+        # (target="pbip"/"live") are refused inside the handler when read-only.
 
         self._setup_handlers()
 
@@ -326,6 +332,15 @@ class PowerBIMCPServer:
             # Custom BPA governance (Wave 4)
             "bpa_validate_rules": lambda a: self._handle_bpa_validate_rules(a),
             "bpa_audit_rule_sources": lambda a: self._handle_bpa_audit_rule_sources(a),
+            # Data modelling / warehousing / bulk DAX (Wave 5)
+            "generate_measure_suite": lambda a: self._handle_generate_measure_suite(a),
+            "batch_create_measures": lambda a: self._handle_batch_create_measures(a),
+            "audit_star_schema": lambda a: self._handle_audit_star_schema(a),
+            "scan_referential_integrity": lambda a: self._handle_scan_referential_integrity(a),
+            "pbip_add_measures": lambda a: self._handle_pbip_add_measures(a),
+            "pbip_create_date_table": lambda a: self._handle_pbip_create_date_table(a),
+            "pbip_add_calculation_group": lambda a: self._handle_pbip_add_calculation_group(a),
+            "pbip_add_hierarchy": lambda a: self._handle_pbip_add_hierarchy(a),
         }
 
     def _build_tool_annotations(self):
@@ -431,6 +446,15 @@ class PowerBIMCPServer:
             # Custom BPA governance (Wave 4) - read-only validation/discovery
             "bpa_validate_rules": local_read,
             "bpa_audit_rule_sources": local_read,
+            # Data modelling / warehousing / bulk DAX (Wave 5)
+            "generate_measure_suite": ann(False, destructive=False, idempotent=False, open_world=False),  # can write (target)
+            "batch_create_measures": ann(False, destructive=False, idempotent=False, open_world=False),
+            "audit_star_schema": local_read,
+            "scan_referential_integrity": local_read,
+            "pbip_add_measures": local_destructive,
+            "pbip_create_date_table": local_destructive,
+            "pbip_add_calculation_group": local_destructive,
+            "pbip_add_hierarchy": local_destructive,
         }
 
     def _setup_handlers(self):
@@ -1409,6 +1433,170 @@ class PowerBIMCPServer:
                             "external_rule_files": {"type": "array"},
                             "ignored_rule_ids": {"type": "array"}
                         }
+                    }
+                ),
+                # === DATA MODELLING / WAREHOUSING / BULK DAX (Wave 5) ===
+                Tool(
+                    name="generate_measure_suite",
+                    description="Bulk-generate a governed suite of DAX measures from one base measure or column: time intelligence (YTD/QTD/MTD/PY/YoY/YoY %/MoM %/rolling windows), share-of-total ratios per dimension, ranks, or column statistics. Every measure gets a name, self-contained DAX, format string, display folder, and description. target='none' returns the suite; 'pbip' writes it into the loaded PBIP project's TMDL; 'live' creates it in the connected Desktop model (validated batch).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["time_intelligence", "ratios", "ranking", "column_stats"]},
+                            "base_measure": {"type": "string", "description": "Base measure name (time_intelligence/ratios/ranking)"},
+                            "date_column": {"type": "string", "description": "Date column as Table.Column, e.g. Date.Date (time_intelligence)"},
+                            "variants": {"type": "array", "items": {"type": "string"}, "description": "Time-intelligence subset, e.g. ['ytd','py','yoy_pct'] (default: a sensible core set)"},
+                            "dimension_columns": {"type": "array", "items": {"type": "string"}, "description": "Dimension columns as Table.Column (ratios/ranking)"},
+                            "column": {"type": "string", "description": "Numeric column as Table.Column (column_stats)"},
+                            "stats": {"type": "array", "items": {"type": "string"}, "description": "Stats subset: sum/avg/min/max/median/distinct"},
+                            "display_folder": {"type": "string"},
+                            "base_format": {"type": "string", "description": "Base measure's format string, inherited by non-percent variants"},
+                            "target": {"type": "string", "enum": ["none", "pbip", "live"], "default": "none"},
+                            "table": {"type": "string", "description": "Table to host the measures (required for target pbip/live)"}
+                        },
+                        "required": ["kind"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "measures": {"type": "array"},
+                            "written": {"type": "boolean"},
+                            "target": {"type": "string"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="batch_create_measures",
+                    description="Create MANY measures on a table of the connected Power BI Desktop model in one all-or-nothing batch (TOM). The whole batch is pre-validated (each expression probed against the live model, duplicate names rejected) before anything is created. Honors an open tom transaction.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "table_name": {"type": "string"},
+                            "measures": {"type": "array", "items": {"type": "object", "properties": {
+                                "name": {"type": "string"},
+                                "expression": {"type": "string"},
+                                "format_string": {"type": "string"},
+                                "description": {"type": "string"},
+                                "display_folder": {"type": "string"}
+                            }, "required": ["name", "expression"]}},
+                            "skip_validation": {"type": "boolean", "default": False}
+                        },
+                        "required": ["table_name", "measures"]
+                    }
+                ),
+                Tool(
+                    name="audit_star_schema",
+                    description="Audit the model as a dimensional (star-schema) design: classifies every table (fact / dimension / date dimension / bridge / disconnected) from relationship topology, then flags snowflake chains, bidirectional filters, many-to-many, fact-to-fact joins, a missing or unmarked date table, measure-less facts, and text attributes stranded on facts. Returns a 0-100 score, a grade, and a recommendation per finding.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "classification": {"type": "object"},
+                            "findings": {"type": "array"},
+                            "summary": {"type": "object"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="scan_referential_integrity",
+                    description="Scan every active relationship for referential-integrity violations: fact keys with no matching dimension row (the cause of the hidden blank row and silently wrong totals). Runs an EXCEPT count per relationship against the connected model and reports orphan-key counts with samples.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "enum": ["desktop", "cloud"], "default": "desktop"},
+                            "max_samples": {"type": "integer", "default": 5, "description": "Sample orphan keys to list per violating relationship"},
+                            "workspace_name": {"type": "string"},
+                            "dataset_name": {"type": "string"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "checked": {"type": "integer"},
+                            "violations": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="pbip_add_measures",
+                    description="Bulk-add measures OFFLINE into a loaded PBIP project's TMDL (no Power BI needed): each measure is appended to the target table's .tmdl with formatString, displayFolder, and description. The batch is linted (dax_lint) and checked for name collisions first; writes are atomic with backup. Close Power BI Desktop before editing, then reopen.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "table": {"type": "string", "description": "Table whose .tmdl hosts the measures"},
+                            "measures": {"type": "array", "items": {"type": "object", "properties": {
+                                "name": {"type": "string"},
+                                "expression": {"type": "string"},
+                                "format_string": {"type": "string"},
+                                "description": {"type": "string"},
+                                "display_folder": {"type": "string"}
+                            }, "required": ["name", "expression"]}},
+                            "skip_lint": {"type": "boolean", "default": False}
+                        },
+                        "required": ["table", "measures"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "created": {"type": "array"},
+                            "path": {"type": "string"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="pbip_create_date_table",
+                    description="Create a complete DAX date-dimension table OFFLINE in the loaded PBIP project: a calculated table over CALENDAR() with Year/Quarter/Month/Month Number/Week/Day columns, marked as the model's date table (date key), sort-by-column wiring, and hidden helper columns. The foundation for time intelligence.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "default": "Date", "description": "Date table name"},
+                            "start_date": {"type": "string", "description": "ISO date, e.g. 2015-01-01 (default: auto from MIN/MAX of fact dates is NOT possible offline; defaults to 2015-01-01)"},
+                            "end_date": {"type": "string", "description": "ISO date (default 2030-12-31)"},
+                            "fiscal_year_start_month": {"type": "integer", "description": "1-12; when set, adds Fiscal Year / Fiscal Quarter columns"}
+                        },
+                        "required": []
+                    }
+                ),
+                Tool(
+                    name="pbip_add_calculation_group",
+                    description="Create a calculation group OFFLINE in the loaded PBIP project (TMDL): the professional alternative to bulk-copying time-intelligence measures. Provide calculation items (name + DAX over SELECTEDMEASURE()); a ready-made time-intelligence set (YTD/QTD/MTD/PY/YoY/YoY %) can be generated by passing preset='time_intelligence' with a date_column.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Calculation group table name, e.g. 'Time Intelligence'"},
+                            "column_name": {"type": "string", "default": "Calculation", "description": "The calc group's selector column name"},
+                            "precedence": {"type": "integer", "default": 1},
+                            "items": {"type": "array", "items": {"type": "object", "properties": {
+                                "name": {"type": "string"},
+                                "expression": {"type": "string"},
+                                "format_string_expression": {"type": "string", "description": "Optional dynamic format string DAX, e.g. \"0.0%\""}
+                            }, "required": ["name", "expression"]}, "description": "Calculation items (omit when using a preset)"},
+                            "preset": {"type": "string", "enum": ["time_intelligence"], "description": "Generate a standard item set instead of passing items"},
+                            "date_column": {"type": "string", "description": "Date column as Table.Column (required for the time_intelligence preset)"}
+                        },
+                        "required": ["name"]
+                    }
+                ),
+                Tool(
+                    name="pbip_add_hierarchy",
+                    description="Add a drill-down hierarchy to a table OFFLINE in the loaded PBIP project (TMDL), e.g. Year > Quarter > Month > Date or Category > Subcategory > Product. Levels are existing columns of the table (validated first).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "table": {"type": "string"},
+                            "name": {"type": "string", "description": "Hierarchy name, e.g. 'Date Hierarchy'"},
+                            "levels": {"type": "array", "items": {"type": "string"}, "description": "Column names in drill order (top first)"}
+                        },
+                        "required": ["table", "name", "levels"]
                     }
                 ),
                 # === DOCUMENTATION (Wave 1) ===
@@ -3527,6 +3715,314 @@ class PowerBIMCPServer:
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
             return (f"Error auditing BPA rule sources: {msg}", {"error": msg})
+
+    # ==================== Wave 5: data modelling / warehousing / bulk DAX ====================
+
+    @staticmethod
+    def _render_measure_list(measures: List[Dict[str, Any]]) -> str:
+        out = ""
+        for m in measures:
+            out += f"--- {m['name']} ---\n"
+            if m.get("format_string"):
+                out += f"  format: {m['format_string']}\n"
+            if m.get("display_folder"):
+                out += f"  folder: {m['display_folder']}\n"
+            out += f"  {m['expression']}\n\n".replace("\n", "\n  ").rstrip() + "\n\n"
+        return out
+
+    def _suite_kwargs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Map tool args onto dax_generator.generate_suite kwargs by kind."""
+        kind = (args.get("kind") or "").lower()
+        if kind in ("time_intelligence", "time", "ti"):
+            kw = {"base_measure": args.get("base_measure"), "date_column": args.get("date_column"),
+                  "variants": args.get("variants"), "display_folder": args.get("display_folder"),
+                  "base_format": args.get("base_format")}
+            if not kw["base_measure"] or not kw["date_column"]:
+                raise ValueError("time_intelligence needs base_measure and date_column")
+        elif kind in ("ratios", "ratio", "share"):
+            kw = {"base_measure": args.get("base_measure"),
+                  "dimension_columns": args.get("dimension_columns"),
+                  "display_folder": args.get("display_folder")}
+            if not kw["base_measure"] or not kw["dimension_columns"]:
+                raise ValueError("ratios needs base_measure and dimension_columns")
+        elif kind in ("ranking", "rank"):
+            kw = {"base_measure": args.get("base_measure"),
+                  "dimension_columns": args.get("dimension_columns"),
+                  "display_folder": args.get("display_folder")}
+            if not kw["base_measure"] or not kw["dimension_columns"]:
+                raise ValueError("ranking needs base_measure and dimension_columns")
+        elif kind in ("column_stats", "stats"):
+            kw = {"column": args.get("column"), "stats": args.get("stats"),
+                  "display_folder": args.get("display_folder")}
+            if not kw["column"]:
+                raise ValueError("column_stats needs column")
+        else:
+            raise ValueError(f"Unknown kind '{args.get('kind')}'")
+        return {k: v for k, v in kw.items() if v is not None}
+
+    async def _batch_create_live(self, table: str, measures: List[Dict[str, Any]],
+                                 skip_validation: bool = False) -> str:
+        """Shared live bulk-create path: validate every expression, then all-or-nothing TOM batch."""
+        error = await self._ensure_tom_connected()
+        if error:
+            return error
+        if not skip_validation:
+            for m in measures:
+                status, verr = await self._validate_via_desktop(m["expression"], as_measure=True)
+                if status is False:
+                    return (f"[INVALID] Batch NOT created - measure '{m['name']}' failed validation.\n\n"
+                            f"Error: {redact_secrets(verr, [self.client_secret])}\n\n"
+                            "Fix the DAX and retry (or pass skip_validation=true).")
+        tom = self._get_tom_connector()
+        auto_save = not self._tom_transaction_active
+        create_fn = lambda: tom.batch_create_measures(table, measures, auto_save=auto_save)
+        result = await asyncio.get_event_loop().run_in_executor(None, create_fn)
+        if not result.success:
+            return f"Failed: {result.message}"
+        pending = " (PENDING - run tom_commit_transaction to save)" if self._tom_transaction_active else ""
+        return f"{result.message}{pending}"
+
+    async def _handle_generate_measure_suite(self, args: Dict[str, Any]):
+        """Bulk-generate a measure suite; optionally write it (pbip TMDL or live TOM).
+        Returns (text, result)."""
+        try:
+            target = (args.get("target") or "none").lower()
+            if target not in ("none", "pbip", "live"):
+                return (f"Error: unknown target '{target}'.", {"error": "bad_target", "measures": []})
+            if target != "none" and self._read_only:
+                return ("Refused: writing a measure suite is a write operation and the server is in "
+                        "READ-ONLY mode. Use target='none' to generate without writing.",
+                        {"error": "read_only", "measures": []})
+            measures = dax_generator.generate_suite(args.get("kind"), **self._suite_kwargs(args))
+            result = {"measures": measures, "written": False, "target": target}
+            out = f"=== Measure suite: {args.get('kind')} ({len(measures)} measures) ===\n\n"
+            out += self._render_measure_list(measures)
+
+            if target == "none":
+                out += "Not written (target='none'). Write with target='pbip' (offline TMDL) or 'live' (TOM)."
+                return (out, result)
+            table = args.get("table")
+            if not table:
+                return ("Error: 'table' is required for target pbip/live.", {"error": "table_required", "measures": measures})
+            if target == "pbip":
+                connector = self._get_pbip_connector()
+                write_fn = lambda: connector.add_measures(table, measures)
+                res = await asyncio.get_event_loop().run_in_executor(None, write_fn)
+                if not res.get("success"):
+                    return (f"Generated but NOT written: {res.get('message')}", {"error": res.get("message"), "measures": measures})
+                result["written"] = True
+                out += f"Written into TMDL: {res.get('path')} ({len(res.get('created', []))} measures).\n"
+                out += "Close and reopen Power BI Desktop to see them."
+                return (out, result)
+            # live
+            msg = await self._batch_create_live(table, measures, bool(args.get("skip_validation", False)))
+            result["written"] = "Created" in msg
+            return (out + msg, result)
+        except ValueError as e:
+            return (f"Error: {e}", {"error": str(e), "measures": []})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error generating measure suite: {msg}", {"error": msg, "measures": []})
+
+    async def _handle_batch_create_measures(self, args: Dict[str, Any]) -> str:
+        """All-or-nothing live bulk measure creation with validate-before-commit."""
+        try:
+            table = args.get("table_name")
+            measures = args.get("measures") or []
+            if not table or not measures:
+                return "Error: table_name and a non-empty measures array are required"
+            bad = [m for m in measures if not (m.get("name") and m.get("expression"))]
+            if bad:
+                return "Error: every measure needs both 'name' and 'expression'"
+            return await self._batch_create_live(table, measures, bool(args.get("skip_validation", False)))
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return f"Error creating measures: {msg}"
+
+    async def _handle_audit_star_schema(self, args: Dict[str, Any]):
+        """Dimensional-model audit. Returns (text, result)."""
+        try:
+            model, err = await self._gather_model_metadata(
+                args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name"))
+            if err:
+                return (f"Error: {err}", {"error": err, "findings": [], "summary": {}})
+            result = star_schema.audit_star_schema(model)
+            s = result["summary"]
+            out = "=== Star Schema Audit ===\n\n"
+            out += f"Score: {s['score']}/100 (Grade {s['grade']})   Relationships: {s['relationships']}\n"
+            out += "Tables: " + ", ".join(f"{k}={v}" for k, v in s["tables_by_class"].items()) + "\n\n"
+            out += "--- Classification ---\n"
+            for name, c in result["classification"].items():
+                mark = " [marked date table]" if c.get("marked_date_table") else ""
+                out += f"  {name}: {c['class']}{mark}  (many-side of {c['many_side_of']}, one-side of {c['one_side_of']})\n"
+            out += "\n--- Findings ---\n"
+            for f in result["findings"]:
+                loc = f" [{f['table']}]" if f.get("table") else ""
+                out += f"  [{f['severity'].upper()}] {f['code']}{loc}: {f['message']}\n"
+                out += f"      fix: {f['recommendation']}\n"
+            if not result["findings"]:
+                out += "  Clean star schema. No findings.\n"
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error auditing star schema: {msg}", {"error": msg, "findings": [], "summary": {}})
+
+    @staticmethod
+    def _dax_col(table: str, column: str) -> str:
+        return "'" + str(table).replace("'", "''") + "'[" + str(column) + "]"
+
+    async def _handle_scan_referential_integrity(self, args: Dict[str, Any]):
+        """Orphan-key scan across active relationships. Returns (text, result)."""
+        try:
+            source = args.get("source") or "desktop"
+            model, err = await self._gather_model_metadata(source, args.get("workspace_name"), args.get("dataset_name"))
+            if err:
+                return (f"Error: {err}", {"error": err, "checked": 0, "violations": []})
+            run, err = await self._get_query_runner(source, args.get("workspace_name"), args.get("dataset_name"))
+            if err:
+                return (f"Error: {err}", {"error": err, "checked": 0, "violations": []})
+            loop = asyncio.get_event_loop()
+            max_samples = int(args.get("max_samples", 5) or 5)
+            checked, violations = 0, []
+            for r in model.get("relationships", []):
+                if not (r.get("from_table") and r.get("from_column") and r.get("to_table") and r.get("to_column")):
+                    continue
+                active = r.get("is_active", True)
+                if isinstance(active, str):
+                    active = active.strip().lower() in ("true", "1", "yes")
+                if not active:
+                    continue
+                fcol = self._dax_col(r["from_table"], r["from_column"])
+                tcol = self._dax_col(r["to_table"], r["to_column"])
+                q = (f"EVALUATE ROW(\"Orphans\", COUNTROWS(EXCEPT(DISTINCT({fcol}), DISTINCT({tcol}))))")
+                try:
+                    rows = await loop.run_in_executor(None, run, q)
+                    count = int(list(rows[0].values())[0] or 0) if rows else 0
+                except Exception as qe:
+                    violations.append({"relationship": f"{r['from_table']}[{r['from_column']}] -> {r['to_table']}[{r['to_column']}]",
+                                       "error": redact_secrets(str(qe), [self.client_secret])})
+                    continue
+                checked += 1
+                if count > 0:
+                    samples = []
+                    try:
+                        sq = f"EVALUATE TOPN({max_samples}, EXCEPT(DISTINCT({fcol}), DISTINCT({tcol})))"
+                        srows = await loop.run_in_executor(None, run, sq)
+                        samples = [list(x.values())[0] for x in (srows or [])]
+                    except Exception:
+                        pass
+                    violations.append({
+                        "relationship": f"{r['from_table']}[{r['from_column']}] -> {r['to_table']}[{r['to_column']}]",
+                        "orphan_keys": count,
+                        "samples": samples,
+                    })
+            result = {"checked": checked, "violations": violations}
+            out = "=== Referential Integrity Scan ===\n\n"
+            out += f"Relationships checked: {checked}   Violations: {len([v for v in violations if v.get('orphan_keys')])}\n\n"
+            for v in violations:
+                if v.get("error"):
+                    out += f"  [SKIPPED] {v['relationship']}: {v['error']}\n"
+                else:
+                    out += f"  [ORPHANS] {v['relationship']}: {v['orphan_keys']} key(s) missing on the one side"
+                    if v.get("samples"):
+                        out += f"  e.g. {', '.join(str(s) for s in v['samples'])}"
+                    out += "\n"
+            if not violations:
+                out += "  No orphan keys. Every fact key has a matching dimension row.\n"
+            else:
+                out += ("\nOrphan keys land in the hidden blank row and silently distort totals; fix the "
+                        "source join or add the missing dimension rows.\n")
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error scanning referential integrity: {msg}", {"error": msg, "checked": 0, "violations": []})
+
+    async def _handle_pbip_add_measures(self, args: Dict[str, Any]):
+        """Bulk-add measures offline into the loaded PBIP project's TMDL. Returns (text, result)."""
+        try:
+            table = args.get("table")
+            measures = args.get("measures") or []
+            if not table or not measures:
+                return ("Error: table and a non-empty measures array are required", {"error": "args", "created": []})
+            lint_note = ""
+            if not args.get("skip_lint"):
+                lint = dax_lint.lint_measures([{"name": m.get("name"), "expression": m.get("expression", "")} for m in measures])
+                warn = [f for f in lint["findings"] if f["severity"] == "warning"]
+                if warn:
+                    lint_note = f"\nLint: {len(warn)} warning(s) - " + "; ".join(
+                        f"{f['object']}: {f['rule_id']}" for f in warn[:8]) + " (created anyway; review suggested)\n"
+            connector = self._get_pbip_connector()
+            write_fn = lambda: connector.add_measures(table, measures)
+            res = await asyncio.get_event_loop().run_in_executor(None, write_fn)
+            if not res.get("success"):
+                return (f"Error: {res.get('message')}", {"error": res.get("message"), "created": []})
+            out = f"Added {len(res.get('created', []))} measure(s) to '{table}' in {res.get('path')}.{lint_note}"
+            out += "\nClose and reopen Power BI Desktop to see them. Validate with pbip_validate."
+            return (out, {"created": res.get("created", []), "path": res.get("path")})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error adding measures: {msg}", {"error": msg, "created": []})
+
+    async def _handle_pbip_create_date_table(self, args: Dict[str, Any]) -> str:
+        """Create an offline DAX date-dimension table in the loaded PBIP project."""
+        try:
+            connector = self._get_pbip_connector()
+            fn = lambda: connector.create_date_table(
+                name=args.get("name") or "Date",
+                start_date=args.get("start_date") or "2015-01-01",
+                end_date=args.get("end_date") or "2030-12-31",
+                fiscal_year_start_month=args.get("fiscal_year_start_month"),
+            )
+            res = await asyncio.get_event_loop().run_in_executor(None, fn)
+            if not res.get("success"):
+                return f"Error: {res.get('message')}"
+            return (f"Date table '{res.get('table')}' created at {res.get('path')} "
+                    f"(marked as date table; {res.get('columns')} columns).\n"
+                    "Relate your fact date columns to it, then reopen Power BI Desktop.")
+        except Exception as e:
+            return f"Error creating date table: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_pbip_add_calculation_group(self, args: Dict[str, Any]) -> str:
+        """Create a calculation group offline in the loaded PBIP project."""
+        try:
+            name = args.get("name")
+            if not name:
+                return "Error: name is required"
+            items = args.get("items")
+            if (args.get("preset") or "").lower() == "time_intelligence":
+                if not args.get("date_column"):
+                    return "Error: date_column is required for the time_intelligence preset"
+                items = tmdl_authoring.time_intelligence_calc_items(args["date_column"])
+            if not items:
+                return "Error: provide items or preset='time_intelligence' with date_column"
+            connector = self._get_pbip_connector()
+            fn = lambda: connector.add_calculation_group(
+                name, items, column_name=args.get("column_name") or "Calculation",
+                precedence=int(args.get("precedence", 1) or 1))
+            res = await asyncio.get_event_loop().run_in_executor(None, fn)
+            if not res.get("success"):
+                return f"Error: {res.get('message')}"
+            return (f"Calculation group '{name}' created at {res.get('path')} with "
+                    f"{res.get('items')} item(s).\nReopen Power BI Desktop; drop the "
+                    f"'{args.get('column_name') or 'Calculation'}' column on a slicer or matrix to use it.")
+        except Exception as e:
+            return f"Error creating calculation group: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_pbip_add_hierarchy(self, args: Dict[str, Any]) -> str:
+        """Add a hierarchy offline to a table in the loaded PBIP project."""
+        try:
+            table, name, levels = args.get("table"), args.get("name"), args.get("levels") or []
+            if not table or not name or not levels:
+                return "Error: table, name, and a non-empty levels array are required"
+            connector = self._get_pbip_connector()
+            fn = lambda: connector.add_hierarchy(table, name, levels)
+            res = await asyncio.get_event_loop().run_in_executor(None, fn)
+            if not res.get("success"):
+                return f"Error: {res.get('message')}"
+            return (f"Hierarchy '{name}' added to '{table}' ({' > '.join(levels)}).\n"
+                    "Reopen Power BI Desktop to see it.")
+        except Exception as e:
+            return f"Error adding hierarchy: {redact_secrets(str(e), [self.client_secret])}"
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus

@@ -3,6 +3,55 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.6.0] - 2026-07-06 — Data modelling, warehousing & bulk DAX
+
+Grew the server from **70 to 78 tools**, making it a first-class data-modelling and
+data-warehousing assistant. All TMDL emission was shape-verified against the TMDL language
+reference and real Power BI Desktop PBIP exports BEFORE implementation (tab indentation,
+`///` doc-comment descriptions, multi-line expression placement, `isNameInferred` +
+bracketed `sourceColumn`, `dataCategory: Time` + `isKey` date marking, calculation-group
+companion columns and `discourageImplicitMeasures`).
+
+### Added — bulk DAX creation
+- **`generate_measure_suite`** — expand one base measure/column into a governed suite:
+  time intelligence (YTD/QTD/MTD/PY/YoY/YoY %/MoM %/rolling 3M+12M), share-of-total ratios
+  (ALL and ALLSELECTED), dense ranks (total-safe via HASONEVALUE), or column statistics.
+  Every measure is self-contained DAX with a format string, display folder, and description.
+  `target` = `none` (return the suite), `pbip` (write offline into TMDL), `live` (TOM batch).
+- **`batch_create_measures`** — all-or-nothing live bulk creation; every expression is
+  validated against the model first, duplicates rejected up front, transactions honored.
+- **`pbip_add_measures`** — bulk-append measures OFFLINE into a table's `.tmdl` with a
+  collision-checked batch (model-wide and intra-batch) and dax_lint advisories.
+- New pure module `dax_generator.py`; generated DAX is lint-clean by construction (tested).
+
+### Added — data modelling (offline TMDL authoring)
+- **`pbip_create_date_table`** — a complete calculated date dimension: ADDCOLUMNS(CALENDAR())
+  with Year/Quarter/Month/Week/Day, sorted label columns, hidden sort keys, optional fiscal
+  year/quarter, marked as the model's date table (`dataCategory: Time` + `isKey`).
+- **`pbip_add_calculation_group`** — calculation groups with custom items or a ready
+  `time_intelligence` preset (7 items over SELECTEDMEASURE(), YoY % with a dynamic format
+  string). Sets `discourageImplicitMeasures` in model.tmdl (engine requirement) and warns
+  when compatibilityLevel < 1470.
+- **`pbip_add_hierarchy`** — drill-down hierarchies from existing (validated) columns.
+- New pure module `tmdl_authoring.py`: measure/date-table/calc-group/hierarchy emitters that
+  round-trip through the connector's own TMDL parser (tested).
+
+### Added — data warehousing
+- **`audit_star_schema`** — classifies every table from relationship topology (fact /
+  dimension / date dimension / bridge / disconnected) and flags snowflake chains,
+  bidirectional filters, many-to-many, fact-to-fact joins, missing or unmarked date tables,
+  measure-less facts, and text attributes stranded on facts; 0-100 score, grade, and a
+  concrete recommendation per finding. (New pure module `star_schema.py`.)
+- **`scan_referential_integrity`** — per-relationship orphan-key scan (EXCEPT counts with
+  sample keys): the cause of the hidden blank row and silently wrong totals.
+
+### Changed
+- TOM connector: `create_measure` gains `display_folder`; new `batch_create_measures`
+  (pre-validated, all-or-nothing).
+- 3 new test suites (dax_generator, star_schema, tmdl_authoring); 23 total, all passing.
+
+---
+
 ## [3.5.1] - 2026-06-22 — Security + UAT hardening
 
 A full UAT and security audit (adversarially verified) of the 70-tool surface. No new tools; the

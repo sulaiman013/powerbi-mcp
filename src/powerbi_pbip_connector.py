@@ -52,6 +52,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
 import pbir_authoring
+import tmdl_authoring
 
 logger = logging.getLogger(__name__)
 
@@ -839,6 +840,163 @@ class PowerBIPBIPConnector:
                         f"Report references '{table}[{field}]' but '{field}' is not in table '{table}'",
                         f"{table}[{field}]"))
         return errors
+
+    # ==================== TMDL MODEL AUTHORING (offline) ====================
+
+    def _tables_folder(self) -> Optional[Path]:
+        if self.current_project and self.current_project.semantic_model_folder:
+            return self.current_project.semantic_model_folder / "definition" / "tables"
+        return None
+
+    def _find_table_file(self, table_name: str) -> Optional[Path]:
+        """Locate the .tmdl file that declares the given table (one table per file)."""
+        want = table_name.strip().lower()
+        for tmdl in (self.current_project.tmdl_files if self.current_project else []):
+            try:
+                content = self._read_text(tmdl)
+            except Exception:
+                continue
+            m = re.search(r"^\s*table\s+(?:'([^']+)'|(\S+))", content, re.MULTILINE)
+            if m and (m.group(1) or m.group(2)).replace("''", "'").strip().lower() == want:
+                return tmdl
+        return None
+
+    def add_measures(self, table: str, measures: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Bulk-append measures to a table's .tmdl (offline). The whole batch is checked for
+        name collisions (model-wide and within the batch) BEFORE anything is written."""
+        if not self.current_project:
+            return {"success": False, "message": "No PBIP project loaded. Use 'pbip_load_project' first."}
+        path = self._find_table_file(table)
+        if not path:
+            return {"success": False, "message": f"Table '{table}' not found in the model"}
+        index = self._model_field_index()
+        existing = {f.lower() for fields in index.values() for f in fields}
+        problems, seen = [], set()
+        for i, m in enumerate(measures):
+            name = (m.get("name") or "").strip()
+            if not name or not (m.get("expression") or "").strip():
+                problems.append(f"#{i + 1}: needs both a name and an expression")
+                continue
+            if name.lower() in existing:
+                problems.append(f"'{name}': already exists in the model")
+            if name.lower() in seen:
+                problems.append(f"'{name}': duplicated within the batch")
+            seen.add(name.lower())
+        if problems:
+            return {"success": False,
+                    "message": "Batch rejected; nothing was written:\n  - " + "\n  - ".join(problems)}
+        if self.auto_backup and not self.current_project.backup_path:
+            self.create_backup()
+        content = self._read_text(path)
+        block = tmdl_authoring.render_measures(measures)
+        self._write_text(path, tmdl_authoring.append_block(content, block))
+        return {"success": True, "created": [m["name"] for m in measures], "path": str(path)}
+
+    def create_date_table(self, name: str = "Date", start_date: str = "2015-01-01",
+                          end_date: str = "2030-12-31",
+                          fiscal_year_start_month: Optional[int] = None) -> Dict[str, Any]:
+        """Create a calculated date-dimension table as a new .tmdl file (offline), marked as
+        the model's date table."""
+        if not self.current_project:
+            return {"success": False, "message": "No PBIP project loaded. Use 'pbip_load_project' first."}
+        tables_dir = self._tables_folder()
+        if not tables_dir:
+            return {"success": False, "message": "No semantic model definition/tables folder found"}
+        if self._find_table_file(name):
+            return {"success": False, "message": f"Table '{name}' already exists"}
+        try:
+            content = tmdl_authoring.build_date_table(name, start_date, end_date, fiscal_year_start_month)
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
+        if self.auto_backup and not self.current_project.backup_path:
+            self.create_backup()
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        path = tables_dir / f"{name}.tmdl"
+        self._write_text(path, content)
+        self.current_project.tmdl_files.append(path)
+        n_cols = len(re.findall(r"^\tcolumn ", content, re.MULTILINE))
+        return {"success": True, "table": name, "path": str(path), "columns": n_cols}
+
+    def add_calculation_group(self, name: str, items: List[Dict[str, Any]],
+                              column_name: str = "Calculation", precedence: int = 1) -> Dict[str, Any]:
+        """Create a calculation-group table as a new .tmdl file (offline)."""
+        if not self.current_project:
+            return {"success": False, "message": "No PBIP project loaded. Use 'pbip_load_project' first."}
+        tables_dir = self._tables_folder()
+        if not tables_dir:
+            return {"success": False, "message": "No semantic model definition/tables folder found"}
+        if self._find_table_file(name):
+            return {"success": False, "message": f"Table '{name}' already exists"}
+        bad = [it for it in items if not (it.get("name") and it.get("expression"))]
+        if bad:
+            return {"success": False, "message": "Every calculation item needs a name and an expression"}
+        if self.auto_backup and not self.current_project.backup_path:
+            self.create_backup()
+        content = tmdl_authoring.build_calculation_group(name, items, column_name, precedence)
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        path = tables_dir / f"{name}.tmdl"
+        self._write_text(path, content)
+        self.current_project.tmdl_files.append(path)
+        # Calculation groups require discourageImplicitMeasures on the model; the engine
+        # refuses a calc group without it. Set the flag in model.tmdl if absent.
+        flag_set = False
+        model_tmdl = self.current_project.semantic_model_folder / "definition" / "model.tmdl"
+        try:
+            if model_tmdl.exists():
+                mcontent = self._read_text(model_tmdl)
+                if "discourageImplicitMeasures" not in mcontent:
+                    mm = re.search(r"^model\s+\S+.*$", mcontent, re.MULTILINE)
+                    if mm:
+                        insert_at = mm.end()
+                        mcontent = (mcontent[:insert_at] + "\n\tdiscourageImplicitMeasures"
+                                    + mcontent[insert_at:])
+                        self._write_text(model_tmdl, mcontent)
+                        flag_set = True
+        except Exception as e:
+            logger.warning(f"Could not set discourageImplicitMeasures in model.tmdl: {e}")
+        # Calculation groups need compatibilityLevel >= 1470; warn (never auto-upgrade,
+        # since a level bump is irreversible).
+        compat_warning = None
+        try:
+            db_tmdl = self.current_project.semantic_model_folder / "definition" / "database.tmdl"
+            if db_tmdl.exists():
+                dm = re.search(r"compatibilityLevel:\s*(\d+)", self._read_text(db_tmdl))
+                if dm and int(dm.group(1)) < 1470:
+                    compat_warning = (f"database.tmdl compatibilityLevel is {dm.group(1)}; calculation "
+                                      "groups need >= 1470 (Desktop writes 1550). Upgrade the model in "
+                                      "Power BI Desktop before relying on this group.")
+        except Exception:
+            pass
+        return {"success": True, "table": name, "path": str(path), "items": len(items),
+                "discourage_implicit_measures_set": flag_set, "compat_warning": compat_warning}
+
+    def add_hierarchy(self, table: str, name: str, levels: List[str]) -> Dict[str, Any]:
+        """Append a hierarchy to a table's .tmdl (offline). Level columns must exist."""
+        if not self.current_project:
+            return {"success": False, "message": "No PBIP project loaded. Use 'pbip_load_project' first."}
+        path = self._find_table_file(table)
+        if not path:
+            return {"success": False, "message": f"Table '{table}' not found in the model"}
+        index = self._model_field_index()
+        cols = {f.lower() for f, meta in index.get(table, {}).items() if meta.get("kind") == "column"}
+        # _model_field_index keys by declared table name; find case-insensitively
+        for tname, fields in index.items():
+            if tname.lower() == table.lower():
+                cols = {f.lower() for f, meta in fields.items() if meta.get("kind") == "column"}
+                break
+        missing = [c for c in levels if c.lower() not in cols]
+        if missing:
+            return {"success": False,
+                    "message": f"Column(s) not found in '{table}': {', '.join(missing)}"}
+        content = self._read_text(path)
+        if re.search(rf"^\s*hierarchy\s+(?:'{re.escape(name)}'|{re.escape(name)})\s*$",
+                     content, re.MULTILINE | re.IGNORECASE):
+            return {"success": False, "message": f"Hierarchy '{name}' already exists on '{table}'"}
+        if self.auto_backup and not self.current_project.backup_path:
+            self.create_backup()
+        block = tmdl_authoring.render_hierarchy(name, levels)
+        self._write_text(path, tmdl_authoring.append_block(content, block))
+        return {"success": True, "table": table, "hierarchy": name, "levels": levels, "path": str(path)}
 
     def _read_text(self, file_path) -> str:
         """Read a text file, remembering its encoding (utf-8 vs utf-8-sig/BOM) so it can be
