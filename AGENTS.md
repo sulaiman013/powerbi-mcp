@@ -40,6 +40,11 @@ Best Practice Analyzer, AI-readiness, security) even without ADOMD/.NET.
   -> remediate top issues -> re-run.
 - **Improve DAX:** `dax_lint` (whole model or one measure) -> `dax_suggest_rewrite` ->
   apply the rewrite with `create_measure`/`batch_update_measures` (which `validate_dax` first).
+- **Bulk-create measures:** `generate_measure_suite` (target='none' to preview) -> review ->
+  re-run with target='pbip' (offline) or target='live' / `batch_create_measures` (validated batch).
+- **Model a warehouse:** `audit_star_schema` -> `pbip_create_date_table` (if no date dim) ->
+  `create_relationship` fact-to-date -> `pbip_add_calculation_group` (time_intelligence preset)
+  or `generate_measure_suite` -> `pbip_add_hierarchy` -> `scan_referential_integrity` to verify.
 - **Safe rename:** `scan_measure_dependencies` + `pbip_scan_broken_refs` ->
   `pbip_load_project` -> `pbip_rename_*` -> `pbip_validate`.
 - **Author a report (PBIR, preview):** `pbip_load_project` -> `pbir_add_page` ->

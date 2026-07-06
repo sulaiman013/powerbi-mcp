@@ -1,6 +1,6 @@
 # Tool Reference
 
-The Power BI MCP server exposes **70 tools**, plus MCP **resources**, **prompts**, and
+The Power BI MCP server exposes **78 tools**, plus MCP **resources**, **prompts**, and
 **completion**. Every tool carries MCP annotations (`readOnlyHint` / `destructiveHint` /
 `idempotentHint` / `openWorldHint`) so clients can auto-approve reads and confirm writes.
 
@@ -134,6 +134,32 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 |------|--|-------------|
 | `bpa_validate_rules` | 🟢 | Validate a custom BPA rules JSON (required fields, valid Severity/Scope, duplicate IDs, destructive low-severity fixes, stray runtime fields); optional `fix` returns a cleaned copy |
 | `bpa_audit_rule_sources` | 🟢 | Audit where BPA rules live for the loaded project: embedded model rules, external rule-file URLs, ignored rule IDs, plus any local user/machine BPARules.json |
+
+## Bulk DAX creation — 3
+| Tool | | Description |
+|------|--|-------------|
+| `generate_measure_suite` | 🟡 | Expand a base measure/column into a governed suite (time intelligence / ratios / ranking / column stats), each with format, folder, description; `target` = none / pbip (offline TMDL) / live (validated TOM batch) |
+| `batch_create_measures` | 🟡 | All-or-nothing live bulk measure creation (each expression validated first; honors transactions) |
+| `pbip_add_measures` | 🔴 | Bulk-append measures OFFLINE into a table's `.tmdl` (collision-checked batch; descriptions as `///` doc-comments) |
+
+## Data modelling (offline TMDL) — 3
+| Tool | | Description |
+|------|--|-------------|
+| `pbip_create_date_table` | 🔴 | Generate a complete calculated date-dimension table, marked as date table (sorted month/quarter labels, optional fiscal year) |
+| `pbip_add_calculation_group` | 🔴 | Create a calculation group (custom items or the time-intelligence preset); sets `discourageImplicitMeasures`, warns on low compatibilityLevel |
+| `pbip_add_hierarchy` | 🔴 | Add a drill-down hierarchy from existing columns (validated) |
+
+> All TMDL emission matches Power BI Desktop's own serialization, verified against the TMDL
+> language reference and real PBIP exports: tab indentation, `///` doc-comment descriptions,
+> multi-line expression placement, `isNameInferred` + bracketed `sourceColumn` on calculated
+> tables, `dataCategory: Time` + `isKey` date marking, and calc-group Name/Ordinal companion
+> columns.
+
+## Warehouse audit — 2
+| Tool | | Description |
+|------|--|-------------|
+| `audit_star_schema` | 🟢 | Classify tables (fact/dimension/date/bridge/disconnected) and flag snowflakes, bidirectional filters, M2M, fact-to-fact joins, missing/unmarked date table, text-on-fact; scored with recommendations |
+| `scan_referential_integrity` | 🟢 | Orphan-key scan per active relationship (EXCEPT counts + sample keys) against the connected model |
 
 ## Documentation, diff & CI — 5
 | Tool | | Description |

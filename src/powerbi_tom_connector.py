@@ -963,7 +963,8 @@ class PowerBITOMConnector:
     # ==================== CREATE OPERATIONS ====================
 
     def create_measure(self, table_name: str, measure_name: str, expression: str,
-                       format_string: Optional[str] = None, description: Optional[str] = None) -> OperationResult:
+                       format_string: Optional[str] = None, description: Optional[str] = None,
+                       display_folder: Optional[str] = None) -> OperationResult:
         """
         Create a new measure
 
@@ -973,6 +974,7 @@ class PowerBITOMConnector:
             expression: DAX expression
             format_string: Optional format string
             description: Optional description
+            display_folder: Optional display folder (use \\ for nesting)
 
         Returns:
             OperationResult with success status
@@ -998,6 +1000,8 @@ class PowerBITOMConnector:
                 measure.FormatString = format_string
             if description:
                 measure.Description = description
+            if display_folder:
+                measure.DisplayFolder = display_folder
 
             table.Measures.Add(measure)
             self._changes_pending = True
@@ -1008,6 +1012,77 @@ class PowerBITOMConnector:
         except Exception as e:
             logger.error(f"Failed to create measure: {e}")
             return OperationResult(False, f"Failed to create measure: {e}")
+
+    def batch_create_measures(self, table_name: str, measures: List[Dict[str, Any]],
+                              auto_save: bool = True) -> OperationResult:
+        """
+        Create many measures on one table in a single pass (all-or-nothing).
+
+        Pre-validates the whole batch (table exists, no duplicate names in the model or within
+        the batch) BEFORE adding anything, so a failure cannot leave a half-created suite. Honors
+        an open tom transaction via auto_save=False.
+
+        Args:
+            table_name: Table to add the measures to
+            measures: [{name, expression, format_string?, description?, display_folder?}]
+            auto_save: Save to the model at the end (False inside a transaction)
+        """
+        if not self._ensure_connected():
+            return OperationResult(False, "Not connected")
+        if not measures:
+            return OperationResult(False, "No measures provided")
+
+        try:
+            table = self.model.Tables.Find(table_name)
+            if not table:
+                return OperationResult(False, f"Table '{table_name}' not found")
+
+            # Validate the whole batch up front.
+            problems = []
+            seen = set()
+            for i, m in enumerate(measures):
+                name = (m.get("name") or "").strip()
+                if not name or not (m.get("expression") or "").strip():
+                    problems.append(f"#{i + 1}: needs both a name and an expression")
+                    continue
+                if name.lower() in seen:
+                    problems.append(f"'{name}': duplicated within the batch")
+                seen.add(name.lower())
+                for t in self.model.Tables:
+                    if t.Measures.Find(name):
+                        problems.append(f"'{name}': already exists in table '{t.Name}'")
+                        break
+            if problems:
+                return OperationResult(False, "Batch rejected; nothing was created:\n  - " + "\n  - ".join(problems))
+
+            created = []
+            for m in measures:
+                measure = TOM.Measure()
+                measure.Name = m["name"]
+                measure.Expression = m["expression"]
+                if m.get("format_string"):
+                    measure.FormatString = m["format_string"]
+                if m.get("description"):
+                    measure.Description = m["description"]
+                if m.get("display_folder"):
+                    measure.DisplayFolder = m["display_folder"]
+                table.Measures.Add(measure)
+                created.append(m["name"])
+            self._changes_pending = True
+
+            if auto_save:
+                save = self.save_changes()
+                if not save.success:
+                    return OperationResult(False, f"Measures staged but save failed: {save.message}")
+
+            logger.info(f"Created {len(created)} measures in table '{table_name}'")
+            return OperationResult(True, f"Created {len(created)} measure(s) in '{table_name}': "
+                                          + ", ".join(created),
+                                   details={"created": created})
+
+        except Exception as e:
+            logger.error(f"Failed to batch-create measures: {e}")
+            return OperationResult(False, f"Failed to batch-create measures: {e}")
 
     def delete_measure(self, measure_name: str, table_name: Optional[str] = None) -> OperationResult:
         """

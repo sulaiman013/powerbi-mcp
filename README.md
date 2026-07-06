@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue?style=flat-square" alt="MCP compatible"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-green?style=flat-square" alt="Python 3.10+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-70-purple?style=flat-square" alt="70 tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-78-purple?style=flat-square" alt="78 tools"></a>
   <a href="#"><img src="https://img.shields.io/badge/Live-Windows-lightgrey?style=flat-square" alt="Windows for live connectivity"></a>
   <a href="#"><img src="https://img.shields.io/badge/Offline-cross--platform-success?style=flat-square" alt="Offline cross-platform"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT license"></a>
@@ -30,14 +30,17 @@ Power BI content through one consistent interface. It talks to a local Power BI 
 a published Power BI Service dataset, or Power BI Project (PBIP) files on disk, and wraps every
 operation in a security and governance layer.
 
-It exposes **70 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-20 assert-based test suites.
+It exposes **78 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
+23 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
 | **Dual connectivity** | Power BI Desktop (local) and Power BI Service (cloud) |
 | **Natural-language DAX** | Run, validate, and optimize DAX through conversation |
 | **Safe refactoring** | PBIP-based renames that update the model **and** the report visuals |
+| **Bulk DAX creation** | Measure-suite generator (time intelligence, ratios, ranks) written offline or live |
+| **Data modelling** | Date-dimension generator, calculation groups, hierarchies, offline TMDL authoring |
+| **Warehouse audit** | Star-schema classification + findings, referential-integrity orphan scan |
 | **Report authoring (preview)** | Add pages, visuals, and field bindings to PBIR reports from the agent |
 | **DAX safety loop** | Validate before committing; impact analysis; atomic transactions |
 | **Model quality** | Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage analysis |
@@ -88,9 +91,28 @@ limit which rows a user can see).
   a chart, card, table, or slicer on it, and bind fields by role. It checks each field exists in
   the model first, picks measure vs aggregated-column automatically, and writes Power-BI-faithful
   PBIR files (right down to the `nativeQueryRef` and `Sum(...)` query refs Desktop itself writes).
-  > "On the PBIP project, add an 'Overview' page with a bar chart of Sales by Region." Best Practice Analyzer (performance, DAX,
+  > "On the PBIP project, add an 'Overview' page with a bar chart of Sales by Region."
+- **Check model quality like a senior reviewer.** Best Practice Analyzer (performance, DAX,
   naming, formatting), an AI-readiness score, storage/size analysis, and query-performance hints.
   > "Audit this model and give me the top issues to fix before I ship."
+- **Bulk-create governed measure suites.** Expand one base measure into a full time-intelligence
+  set (YTD, QTD, MTD, PY, YoY, YoY %, MoM %, rolling windows), share-of-total ratios, ranks, or
+  column statistics. Every measure arrives with a format string, display folder, and description,
+  and can be written straight into the PBIP files offline or created live in one validated batch.
+  > "Generate the full time-intelligence suite for 'Total Sales' over Date[Date] and add it to the model."
+- **Build the data-warehouse backbone.** Generate a complete, marked date-dimension table
+  (with sorted month/quarter labels and optional fiscal columns), create calculation groups
+  (the professional alternative to measure explosion), and add drill-down hierarchies, all
+  offline into the PBIP project.
+  > "Create a date table from 2018 to 2030 with a July fiscal year, and a time-intelligence calculation group."
+- **Audit the model as a star schema.** Classifies every table (fact, dimension, date dimension,
+  bridge, disconnected) from relationship topology and flags snowflake chains, bidirectional
+  filters, many-to-many, fact-to-fact joins, missing or unmarked date tables, and text attributes
+  stranded on facts, with a score and a fix per finding.
+  > "Audit my model as a star schema and tell me what a warehouse architect would flag."
+- **Catch orphan keys before they distort totals.** Scan every relationship for fact keys with
+  no matching dimension row (the cause of the hidden blank row).
+  > "Scan referential integrity and show me sample orphan keys per relationship."
 - **Lint your DAX for performance traps.** A static analyzer flags the classic anti-patterns
   (FILTER over a whole table inside CALCULATE, nested CALCULATE, `/` instead of DIVIDE, IFERROR,
   EARLIER, SUMMARIZE used for aggregation, blank-suppressing `+ 0`, and unrecognized or
@@ -227,7 +249,7 @@ docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
 
 ## Tools
 
-70 tools across the categories below. The full reference, with parameters and read / write /
+78 tools across the categories below. The full reference, with parameters and read / write /
 destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Category | Count | Highlights |
@@ -247,6 +269,9 @@ destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | Authoring helpers | 2 | `generate_svg_measure` (sparkline/bullet/progress/pill), `audit_naming` |
 | PBIX onboarding | 2 | `pbix_inspect`, `pbix_extract` (crack open a real `.pbix`) |
 | Custom BPA governance | 2 | `bpa_validate_rules`, `bpa_audit_rule_sources` |
+| Bulk DAX creation | 3 | `generate_measure_suite`, `batch_create_measures`, `pbip_add_measures` |
+| Data modelling (offline TMDL) | 3 | `pbip_create_date_table`, `pbip_add_calculation_group`, `pbip_add_hierarchy` |
+| Warehouse audit | 2 | `audit_star_schema`, `scan_referential_integrity` |
 | Documentation, diff, CI | 5 | `export_data_dictionary`, `model_snapshot`, `model_diff`, `pre_deploy_gate`, `run_dax_tests` |
 | Diagnostics and ops | 4 | `refresh_doctor`, `find_unused_objects`, `impact_analysis`, `rls_test_harness` |
 | Governance-ops fleet (admin) | 3 | `cross_workspace_lineage`, `fleet_refresh_monitor`, `usage_and_orphan_analytics` |
@@ -328,7 +353,7 @@ tables:
 
 | Doc | Contents |
 |-----|----------|
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 70 tools, resources, prompts, env vars |
+| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 78 tools, resources, prompts, env vars |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, security layer, registry pattern, verification methodology, file map |
 | [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
 | [CHANGELOG.md](CHANGELOG.md) | Everything that changed, by milestone |
@@ -356,7 +381,7 @@ those paths needs a Windows + Power BI / Fabric environment.
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server: 70 tools + resources/prompts/completion
+│   ├── server.py                    # MCP server: 78 tools + resources/prompts/completion
 │   ├── powerbi_desktop_connector.py # Desktop (ADOMD) + RLS + VertiPaq DMVs
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
 │   ├── powerbi_rest_connector.py    # REST: discovery, refresh, admin Scanner/Activity
@@ -370,6 +395,9 @@ powerbi-mcp/
 │   ├── naming_audit.py             # Naming-convention audit -> rename plan
 │   ├── pbix_tools.py               # PBIX (.pbix ZIP) inspect/extract + layout decode
 │   ├── bpa_authoring.py            # Custom BPA rule validation + rule-source audit
+│   ├── dax_generator.py            # Bulk measure-suite generation (time intel, ratios, ranks)
+│   ├── star_schema.py              # Star-schema classification + warehouse audit
+│   ├── tmdl_authoring.py           # TMDL emitters: measures, date table, calc groups, hierarchies
 │   ├── refresh_diagnostics.py       # Refresh error classification
 │   ├── governance.py                # Scanner summary + activity aggregation
 │   └── security/                    # security_layer, access_policy, pii_detector, audit_logger
