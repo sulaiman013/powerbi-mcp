@@ -4268,9 +4268,12 @@ class PowerBIMCPServer:
         except desktop_bridge.BridgeError as e:
             hint = ""
             if e.code == -32000:
-                hint = ("\nHint: the Desktop Bridge's snapshot/reload paths are built for PBIP/PBIR "
-                        "projects opened from disk. If a .pbix is open, save it as a Power BI "
-                        "Project (.pbip) and reopen it, then retry.")
+                hint = ("\nNote: report.snapshot.capture is a Desktop-side preview method and can "
+                        "return an internal error (Desktop -32000) independent of this server - "
+                        "observed even on a valid PBIP and for an unknown page id, so it is a "
+                        "Power BI Desktop limitation on the current build, not a client fault. "
+                        "bridge_status, bridge_manifest, and bridge_reload work. Confirm the page "
+                        "renders in Desktop and retry on a later Desktop build.")
             return (f"Bridge refused the screenshot: {e}{hint}", {"error": str(e), "screenshots": []})
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])

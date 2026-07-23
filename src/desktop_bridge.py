@@ -164,9 +164,11 @@ class DesktopBridgeClient:
         return self.call("application.state.get/v1")
 
     def capture_snapshot(self, page_id: str, scale: Optional[float] = None) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"pageId": page_id}
-        if scale is not None:
-            params["scale"] = float(scale)
+        # The manifest marks BOTH pageId and scale as required (scale is nullable but the key
+        # must be present; omitting it null-refs inside Desktop). Learn's doc says optional -
+        # trust the manifest.
+        params: Dict[str, Any] = {"pageId": page_id,
+                                  "scale": float(scale) if scale is not None else 1.0}
         return self.call("report.snapshot.capture/v1", params)
 
     def reload_file(self, reload_model_definition: bool = True) -> Dict[str, Any]:
