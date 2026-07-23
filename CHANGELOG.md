@@ -29,10 +29,19 @@ Desktop, then screenshot the rendered pages so the agent can SEE its work.
   `pbix_tools.read_pbir_pages` reads the page list of a modern `.pbix` from its embedded
   PBIR definition.
 - `tests/test_desktop_bridge.py` (framing round-trip, fake-pipe client, discovery, page
-  resolution, unsaved-changes guard). Verified LIVE against a running Desktop: pipe
-  discovery, manifest, application state, and the reload guard all confirmed; snapshot and
-  reload require the file to be opened as a PBIP/PBIR project (the tool explains this when
-  a `.pbix` is open).
+  resolution, unsaved-changes guard, snapshot param shape).
+
+### Verified live (Power BI Desktop 2.156.951.0, PBIP open)
+- **Working:** pipe discovery, `bridge.manifest`, `application.state.get` (real file path +
+  unsaved flag), page enumeration, msmdsrv-port correlation, and `file.reload` in BOTH states
+  (clean -> `success: true`; dirty -> the unsaved-changes guard correctly refuses). The
+  bridge-discovered port chains straight into `desktop_connect` for a full author-and-verify
+  loop (add measure -> query value -> reload) end to end.
+- **Known Desktop-side limitation:** `report.snapshot.capture` returns an internal
+  `-32000 NullReferenceException` on this build for ANY input (including an unknown page id,
+  so it fails before page validation) - a Power BI Desktop preview defect, not a client fault.
+  `bridge_screenshot` sends the manifest-required `scale` param and surfaces the Desktop error
+  with an honest note. Expected to work on a later Desktop build.
 
 ---
 

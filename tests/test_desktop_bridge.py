@@ -79,6 +79,19 @@ def test_client(monkey_open):
     check("reload params + result", r.get("success") is True
           and sent["params"] == {"reloadModelDefinition": False})
 
+    # snapshot: the live manifest marks BOTH pageId and scale required (scale nullable but the
+    # key must be present, else Desktop null-refs). Assert we always send scale.
+    snap_pipe = FakePipe({"jsonrpc": "2.0", "id": 1, "result": {"payload": "AAAA", "pageDisplayName": "P1"}})
+    monkey_open(snap_pipe)
+    c.capture_snapshot("page1")
+    sp = json.loads(snap_pipe.wrote.split(b"\r\n\r\n", 1)[1])["params"]
+    check("snapshot always sends scale (default 1.0)", sp == {"pageId": "page1", "scale": 1.0}, str(sp))
+    snap_pipe2 = FakePipe({"jsonrpc": "2.0", "id": 1, "result": {"payload": "AAAA"}})
+    monkey_open(snap_pipe2)
+    c.capture_snapshot("page1", scale=2.5)
+    sp2 = json.loads(snap_pipe2.wrote.split(b"\r\n\r\n", 1)[1])["params"]
+    check("snapshot passes explicit scale", sp2["scale"] == 2.5)
+
 
 def test_discovery():
     print("\n== discovery parses pipe names ==")
