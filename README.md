@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue?style=flat-square" alt="MCP compatible"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-green?style=flat-square" alt="Python 3.10+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-78-purple?style=flat-square" alt="78 tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-82-purple?style=flat-square" alt="82 tools"></a>
   <a href="#"><img src="https://img.shields.io/badge/Live-Windows-lightgrey?style=flat-square" alt="Windows for live connectivity"></a>
   <a href="#"><img src="https://img.shields.io/badge/Offline-cross--platform-success?style=flat-square" alt="Offline cross-platform"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT license"></a>
@@ -30,8 +30,8 @@ Power BI content through one consistent interface. It talks to a local Power BI 
 a published Power BI Service dataset, or Power BI Project (PBIP) files on disk, and wraps every
 operation in a security and governance layer.
 
-It exposes **78 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-23 assert-based test suites.
+It exposes **82 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
+24 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
@@ -42,6 +42,7 @@ It exposes **78 tools** plus MCP **resources**, **prompts**, and **completion**,
 | **Data modelling** | Date-dimension generator, calculation groups, hierarchies, offline TMDL authoring |
 | **Warehouse audit** | Star-schema classification + findings, referential-integrity orphan scan |
 | **Report authoring (preview)** | Add pages, visuals, and field bindings to PBIR reports from the agent |
+| **Desktop Bridge (preview)** | Hot-reload the open report and screenshot pages in the RUNNING Desktop |
 | **DAX safety loop** | Validate before committing; impact analysis; atomic transactions |
 | **Model quality** | Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage analysis |
 | **Diagnostics and ops** | Refresh-failure triage, unused-object detection, RLS test matrix |
@@ -92,6 +93,11 @@ limit which rows a user can see).
   the model first, picks measure vs aggregated-column automatically, and writes Power-BI-faithful
   PBIR files (right down to the `nativeQueryRef` and `Sum(...)` query refs Desktop itself writes).
   > "On the PBIP project, add an 'Overview' page with a bar chart of Sales by Region."
+- **Close the loop with the running Desktop (preview).** Through Microsoft's Power BI Desktop
+  Bridge (June 2026+), the agent can see which file is open and whether it has unsaved changes,
+  hot-reload the report from disk after offline edits (no close/reopen), and capture PNG
+  screenshots of report pages so it can visually verify its own work. Edit, reload, look, fix.
+  > "Add the visual, reload Desktop, and screenshot the page so you can check the layout."
 - **Check model quality like a senior reviewer.** Best Practice Analyzer (performance, DAX,
   naming, formatting), an AI-readiness score, storage/size analysis, and query-performance hints.
   > "Audit this model and give me the top issues to fix before I ship."
@@ -249,7 +255,7 @@ docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
 
 ## Tools
 
-78 tools across the categories below. The full reference, with parameters and read / write /
+82 tools across the categories below. The full reference, with parameters and read / write /
 destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Category | Count | Highlights |
@@ -272,6 +278,7 @@ destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | Bulk DAX creation | 3 | `generate_measure_suite`, `batch_create_measures`, `pbip_add_measures` |
 | Data modelling (offline TMDL) | 3 | `pbip_create_date_table`, `pbip_add_calculation_group`, `pbip_add_hierarchy` |
 | Warehouse audit | 2 | `audit_star_schema`, `scan_referential_integrity` |
+| Desktop Bridge (preview) | 4 | `bridge_status`, `bridge_manifest`, `bridge_reload` (hot-reload), `bridge_screenshot` |
 | Documentation, diff, CI | 5 | `export_data_dictionary`, `model_snapshot`, `model_diff`, `pre_deploy_gate`, `run_dax_tests` |
 | Diagnostics and ops | 4 | `refresh_doctor`, `find_unused_objects`, `impact_analysis`, `rls_test_harness` |
 | Governance-ops fleet (admin) | 3 | `cross_workspace_lineage`, `fleet_refresh_monitor`, `usage_and_orphan_analytics` |
@@ -354,7 +361,7 @@ tables:
 
 | Doc | Contents |
 |-----|----------|
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 78 tools, resources, prompts, env vars |
+| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 82 tools, resources, prompts, env vars |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, security layer, registry pattern, verification methodology, file map |
 | [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
 | [CHANGELOG.md](CHANGELOG.md) | Everything that changed, by milestone |
@@ -382,7 +389,7 @@ those paths needs a Windows + Power BI / Fabric environment.
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server: 78 tools + resources/prompts/completion
+│   ├── server.py                    # MCP server: 82 tools + resources/prompts/completion
 │   ├── powerbi_desktop_connector.py # Desktop (ADOMD) + RLS + VertiPaq DMVs
 │   ├── powerbi_xmla_connector.py    # Cloud XMLA
 │   ├── powerbi_rest_connector.py    # REST: discovery, refresh, admin Scanner/Activity
@@ -399,6 +406,7 @@ powerbi-mcp/
 │   ├── dax_generator.py            # Bulk measure-suite generation (time intel, ratios, ranks)
 │   ├── star_schema.py              # Star-schema classification + warehouse audit
 │   ├── tmdl_authoring.py           # TMDL emitters: measures, date table, calc groups, hierarchies
+│   ├── desktop_bridge.py           # Power BI Desktop Bridge client (JSON-RPC over named pipe)
 │   ├── refresh_diagnostics.py       # Refresh error classification
 │   ├── governance.py                # Scanner summary + activity aggregation
 │   └── security/                    # security_layer, access_policy, pii_detector, audit_logger

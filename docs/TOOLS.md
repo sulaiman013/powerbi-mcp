@@ -1,6 +1,6 @@
 # Tool Reference
 
-The Power BI MCP server exposes **78 tools**, plus MCP **resources**, **prompts**, and
+The Power BI MCP server exposes **82 tools**, plus MCP **resources**, **prompts**, and
 **completion**. Every tool carries MCP annotations (`readOnlyHint` / `destructiveHint` /
 `idempotentHint` / `openWorldHint`) so clients can auto-approve reads and confirm writes.
 
@@ -160,6 +160,21 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 |------|--|-------------|
 | `audit_star_schema` | 🟢 | Classify tables (fact/dimension/date/bridge/disconnected) and flag snowflakes, bidirectional filters, M2M, fact-to-fact joins, missing/unmarked date table, text-on-fact; scored with recommendations |
 | `scan_referential_integrity` | 🟢 | Orphan-key scan per active relationship (EXCEPT counts + sample keys) against the connected model |
+
+## Power BI Desktop Bridge (preview) — 4
+| Tool | | Description |
+|------|--|-------------|
+| `bridge_status` | 🟢 | Discover running Desktop Bridge instances: pid, open file, unsaved-changes flag, report pages (PBIR folder, embedded-PBIR `.pbix`, or legacy Layout), and the correlated Analysis Services port for `desktop_connect` |
+| `bridge_manifest` | 🟢 | Method manifest of the running Desktop's bridge (the surface grows over time) |
+| `bridge_reload` | 🔴 | Hot-reload the open PBIP/PBIR from disk (no close/reopen); refuses over unsaved Desktop changes unless `force` |
+| `bridge_screenshot` | 🟡 | Capture PNG screenshots of report pages from the running Desktop (page id, display name, or `all`); saved to disk for visual verification |
+
+> Talks JSON-RPC 2.0 to Microsoft's Power BI Desktop Bridge (preview, June 2026+ Desktop) over
+> the local named pipe `pbi-desktop-bridge-{pid}`. Pure Python, no dependencies. Requires the
+> Desktop preview option "Enable external tool access to Power BI Desktop through secure local
+> APIs" (on by default). The edit-and-verify loop: author offline with `pbir_*`/`pbip_*` tools,
+> `bridge_reload`, then `bridge_screenshot` to see the result. Snapshot/reload target PBIP/PBIR
+> projects opened from disk; one operation at a time per Desktop window.
 
 ## Documentation, diff & CI — 5
 | Tool | | Description |
