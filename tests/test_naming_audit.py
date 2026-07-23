@@ -82,6 +82,25 @@ def test_summary_and_scope():
     check("scope=tables yields only tables", all(p["object_type"] == "table" for p in only_tables["plan"]))
 
 
+def test_hidden_and_internal_columns_skipped():
+    print("\n== live-UAT regression: hidden + internal RowNumber columns skipped ==")
+    model = {"tables": [{
+        "name": "dim_date",
+        "columns": [
+            {"name": "RowNumber-2662979B-1795-4F74-8F37-6A1BA8059B61"},
+            {"name": "hidden_helper", "is_hidden": True},
+            {"name": "monthName"},
+        ],
+        "measures": [{"name": "secretCalc", "is_hidden": "true"}],
+    }]}
+    res = naming_audit.audit(model)
+    olds = {p["old"] for p in res["plan"]}
+    check("RowNumber-GUID never in plan", not any(o.startswith("RowNumber-") for o in olds), str(olds))
+    check("hidden column never in plan", "hidden_helper" not in olds, str(olds))
+    check("hidden measure never in plan", "secretCalc" not in olds, str(olds))
+    check("visible column still audited", any(p["old"] == "monthName" for p in res["plan"]))
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  NAMING AUDIT TESTS")
@@ -90,6 +109,7 @@ if __name__ == "__main__":
     test_acronyms_and_clean_preserved()
     test_abbreviations_opt_in()
     test_summary_and_scope()
+    test_hidden_and_internal_columns_skipped()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

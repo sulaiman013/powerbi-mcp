@@ -843,20 +843,44 @@ class PowerBIPBIPConnector:
 
     # ==================== TMDL MODEL AUTHORING (offline) ====================
 
+    _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+    _RESERVED_FILENAMES = {"con", "prn", "aux", "nul",
+                           *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+
     def _tables_folder(self) -> Optional[Path]:
         if self.current_project and self.current_project.semantic_model_folder:
             return self.current_project.semantic_model_folder / "definition" / "tables"
         return None
 
+    def _safe_new_table_path(self, tables_dir: Path, name: str):
+        """Resolve tables_dir/<name>.tmdl for a NEW table file, refusing path traversal,
+        Windows-invalid characters, reserved device names, and silent overwrites of an
+        existing file. Returns (path, error)."""
+        clean = (name or "").strip()
+        if not clean or clean in (".", "..") or self._INVALID_FILENAME_CHARS.search(clean):
+            return None, f"Table name '{name}' cannot be used as a file name"
+        if clean.lower() in self._RESERVED_FILENAMES:
+            return None, f"Table name '{name}' is a reserved Windows device name"
+        path = tables_dir / f"{clean}.tmdl"
+        try:
+            if path.resolve().parent != tables_dir.resolve():
+                return None, f"Table name '{name}' escapes the tables folder"
+        except OSError:
+            return None, f"Table name '{name}' is not a valid path"
+        if path.exists():
+            return None, f"File '{path.name}' already exists in the tables folder"
+        return path, None
+
     def _find_table_file(self, table_name: str) -> Optional[Path]:
-        """Locate the .tmdl file that declares the given table (one table per file)."""
+        """Locate the .tmdl file that declares the given table (one table per file).
+        Handles quoted names with escaped inner quotes ('O''Brien')."""
         want = table_name.strip().lower()
         for tmdl in (self.current_project.tmdl_files if self.current_project else []):
             try:
                 content = self._read_text(tmdl)
             except Exception:
                 continue
-            m = re.search(r"^\s*table\s+(?:'([^']+)'|(\S+))", content, re.MULTILINE)
+            m = re.search(r"^\s*table\s+(?:'((?:[^']|'')+)'|(\S+))", content, re.MULTILINE)
             if m and (m.group(1) or m.group(2)).replace("''", "'").strip().lower() == want:
                 return tmdl
         return None
@@ -877,6 +901,11 @@ class PowerBIPBIPConnector:
             if not name or not (m.get("expression") or "").strip():
                 problems.append(f"#{i + 1}: needs both a name and an expression")
                 continue
+            # Single-line TMDL fields must not carry line breaks (they would corrupt the file).
+            for field in ("name", "format_string", "display_folder"):
+                val = m.get(field)
+                if isinstance(val, str) and ("\n" in val or "\r" in val):
+                    problems.append(f"'{name}': {field} must not contain line breaks")
             if name.lower() in existing:
                 problems.append(f"'{name}': already exists in the model")
             if name.lower() in seen:
@@ -908,10 +937,12 @@ class PowerBIPBIPConnector:
             content = tmdl_authoring.build_date_table(name, start_date, end_date, fiscal_year_start_month)
         except ValueError as e:
             return {"success": False, "message": str(e)}
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        path, path_err = self._safe_new_table_path(tables_dir, name)
+        if path_err:
+            return {"success": False, "message": path_err}
         if self.auto_backup and not self.current_project.backup_path:
             self.create_backup()
-        tables_dir.mkdir(parents=True, exist_ok=True)
-        path = tables_dir / f"{name}.tmdl"
         self._write_text(path, content)
         self.current_project.tmdl_files.append(path)
         n_cols = len(re.findall(r"^\tcolumn ", content, re.MULTILINE))
@@ -930,11 +961,19 @@ class PowerBIPBIPConnector:
         bad = [it for it in items if not (it.get("name") and it.get("expression"))]
         if bad:
             return {"success": False, "message": "Every calculation item needs a name and an expression"}
+        crooked = [it["name"] for it in items
+                   if any(isinstance(it.get(f), str) and ("\n" in it[f] or "\r" in it[f])
+                          for f in ("name", "format_string_expression"))]
+        if crooked:
+            return {"success": False,
+                    "message": f"Item name/format must not contain line breaks: {', '.join(crooked)}"}
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        path, path_err = self._safe_new_table_path(tables_dir, name)
+        if path_err:
+            return {"success": False, "message": path_err}
         if self.auto_backup and not self.current_project.backup_path:
             self.create_backup()
         content = tmdl_authoring.build_calculation_group(name, items, column_name, precedence)
-        tables_dir.mkdir(parents=True, exist_ok=True)
-        path = tables_dir / f"{name}.tmdl"
         self._write_text(path, content)
         self.current_project.tmdl_files.append(path)
         # Calculation groups require discourageImplicitMeasures on the model; the engine
@@ -1268,7 +1307,10 @@ class PowerBIPBIPConnector:
             backup_path = self.create_backup()
 
         # Transactional cascade: if any step fails, roll every file back so the model
-        # and report can never be left half-renamed (inconsistent).
+        # and report can never be left half-renamed (inconsistent). The rollback cache is
+        # scoped to THIS operation - a stale cache from an earlier operation would otherwise
+        # roll files back past changes made in between (e.g. measures added by add_measures).
+        self._original_files = {}
         try:
             # 1. Update TMDL files (semantic model) - auto-quoting is built-in
             tmdl_replacements = self._rename_table_in_tmdl_files(old_name, new_name)
@@ -1351,7 +1393,9 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # Transactional cascade: roll back every file if any step fails.
+        # Transactional cascade: roll back every file if any step fails. Scope the
+        # rollback cache to THIS operation (see rename_table_in_files).
+        self._original_files = {}
         try:
             # 1. Update TMDL files (semantic model)
             tmdl_replacements = self._rename_column_in_tmdl_files(table_name, old_name, new_name)
@@ -1416,7 +1460,9 @@ class PowerBIPBIPConnector:
         if self.auto_backup and not self.current_project.backup_path:
             backup_path = self.create_backup()
 
-        # Transactional cascade: roll back every file if any step fails.
+        # Transactional cascade: roll back every file if any step fails. Scope the
+        # rollback cache to THIS operation (see rename_table_in_files).
+        self._original_files = {}
         try:
             # 1. Update TMDL files (semantic model)
             tmdl_replacements = self._rename_measure_in_tmdl_files(old_name, new_name)
@@ -1790,6 +1836,21 @@ class PowerBIPBIPConnector:
             (rf"(toColumn\s*:\s*'{table_escaped}'\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
         ]
 
+        # Constructs that live ONLY inside the owning table's file (hierarchy levels,
+        # sortByColumn wiring, calculated-table sourceColumn). Applying these globally would
+        # rename same-named columns of OTHER tables, so they are scoped to this file.
+        owning_file = self._find_table_file(table_name)
+        owner_patterns = [
+            # sortByColumn: OldName  (bare or quoted)
+            (rf"^(\s*)sortByColumn:\s*{old_escaped}\s*$", rf"\1sortByColumn: {new_name_quoted}", re.MULTILINE),
+            (rf"^(\s*)sortByColumn:\s*'{old_escaped}'\s*$", rf"\1sortByColumn: {new_name_quoted}", re.MULTILINE),
+            # hierarchy level reference: column: OldName
+            (rf"^(\s*)column:\s*{old_escaped}\s*$", rf"\1column: {new_name_quoted}", re.MULTILINE),
+            (rf"^(\s*)column:\s*'{old_escaped}'\s*$", rf"\1column: {new_name_quoted}", re.MULTILINE),
+            # NOTE: sourceColumn: [Name] is deliberately NOT rewritten - for calculated tables
+            # it maps to the DAX output alias, which does not change when the column is renamed.
+        ]
+
         for tmdl_file in self.current_project.tmdl_files:
             try:
                 self._cache_file_content(tmdl_file)
@@ -1805,6 +1866,10 @@ class PowerBIPBIPConnector:
                 for pattern, replacement, flags in patterns:
                     content, count = re.subn(pattern, replacement, content, flags=flags)
                     file_count += count
+                if owning_file is not None and Path(tmdl_file) == Path(owning_file):
+                    for pattern, replacement, flags in owner_patterns:
+                        content, count = re.subn(pattern, replacement, content, flags=flags)
+                        file_count += count
 
                 if content != original_content:
                     with open(tmdl_file, 'w', encoding='utf-8') as f:
@@ -1828,10 +1893,13 @@ class PowerBIPBIPConnector:
         new_name_quoted = quote_tmdl_name(new_name)
         old_escaped = re.escape(old_name)
 
-        # Patterns for measure references
+        # Patterns for measure references. The bracket pattern must NOT touch a
+        # calculated-table column mapping line (sourceColumn: [Name]) when a measure happens
+        # to share a column's name - that mapping refers to the DAX-produced column, not the
+        # measure. The fixed-width lookbehind covers the exact emitted/exported form.
         patterns = [
             # [MeasureName] references in DAX
-            (rf"\[\s*{old_escaped}\s*\]", f"[{new_name}]", 0),
+            (rf"(?<!sourceColumn: )\[\s*{old_escaped}\s*\]", f"[{new_name}]", 0),
             # TMDL measure definition: measure OldName = -> measure NewName =
             (rf'^(\s*)measure\s+{old_escaped}\s*=', rf'\1measure {new_name_quoted} =', re.MULTILINE),
             (rf"^(\s*)measure\s+'{old_escaped}'\s*=", rf'\1measure {new_name_quoted} =', re.MULTILINE),

@@ -364,7 +364,8 @@ class PowerBIXmlaConnector:
         except Exception as e:
             # The connection string embeds the service-principal secret; a provider error can
             # echo it. Strip it before logging or re-raising so it never reaches a caller/model.
-            safe = str(e)
+            # Also drop the .NET stack trace ADOMD appends - only the message line is useful.
+            safe = str(e).split("\n   at ")[0].strip()
             if getattr(self, "client_secret", None) and len(self.client_secret) >= 6:
                 safe = safe.replace(self.client_secret, "***")
             logger.error(f"DAX query execution failed: {safe}")

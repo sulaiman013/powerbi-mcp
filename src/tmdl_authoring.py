@@ -24,6 +24,8 @@ import datetime
 import re
 from typing import Any, Dict, List, Optional
 
+import dax_generator
+
 TAB = "\t"
 _NEEDS_QUOTE = re.compile(r"[\s.='':]|^\d")
 
@@ -205,10 +207,8 @@ def build_date_table(name: str = "Date", start_date: str = "2015-01-01",
 
 def time_intelligence_calc_items(date_column: str) -> List[Dict[str, Any]]:
     """A standard time-intelligence calculation-item set over SELECTEDMEASURE()."""
-    d = date_column.strip()
-    if "[" not in d:
-        table, _, col = d.partition(".")
-        d = f"'{table.strip()}'[{col.strip()}]"
+    # column_ref handles Table.Column, 'Quoted Table'.Column, and literal DAX references.
+    d = dax_generator.column_ref(date_column)
     return [
         {"name": "Current", "expression": "SELECTEDMEASURE()"},
         {"name": "YTD", "expression": f"CALCULATE(SELECTEDMEASURE(), DATESYTD({d}))"},
@@ -281,6 +281,10 @@ def find_table_end(content: str) -> int:
 
 def append_block(content: str, block: str) -> str:
     """Append a rendered block to a table .tmdl, separated by one blank line, preserving a
-    trailing newline."""
+    trailing newline and the file's existing line-ending convention (CRLF vs LF)."""
+    nl = "\r\n" if "\r\n" in content else "\n"
     head = content.rstrip()
-    return head + "\n\n" + block.rstrip() + "\n"
+    body = block.rstrip()
+    if nl == "\r\n":
+        body = body.replace("\r\n", "\n").replace("\n", "\r\n")
+    return head + nl * 2 + body + nl

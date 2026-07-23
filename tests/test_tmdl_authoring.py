@@ -181,6 +181,70 @@ def test_hierarchy():
         check("measure not usable as level", c.add_hierarchy("Sales", "H3", ["Total Sales"])["success"] is False)
 
 
+def test_filename_safety_and_quoted_date_column():
+    print("\n== live-UAT regressions: filename safety + quoted-table calc items ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _build_project(tmp)
+        for bad_name, why in [("../Evil", "traversal"), ("Time: Intel", "colon"),
+                              ("CON", "reserved"), ("a*b", "wildcard")]:
+            res = c.create_date_table(bad_name)
+            check(f"date table rejects {why}", res.get("success") is False, str(res))
+            res2 = c.add_calculation_group(bad_name, [{"name": "X", "expression": "SELECTEDMEASURE()"}])
+            check(f"calc group rejects {why}", res2.get("success") is False, str(res2))
+        # nothing escaped the project tree
+        escaped = list(Path(tmp).parent.glob("Evil.tmdl"))
+        check("no file escaped the tables folder", not escaped)
+        # a pre-existing FILE with that name (different table inside) must not be overwritten
+        tables_dir = Path(tmp) / "proj.SemanticModel" / "definition" / "tables"
+        (tables_dir / "Clash.tmdl").write_text("table SomethingElse\n", encoding="utf-8")
+        res3 = c.create_date_table("Clash")
+        check("existing file not overwritten", res3.get("success") is False and "already exists" in res3["message"], str(res3))
+
+    items = ta.time_intelligence_calc_items("'Order Date'.Date")
+    ytd = next(i for i in items if i["name"] == "YTD")
+    check("quoted table parsed once (no double quotes)", "'Order Date'[Date]" in ytd["expression"]
+          and "''Order Date''" not in ytd["expression"], ytd["expression"])
+
+
+def test_rename_integration_with_wave5_constructs():
+    print("\n== workflow-UAT regressions: rename cascade vs hierarchies/sortBy/sourceColumn + scoped rollback ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _build_project(tmp)
+        c.create_date_table("Date", "2020-01-01", "2021-12-31")
+        c.add_hierarchy("Date", "Calendar Hierarchy", ["Year", "Month"])
+        path = Path(c._find_table_file("Date"))
+
+        res = c.rename_column_in_files("Date", "Month", "Month Label")
+        check("column rename succeeds", res.success is True, res.message)
+        content = path.read_text(encoding="utf-8")
+        check("column declaration renamed", "column 'Month Label'" in content)
+        check("hierarchy level ref updated", "\t\t\tcolumn: 'Month Label'" in content, content[content.find("hierarchy"):][:400])
+        check("sourceColumn kept (DAX alias unchanged)", "sourceColumn: [Month]" in content)
+        res2 = c.rename_column_in_files("Date", "Month Number", "MonthNum")
+        content2 = path.read_text(encoding="utf-8")
+        check("sortByColumn updated", "sortByColumn: MonthNum" in content2, str(res2.message))
+        check("sortByColumn old gone", "sortByColumn: 'Month Number'" not in content2)
+
+        # measure rename must not corrupt a sourceColumn mapping sharing the name
+        c.add_measures("Sales", [{"name": "Year", "expression": "SUM(Sales[Amount])"}])
+        c.rename_measure_in_files("Year", "Year Total")
+        content3 = path.read_text(encoding="utf-8")
+        check("sourceColumn: [Year] survives measure rename", "sourceColumn: [Year]" in content3)
+
+        # scoped rollback: a failing rename must NOT roll files back past unrelated changes
+        c.add_measures("Sales", [{"name": "Keep Me", "expression": "1"}])
+        sales_path = Path(c._find_table_file("Sales"))
+        orig_fail = c._rename_column_in_visual_files
+        c.current_project.is_pbir_enhanced = True
+        c._rename_column_in_visual_files = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        res3 = c.rename_column_in_files("Sales", "Region", "Zone")
+        c._rename_column_in_visual_files = orig_fail
+        check("failed rename reports rollback", res3.success is False)
+        after = sales_path.read_text(encoding="utf-8")
+        check("rollback did NOT eat unrelated added measure", "'Keep Me'" in after or "measure 'Keep Me'" in after, after[-300:])
+        check("rollback restored the column name", "column Region" in after)
+
+
 def test_structural_tabs_only():
     print("\n== structural indentation is tabs-only ==")
     content = ta.build_date_table("Date", "2020-01-01", "2021-01-01")
@@ -203,6 +267,8 @@ if __name__ == "__main__":
     test_date_table()
     test_calculation_group()
     test_hierarchy()
+    test_filename_safety_and_quoted_date_column()
+    test_rename_integration_with_wave5_constructs()
     test_structural_tabs_only()
     print("\n" + "=" * 70)
     if _failures:

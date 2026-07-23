@@ -15,16 +15,22 @@ Entry point:
     generate_suite(kind, **params) -> List[{name, expression, format_string, display_folder, description}]
 Kinds: "time_intelligence", "ratios", "ranking", "column_stats".
 """
+import re
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------- reference helpers
+
+def _bracket(prop: str) -> str:
+    """Wrap a column/measure name in brackets, escaping ']' as ']]' (the DAX rule)."""
+    return "[" + str(prop).replace("]", "]]") + "]"
+
 
 def measure_ref(name: str) -> str:
     """'Total Sales' or '[Total Sales]' -> '[Total Sales]'."""
     name = name.strip()
     if name.startswith("[") and name.endswith("]"):
         return name
-    return f"[{name}]"
+    return _bracket(name)
 
 
 def bare_name(name: str) -> str:
@@ -36,22 +42,28 @@ def bare_name(name: str) -> str:
 
 
 def column_ref(ref: str) -> str:
-    """Accept 'Date.Date', 'Date'[Date], or Sales[Amount] and return a DAX column reference.
+    """Accept 'Date.Date', 'Date'[Date], Sales[Amount], or "Table Name[Col]" and return a
+    valid DAX column reference.
 
-    A ref that already contains '[' is passed through verbatim. Otherwise the first dot
-    splits table from column and the table is single-quoted (always safe in DAX).
+    A ref containing '[' is treated as bracketed DAX, but its table part is single-quoted
+    when needed (a bare table name with spaces is not valid DAX). Otherwise the first dot
+    splits table from column and the table is always single-quoted (always safe in DAX).
     """
     s = ref.strip()
     if "[" in s:
-        return s
+        table, bracket, rest = s.partition("[")
+        table = table.strip()
+        if table and not table.startswith("'") and re.search(r"[^\w]", table):
+            table = "'" + table.replace("'", "''") + "'"
+        return f"{table}{bracket}{rest}"
     if s.startswith("'"):
         end = s.find("'", 1)
         if end != -1:
             table = s[1:end]
             col = s[end + 1:].lstrip(".")
-            return f"'{table}'[{col}]"
+            return f"'{table}'" + _bracket(col)
     table, _, col = s.partition(".")
-    return f"'{table.strip()}'[{col.strip()}]"
+    return f"'{table.strip()}'" + _bracket(col.strip())
 
 
 def split_column_ref(ref: str):
