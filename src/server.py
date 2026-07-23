@@ -100,6 +100,7 @@ import bpa_authoring
 import dax_generator
 import star_schema
 import tmdl_authoring
+import desktop_bridge
 
 # Import security layer
 from security import SecurityLayer, get_security_layer
@@ -154,7 +155,7 @@ class PowerBIMCPServer:
             {n for n, a in self._tool_annotations.items() if a.destructiveHint}
             | {"create_measure", "create_relationship", "tom_commit_transaction",
                "batch_create_measures"}
-            | {"export_data_dictionary", "model_snapshot", "pbix_extract"}
+            | {"export_data_dictionary", "model_snapshot", "pbix_extract", "bridge_screenshot"}
         )
         # generate_measure_suite is generation-only by default; its write targets
         # (target="pbip"/"live") are refused inside the handler when read-only.
@@ -341,6 +342,11 @@ class PowerBIMCPServer:
             "pbip_create_date_table": lambda a: self._handle_pbip_create_date_table(a),
             "pbip_add_calculation_group": lambda a: self._handle_pbip_add_calculation_group(a),
             "pbip_add_hierarchy": lambda a: self._handle_pbip_add_hierarchy(a),
+            # Desktop Bridge (Wave 6): JSON-RPC to the running Power BI Desktop process
+            "bridge_status": lambda a: self._handle_bridge_status(a),
+            "bridge_manifest": lambda a: self._handle_bridge_manifest(a),
+            "bridge_screenshot": lambda a: self._handle_bridge_screenshot(a),
+            "bridge_reload": lambda a: self._handle_bridge_reload(a),
         }
 
     def _build_tool_annotations(self):
@@ -455,6 +461,11 @@ class PowerBIMCPServer:
             "pbip_create_date_table": local_destructive,
             "pbip_add_calculation_group": local_destructive,
             "pbip_add_hierarchy": local_destructive,
+            # Desktop Bridge (Wave 6)
+            "bridge_status": local_read,
+            "bridge_manifest": local_read,
+            "bridge_screenshot": ann(False, destructive=False, idempotent=True, open_world=False),  # writes PNGs
+            "bridge_reload": local_destructive,  # can discard unsaved Desktop changes (guarded)
         }
 
     def _setup_handlers(self):
@@ -1598,6 +1609,68 @@ class PowerBIMCPServer:
                             "levels": {"type": "array", "items": {"type": "string"}, "description": "Column names in drill order (top first)"}
                         },
                         "required": ["table", "name", "levels"]
+                    }
+                ),
+                # === POWER BI DESKTOP BRIDGE (Wave 6, preview) ===
+                Tool(
+                    name="bridge_status",
+                    description="Discover running Power BI Desktop Bridge instances (the JSON-RPC endpoint inside each open Desktop window; preview feature, on by default). For each instance returns the process id, the open file path, whether it has unsaved changes, and - for PBIP/PBIR files - the report pages (id, display name, active). Start here before bridge_reload or bridge_screenshot.",
+                    inputSchema={"type": "object", "properties": {}, "required": []},
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "instances": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="bridge_manifest",
+                    description="Return the Desktop Bridge method manifest for a running Power BI Desktop process: which bridge methods this Desktop build supports, with their descriptions. Use to discover capabilities before calling them (the bridge surface is preview and grows over time).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "pid": {"type": "integer", "description": "Desktop process id (from bridge_status); optional when exactly one instance is running"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "methods": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="bridge_screenshot",
+                    description="Capture PNG screenshots of report pages from the RUNNING Power BI Desktop via the Desktop Bridge - the agent can literally see the rendered report. Pass a page id or display name, or 'all' for every page. Images are saved to output_dir and the file paths returned. The heart of the edit-and-verify loop: author with pbir_*/pbip_* tools, bridge_reload, then screenshot to verify.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "page": {"type": "string", "description": "Page id, page display name, or 'all' (default 'all')"},
+                            "pid": {"type": "integer", "description": "Desktop process id; optional when exactly one instance is running"},
+                            "scale": {"type": "number", "description": "Scale factor 1.0-3.0 (default 1.0)"},
+                            "output_dir": {"type": "string", "description": "Folder to save PNGs (default: a 'bridge-screenshots' folder in the temp dir)"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "screenshots": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="bridge_reload",
+                    description="Hot-reload the file open in Power BI Desktop from disk via the Desktop Bridge - NO close/reopen needed. This is how offline edits (pbir_add_page, pbir_add_visual, pbip_add_measures, pbip_create_date_table, renames...) become visible in the running Desktop. Refuses to reload over unsaved Desktop changes unless force=true. reload_model_definition=false reloads only the report layer.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "pid": {"type": "integer", "description": "Desktop process id; optional when exactly one instance is running"},
+                            "reload_model_definition": {"type": "boolean", "default": True, "description": "Also re-apply the semantic model definition (default true)"},
+                            "force": {"type": "boolean", "default": False, "description": "Reload even if Desktop has unsaved changes (they will be lost)"}
+                        },
+                        "required": []
                     }
                 ),
                 # === DOCUMENTATION (Wave 1) ===
@@ -4062,9 +4135,170 @@ class PowerBIMCPServer:
             if not res.get("success"):
                 return f"Error: {res.get('message')}"
             return (f"Hierarchy '{name}' added to '{table}' ({' > '.join(levels)}).\n"
-                    "Reopen Power BI Desktop to see it.")
+                    "Reopen Power BI Desktop to see it (or hot-reload it with bridge_reload).")
         except Exception as e:
             return f"Error adding hierarchy: {redact_secrets(str(e), [self.client_secret])}"
+
+    # ==================== Wave 6: Power BI Desktop Bridge ====================
+
+    @staticmethod
+    def _get_bridge(pid: Optional[int] = None):
+        """Resolve a Desktop Bridge client. Returns (client, pid, error)."""
+        bridges = desktop_bridge.discover_bridges()
+        if not bridges:
+            return None, None, ("No Power BI Desktop Bridge found. Open a report in Power BI "
+                                "Desktop and ensure the preview option 'Enable external tool "
+                                "access to Power BI Desktop through secure local APIs' is on "
+                                "(File > Options > Preview features; on by default).")
+        if pid is not None:
+            match = [b for b in bridges if b["pid"] == int(pid)]
+            if not match:
+                return None, None, (f"No Desktop Bridge for pid {pid}. Running instances: "
+                                    + ", ".join(str(b["pid"]) for b in bridges))
+            chosen = match[0]
+        elif len(bridges) == 1:
+            chosen = bridges[0]
+        else:
+            return None, None, ("Multiple Power BI Desktop windows are open (pids: "
+                                + ", ".join(str(b["pid"]) for b in bridges)
+                                + "). Pass 'pid' to choose one (see bridge_status).")
+        return desktop_bridge.DesktopBridgeClient(chosen["pipe"]), chosen["pid"], None
+
+    async def _handle_bridge_status(self, args: Dict[str, Any]):
+        """Discover Desktop Bridge instances + open-file state + PBIR pages. Returns (text, result)."""
+        try:
+            loop = asyncio.get_event_loop()
+            bridges = desktop_bridge.discover_bridges()
+            instances = []
+            out = "=== Power BI Desktop Bridge ===\n\n"
+            if not bridges:
+                out += ("No bridge instances found. Open a report in Power BI Desktop and check the "
+                        "preview option 'Enable external tool access to Power BI Desktop through "
+                        "secure local APIs'.\n")
+                return (out, {"instances": []})
+            for b in bridges:
+                client = desktop_bridge.DesktopBridgeClient(b["pipe"])
+                inst: Dict[str, Any] = {"pid": b["pid"]}
+                try:
+                    state = await loop.run_in_executor(None, client.get_state)
+                    inst["file"] = state.get("currentFilePath")
+                    inst["has_unsaved_changes"] = state.get("hasUnsavedChanges")
+                    inst["pages"] = desktop_bridge.pages_for_file(inst["file"] or "")
+                    if b["pid"]:
+                        inst["msmdsrv_port"] = await loop.run_in_executor(
+                            None, desktop_bridge.msmdsrv_port_for_desktop_pid, b["pid"])
+                except Exception as e:
+                    inst["error"] = redact_secrets(str(e), [self.client_secret])
+                instances.append(inst)
+                out += f"pid {inst['pid']}: {inst.get('file') or '(no file / state unavailable)'}\n"
+                if inst.get("error"):
+                    out += f"  error: {inst['error']}\n"
+                else:
+                    out += f"  unsaved changes: {inst.get('has_unsaved_changes')}\n"
+                    if inst.get("msmdsrv_port"):
+                        out += (f"  analysis services port: {inst['msmdsrv_port']} "
+                                "(use with desktop_connect for DAX/TOM)\n")
+                    pages = inst.get("pages") or []
+                    if pages:
+                        out += "  pages:\n"
+                        for p in pages:
+                            mark = " (active)" if p.get("active") else ""
+                            out += f"    - {p['display_name']}{mark}  [id: {p['id']}]\n"
+                    else:
+                        out += "  pages: (not a PBIP/PBIR file, or pages folder not found)\n"
+            return (out, {"instances": instances})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error querying Desktop Bridge: {msg}", {"error": msg, "instances": []})
+
+    async def _handle_bridge_manifest(self, args: Dict[str, Any]):
+        """Desktop Bridge method discovery. Returns (text, result)."""
+        try:
+            client, pid, err = self._get_bridge(args.get("pid"))
+            if err:
+                return (f"Error: {err}", {"error": err, "methods": []})
+            manifest = await asyncio.get_event_loop().run_in_executor(None, client.manifest)
+            methods = manifest.get("methods", [])
+            out = f"=== Desktop Bridge manifest (pid {pid}) ===\n\n"
+            for m in methods:
+                out += f"- {m.get('name')}: {m.get('description', '')}\n"
+            return (out, {"methods": methods})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error reading bridge manifest: {msg}", {"error": msg, "methods": []})
+
+    async def _handle_bridge_screenshot(self, args: Dict[str, Any]):
+        """Capture report-page PNGs from the running Desktop. Returns (text, result)."""
+        try:
+            import base64
+            import tempfile
+            loop = asyncio.get_event_loop()
+            client, pid, err = self._get_bridge(args.get("pid"))
+            if err:
+                return (f"Error: {err}", {"error": err, "screenshots": []})
+            state = await loop.run_in_executor(None, client.get_state)
+            pages = desktop_bridge.pages_for_file(state.get("currentFilePath") or "")
+            ref = (args.get("page") or "all").strip()
+            if ref.lower() == "all":
+                targets = [p["id"] for p in pages]
+                if not targets:
+                    return ("Error: no PBIR pages found for the open file; pass an explicit page id.",
+                            {"error": "no_pages", "screenshots": []})
+            else:
+                page_id = desktop_bridge.resolve_page_id(pages, ref) or ref  # allow raw ids for .pbix
+                targets = [page_id]
+            out_dir = Path(args.get("output_dir") or (Path(tempfile.gettempdir()) / "bridge-screenshots"))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            scale = args.get("scale")
+            by_id = {p["id"]: p["display_name"] for p in pages}
+            shots = []
+            for page_id in targets:
+                snap = await loop.run_in_executor(None, client.capture_snapshot, page_id, scale)
+                data = base64.b64decode(snap.get("payload") or "")
+                display = snap.get("pageDisplayName") or by_id.get(page_id, page_id)
+                safe = re.sub(r'[<>:"/\\|?*]', "_", display)
+                path = out_dir / f"{safe}.png"
+                path.write_bytes(data)
+                shots.append({"page_id": page_id, "page": display, "path": str(path), "bytes": len(data)})
+            out = f"=== Captured {len(shots)} page screenshot(s) from Desktop (pid {pid}) ===\n\n"
+            for s in shots:
+                out += f"  {s['page']}: {s['path']} ({s['bytes']:,} bytes)\n"
+            out += "\nRead the PNG file(s) to visually verify the report."
+            return (out, {"screenshots": shots})
+        except desktop_bridge.BridgeError as e:
+            hint = ""
+            if e.code == -32000:
+                hint = ("\nHint: the Desktop Bridge's snapshot/reload paths are built for PBIP/PBIR "
+                        "projects opened from disk. If a .pbix is open, save it as a Power BI "
+                        "Project (.pbip) and reopen it, then retry.")
+            return (f"Bridge refused the screenshot: {e}{hint}", {"error": str(e), "screenshots": []})
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error capturing screenshot: {msg}", {"error": msg, "screenshots": []})
+
+    async def _handle_bridge_reload(self, args: Dict[str, Any]) -> str:
+        """Hot-reload the open file from disk (guarded against unsaved-change loss)."""
+        try:
+            loop = asyncio.get_event_loop()
+            client, pid, err = self._get_bridge(args.get("pid"))
+            if err:
+                return f"Error: {err}"
+            state = await loop.run_in_executor(None, client.get_state)
+            if state.get("hasUnsavedChanges") and not args.get("force"):
+                return ("Refused: Power BI Desktop has UNSAVED changes for "
+                        f"'{state.get('currentFilePath')}'. Reloading would discard them. "
+                        "Save in Desktop first, or pass force=true to discard.")
+            reload_model = args.get("reload_model_definition", True)
+            result = await loop.run_in_executor(None, client.reload_file, bool(reload_model))
+            scope = "report + model definition" if reload_model else "report only"
+            ok = result.get("success", True)
+            return (f"{'Reloaded' if ok else 'Reload reported failure for'} "
+                    f"'{state.get('currentFilePath')}' from disk ({scope}) in Desktop pid {pid}. "
+                    "Verify visually with bridge_screenshot.")
+        except desktop_bridge.BridgeError as e:
+            return f"Bridge refused the reload: {e}"
+        except Exception as e:
+            return f"Error reloading: {redact_secrets(str(e), [self.client_secret])}"
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus

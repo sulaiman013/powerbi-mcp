@@ -51,6 +51,9 @@ Best Practice Analyzer, AI-readiness, security) even without ADOMD/.NET.
   `pbir_add_visual` (bind fields by role) / `pbir_bind_fields` -> `pbir_validate_report`.
   Pass fields as `Table.Field`; the server picks measure vs aggregated-column from the model,
   so prefer naming explicit measures for value wells. Close Power BI Desktop before editing.
+- **Edit-and-verify a report (Desktop Bridge):** `bridge_status` (open file, unsaved state,
+  pages) -> edit offline with `pbir_*`/`pbip_*` -> `bridge_reload` (hot-reload, no reopen) ->
+  `bridge_screenshot` -> Read the PNG to visually verify. Never reload over unsaved changes.
 - **Ground yourself first:** read the `powerbi://desktop/schema` resource (or
   `get_model_info`) before generating DAX, so you use real table/column names.
 

@@ -36,6 +36,10 @@ python tests/test_security_enforcement.py
 | `test_pbix_tools.py` | PBIX inspect/extract: thin/thick, UTF-16-LE layout decode, Zip-Slip guard |
 | `test_bpa_authoring.py` | Custom BPA rule validation + rule-source audit (single- and multi-line annotations) |
 | `test_security_audit_fixes.py` | Regression: secret redaction, audit-chain tamper + HMAC, error scrubbing, ReDoS-safe refs, PII summary, status_pill guard |
+| `test_dax_generator.py` | Measure-suite templates (time intel/ratios/ranks/stats); generated DAX is lint-clean |
+| `test_star_schema.py` | Fact/dim/date/bridge/measure-table classification + warehouse findings |
+| `test_tmdl_authoring.py` | TMDL emitters, connector round-trips, filename safety, rename integration |
+| `test_desktop_bridge.py` | Bridge JSON-RPC framing, fake-pipe client, discovery, page resolution, reload guard |
 
 ## Engine-level verification of generated TMDL
 

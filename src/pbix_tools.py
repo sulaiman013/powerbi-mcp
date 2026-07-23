@@ -100,6 +100,44 @@ def read_layout(path: str) -> Optional[Dict[str, Any]]:
         return _decode_layout_bytes(z.read(layout))
 
 
+def read_pbir_pages(path: str) -> List[Dict[str, Any]]:
+    """List report pages of a .pbix whose report is stored in the embedded PBIR-enhanced
+    format (Report/definition/pages/<id>/page.json inside the archive).
+    Returns [{id, display_name, active, order}] ([] when the archive has no embedded PBIR)."""
+    if not zipfile.is_zipfile(path):
+        raise ValueError(f"Not a valid PBIX/ZIP package: {path}")
+    pages: List[Dict[str, Any]] = []
+    order: List[str] = []
+    active = None
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        meta_name = "Report/definition/pages/pages.json"
+        if meta_name in names:
+            try:
+                meta = json.loads(z.read(meta_name).decode("utf-8-sig"))
+                order = list(meta.get("pageOrder", []))
+                active = meta.get("activePageName")
+            except Exception:
+                pass
+        for n in names:
+            parts = n.split("/")
+            if (len(parts) == 5 and parts[:3] == ["Report", "definition", "pages"]
+                    and parts[4] == "page.json"):
+                try:
+                    data = json.loads(z.read(n).decode("utf-8-sig"))
+                except Exception:
+                    continue
+                pid = data.get("name") or parts[3]
+                pages.append({
+                    "id": pid,
+                    "display_name": data.get("displayName") or pid,
+                    "active": pid == active,
+                    "order": order.index(pid) if pid in order else None,
+                })
+    pages.sort(key=lambda p: (p["order"] is None, p["order"]))
+    return pages
+
+
 def _safe_target(dest: str, name: str) -> str:
     """Resolve an archive member to a path inside dest, rejecting Zip-Slip traversal."""
     dest_abs = os.path.abspath(dest)

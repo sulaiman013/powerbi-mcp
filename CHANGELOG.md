@@ -3,6 +3,39 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.7.0] - 2026-07-23 — Power BI Desktop Bridge integration (preview)
+
+Grew the server from **78 to 82 tools** by integrating Microsoft's **Power BI Desktop Bridge**
+(preview, Desktop June 2026+ / 2.155.756.0): the JSON-RPC 2.0 endpoint each Desktop window
+exposes on the local named pipe `pbi-desktop-bridge-{pid}`. This closes the agentic
+edit-and-verify loop: author offline with the `pbir_*`/`pbip_*` tools, hot-reload the running
+Desktop, then screenshot the rendered pages so the agent can SEE its work.
+
+### Added
+- **`bridge_status`** — discover running bridge instances: pid, open file, unsaved-changes
+  flag, report pages (from a PBIR folder for `.pbip`, the embedded PBIR inside a modern
+  `.pbix`, or the legacy UTF-16 Layout), plus the correlated msmdsrv port so an instance
+  chains straight into `desktop_connect` for DAX/TOM.
+- **`bridge_manifest`** — the running Desktop's bridge method manifest (forward-compatible
+  discovery of a growing preview surface).
+- **`bridge_reload`** — hot-reload the open PBIP/PBIR from disk, no close/reopen; refuses
+  when Desktop has unsaved changes unless `force=true`; `reload_model_definition=false`
+  reloads the report layer only.
+- **`bridge_screenshot`** — PNG screenshots of report pages (by id, display name, or `all`),
+  saved to disk for visual verification.
+- New pure module `desktop_bridge.py`: pipe discovery, Content-Length JSON-RPC framing,
+  a timeout-guarded one-shot client (plain `open()` on the pipe; no pywin32), page
+  resolution across all three report storage formats, and msmdsrv-pid correlation.
+  `pbix_tools.read_pbir_pages` reads the page list of a modern `.pbix` from its embedded
+  PBIR definition.
+- `tests/test_desktop_bridge.py` (framing round-trip, fake-pipe client, discovery, page
+  resolution, unsaved-changes guard). Verified LIVE against a running Desktop: pipe
+  discovery, manifest, application state, and the reload guard all confirmed; snapshot and
+  reload require the file to be opened as a PBIP/PBIR project (the tool explains this when
+  a `.pbix` is open).
+
+---
+
 ## [3.6.1] - 2026-07-23 — Live UAT hardening (tested against a running Power BI Desktop)
 
 A complete UAT round: dynamic testing against a LIVE Power BI Desktop model (connect, query,
