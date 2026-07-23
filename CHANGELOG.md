@@ -3,6 +3,53 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.6.1] - 2026-07-23 — Live UAT hardening (tested against a running Power BI Desktop)
+
+A complete UAT round: dynamic testing against a LIVE Power BI Desktop model (connect, query,
+TOM writes, star-schema audit, referential integrity) plus a 5-dimension adversarial static
+review (44 findings raised, 39 confirmed after independent verification). All confirmed
+findings fixed; 23/23 suites pass; every fix re-verified against the live model.
+
+### Fixed — live connectivity
+- **TOM discovery now honors `TOM_DLL_PATH` / `ADOMD_DLL_PATH`** (folder or DLL path) and the
+  AMO NuGet package cache, matching the ADOMD loader; previously a NuGet-installed
+  `Microsoft.AnalysisServices.Tabular.dll` could not be used at all.
+- **`batch_create_measures` supports intra-batch references** (a measure referencing a sibling
+  created in the same batch). Sibling-referencing measures are validated AFTER creation; if a
+  post-check fails the whole batch is deleted again (compensating rollback). Previously any
+  batch with internal references was always refused.
+- ADOMD/XMLA error messages **no longer carry the full .NET stack trace** into tool output.
+
+### Fixed — classification quality (verified on a real star-schema model)
+- A relationship-less table holding measures is now classified **`measure_table`** (the
+  `_Measures` pattern), not "disconnected"; measure-less facts are not flagged when a dedicated
+  measure table exists.
+- Bridge tables are recognized by **name hint** (`bridge_*`) as well as topology.
+- A both-sides table is called a fact only when topology dominance AND measures agree, so
+  snowflaked dimensions (and dims with parked measures) no longer cascade into false
+  fact-to-fact / text-on-fact findings.
+- Marked date tables are recognized as date dimensions even without an English name hint;
+  date-name detection is token-based (no more "Sentiment"/"Downtime" matches); key-column
+  detection requires a case/underscore boundary (no more "Idaho"/"Paid" matches); relationship
+  key columns are excluded from text-on-fact counting; info-finding score impact is capped.
+- `audit_naming` **skips hidden columns/measures and Power BI's internal `RowNumber-` columns**
+  (they previously appeared, mangled, in rename plans).
+
+### Fixed — write safety and rename integration
+- `pbip_create_date_table` / `pbip_add_calculation_group` refuse path traversal,
+  Windows-invalid and reserved file names, and never overwrite an existing file.
+- Column renames now cascade into **hierarchy level references and `sortByColumn` wiring**
+  (scoped to the owning table); measure renames no longer corrupt a calculated table's
+  `sourceColumn: [Name]` mapping; the rename rollback cache is **scoped per operation** so a
+  failed rename can no longer roll files back past changes made between operations.
+- Measure/calc-item names and single-line TMDL fields reject embedded line breaks; appends
+  preserve a CRLF file's line-ending convention; quoted table names with escaped quotes match.
+- `generate_measure_suite`: `skip_validation` declared in the schema; `written` flag no longer
+  false-positives; read-only refusals return structured content so outputSchema tools do not
+  error; DAX reference helpers escape `]` and quote table names in `Table Name[Col]` inputs.
+
+---
+
 ## [3.6.0] - 2026-07-06 — Data modelling, warehousing & bulk DAX
 
 Grew the server from **70 to 78 tools**, making it a first-class data-modelling and

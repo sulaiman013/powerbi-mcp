@@ -125,15 +125,26 @@ def audit(model: Dict[str, Any], options: Optional[Dict[str, Any]] = None) -> Di
             plan.append({"object_type": object_type, "table": table, "old": old,
                          "new": new, "reasons": reasons})
 
+    def _hidden(obj) -> bool:
+        v = obj.get("is_hidden")
+        return v is True or (isinstance(v, str) and v.strip().lower() in ("true", "1", "yes"))
+
     for t in model.get("tables", []):
         tname = t.get("name", "")
         if "tables" in scope:
             consider("table", None, tname)
         if "columns" in scope:
             for c in t.get("columns", []):
-                consider("column", tname, c.get("name", ""))
+                cname = c.get("name", "")
+                # Skip hidden columns and Power BI's internal RowNumber-<GUID> columns:
+                # they are not user-facing and must never appear in a rename plan.
+                if _hidden(c) or cname.startswith("RowNumber-"):
+                    continue
+                consider("column", tname, cname)
         if "measures" in scope:
             for m in t.get("measures", []):
+                if _hidden(m):
+                    continue
                 consider("measure", tname, m.get("name", ""))
 
     by_type: Dict[str, int] = {}

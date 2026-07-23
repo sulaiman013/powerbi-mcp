@@ -14,7 +14,22 @@ logger = logging.getLogger(__name__)
 
 # Find and load TOM DLLs
 def _find_tom_dll() -> Optional[Path]:
-    """Find Microsoft.AnalysisServices.Tabular.dll"""
+    """Find Microsoft.AnalysisServices.Tabular.dll.
+
+    Honors TOM_DLL_PATH (folder or full DLL path) and, as a convenience, ADOMD_DLL_PATH,
+    since the AMO NuGet package's DLLs are commonly extracted alongside the ADOMD client."""
+    for env_var in ("TOM_DLL_PATH", "ADOMD_DLL_PATH"):
+        override = os.environ.get(env_var)
+        if override:
+            p = Path(override)
+            candidate = p if p.suffix.lower() == ".dll" else p / "Microsoft.AnalysisServices.Tabular.dll"
+            if candidate.name.lower() == "microsoft.analysisservices.tabular.dll" and candidate.exists():
+                return candidate.parent
+            if p.is_dir():
+                hits = list(p.glob("**/Microsoft.AnalysisServices.Tabular.dll"))
+                if hits:
+                    return hits[0].parent
+
     possible_paths = [
         # Power BI Desktop installation (preferred)
         Path(r"C:\Program Files\Microsoft Power BI Desktop\bin"),
@@ -26,6 +41,12 @@ def _find_tom_dll() -> Optional[Path]:
         # Update Cache
         Path(r"C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Update Cache"),
     ]
+
+    # AMO NuGet package cache (Microsoft.AnalysisServices[.retail.amd64])
+    nuget_root = Path(os.path.expandvars(r"%USERPROFILE%\.nuget\packages"))
+    if nuget_root.exists():
+        for pkg_dir in nuget_root.glob("microsoft.analysisservices*"):
+            possible_paths.append(pkg_dir)
 
     # Check Update Cache for latest version
     update_cache = Path(r"C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Update Cache")

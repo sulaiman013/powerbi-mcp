@@ -134,6 +134,33 @@ def test_negative_cases():
     check("empty model ok", res4["summary"]["score"] == 100 and res4["findings"] == [])
 
 
+def test_measure_table_and_bridge_hint():
+    print("\n== live-UAT regressions: measure table + name-hinted bridge ==")
+    model = {
+        "tables": [
+            {"name": "_Measures", "columns": _cols(("Col1",)),
+             "measures": [{"name": "Total Revenue", "expression": "SUM(fact_sales[Revenue])"}]},
+            {"name": "fact_sales", "columns": _cols(("DateKey", "int64"), ("Revenue", "double")), "measures": []},
+            {"name": "dim_date", "columns": _cols(("Date", "dateTime", {"is_key": True})), "measures": []},
+            {"name": "bridge_line_account",
+             "columns": _cols(("LineKey", "int64"), ("AccountKey", "int64"), ("Weight", "double")), "measures": []},
+            {"name": "dim_account", "columns": _cols(("AccountKey", "int64"), ("Account",)), "measures": []},
+        ],
+        "relationships": [
+            {"from_table": "fact_sales", "from_column": "DateKey", "to_table": "dim_date", "to_column": "Date", "is_active": True},
+            {"from_table": "bridge_line_account", "from_column": "AccountKey", "to_table": "dim_account", "to_column": "AccountKey", "is_active": True},
+        ],
+    }
+    res = star_schema.audit_star_schema(model)
+    c = {n: v["class"] for n, v in res["classification"].items()}
+    codes = {f["code"] for f in res["findings"]}
+    check("_Measures is measure_table", c["_Measures"] == "measure_table", str(c))
+    check("measure table NOT flagged disconnected", "SS_DISCONNECTED" not in codes, str(codes))
+    check("bridge by name hint (1 rel, extra attr)", c["bridge_line_account"] == "bridge", c["bridge_line_account"])
+    check("facts not flagged measure-less when measure table exists",
+          "SS_FACT_NO_MEASURES" not in codes, str(codes))
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  STAR SCHEMA AUDIT TESTS")
@@ -141,6 +168,7 @@ if __name__ == "__main__":
     test_classification()
     test_findings()
     test_negative_cases()
+    test_measure_table_and_bridge_hint()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

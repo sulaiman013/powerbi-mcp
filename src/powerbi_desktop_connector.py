@@ -234,8 +234,10 @@ class PowerBIDesktopConnector:
             return rows
 
         except Exception as e:
-            logger.error(f"DAX query failed: {e}")
-            raise Exception(f"DAX query failed: {e}")
+            # ADOMD exceptions embed the full .NET stack trace; keep only the message line(s).
+            msg = str(e).split("\n   at ")[0].strip()
+            logger.error(f"DAX query failed: {msg}")
+            raise Exception(f"DAX query failed: {msg}")
 
     def list_tables(self) -> List[Dict[str, Any]]:
         """

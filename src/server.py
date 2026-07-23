@@ -1452,7 +1452,8 @@ class PowerBIMCPServer:
                             "display_folder": {"type": "string"},
                             "base_format": {"type": "string", "description": "Base measure's format string, inherited by non-percent variants"},
                             "target": {"type": "string", "enum": ["none", "pbip", "live"], "default": "none"},
-                            "table": {"type": "string", "description": "Table to host the measures (required for target pbip/live)"}
+                            "table": {"type": "string", "description": "Table to host the measures (required for target pbip/live)"},
+                            "skip_validation": {"type": "boolean", "default": False, "description": "target='live' only: skip the per-expression validation probe"}
                         },
                         "required": ["kind"]
                     },
@@ -1836,10 +1837,12 @@ class PowerBIMCPServer:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
                 if self._read_only and name in self._write_tools:
+                    # Return a structured payload too: tools that declare an outputSchema must
+                    # produce structuredContent or the SDK rejects the (refusal) result.
                     return [TextContent(type="text", text=(
                         f"Refused: '{name}' is a write operation and the server is running in "
                         "READ-ONLY mode. Unset POWERBI_MCP_READONLY to allow model/report changes."
-                    ))]
+                    ))], {"error": "read_only_mode", "refused": True}
 
                 result = await handler(args)
                 # Handlers return either a plain string (text only) or a
@@ -3590,7 +3593,7 @@ class PowerBIMCPServer:
             out += f"Suggestions: {s['total_suggestions']}"
             if s.get("by_type"):
                 out += "  (" + ", ".join(f"{k}: {v}" for k, v in s["by_type"].items()) + ")"
-            out += f"\nDominant style: {s.get('dominant_style')}  (consistent: {s.get('consistent')})\n\n"
+            out += f"\nDominant style: {s.get('dominant_style')}  (single style: {s.get('single_style')})\n\n"
             for p in result["plan"][:200]:
                 loc = f"{p['table']}[{p['old']}]" if p.get("table") else p["old"]
                 out += f"  {p['object_type']}: {loc}  ->  '{p['new']}'  ({', '.join(p['reasons'])})\n"
@@ -3762,25 +3765,60 @@ class PowerBIMCPServer:
 
     async def _batch_create_live(self, table: str, measures: List[Dict[str, Any]],
                                  skip_validation: bool = False) -> str:
-        """Shared live bulk-create path: validate every expression, then all-or-nothing TOM batch."""
+        """Shared live bulk-create path: validate, then all-or-nothing TOM batch.
+
+        Measures may reference sibling measures created in the SAME batch (e.g. a ratio over a
+        base defined two entries earlier). Those cannot be probed against the current model, so
+        they are validated AFTER creation; if a post-check fails, every measure created by the
+        batch is deleted again (compensating rollback), preserving all-or-nothing semantics."""
         error = await self._ensure_tom_connected()
         if error:
             return error
+        loop = asyncio.get_event_loop()
+        batch_names = {(m.get("name") or "") for m in measures}
+
+        def refs_sibling(expr: str) -> bool:
+            return any(f"[{n}]" in (expr or "") for n in batch_names if n)
+
+        deferred = [m for m in measures if refs_sibling(m.get("expression", ""))]
         if not skip_validation:
             for m in measures:
+                if m in deferred:
+                    continue  # references a sibling from this batch; validated post-create
                 status, verr = await self._validate_via_desktop(m["expression"], as_measure=True)
                 if status is False:
                     return (f"[INVALID] Batch NOT created - measure '{m['name']}' failed validation.\n\n"
                             f"Error: {redact_secrets(verr, [self.client_secret])}\n\n"
                             "Fix the DAX and retry (or pass skip_validation=true).")
+
         tom = self._get_tom_connector()
         auto_save = not self._tom_transaction_active
         create_fn = lambda: tom.batch_create_measures(table, measures, auto_save=auto_save)
         result = await asyncio.get_event_loop().run_in_executor(None, create_fn)
         if not result.success:
             return f"Failed: {result.message}"
+
+        # Post-validate the sibling-referencing measures now that the whole batch exists.
+        if deferred and not skip_validation and auto_save:
+            for m in deferred:
+                status, verr = await self._validate_via_desktop(f"[{m['name']}]", as_measure=True)
+                if status is False:
+                    for created in measures:  # compensating rollback of the whole batch
+                        del_fn = lambda n=created["name"]: tom.delete_measure(n, table)
+                        await loop.run_in_executor(None, del_fn)
+                    await loop.run_in_executor(None, tom.save_changes)
+                    return (f"[INVALID] Batch rolled back - measure '{m['name']}' failed post-create "
+                            f"validation.\n\nError: {redact_secrets(verr, [self.client_secret])}\n\n"
+                            "Nothing remains from this batch. Fix the DAX and retry.")
+
         pending = " (PENDING - run tom_commit_transaction to save)" if self._tom_transaction_active else ""
-        return f"{result.message}{pending}"
+        note = ""
+        if deferred:
+            names = ", ".join(m["name"] for m in deferred[:5])
+            note = (f"\n({len(deferred)} measure(s) referencing batch siblings were validated "
+                    f"after creation: {names})") if auto_save else \
+                   (f"\n({len(deferred)} sibling-referencing measure(s) will be checked at commit)")
+        return f"{result.message}{pending}{note}"
 
     async def _handle_generate_measure_suite(self, args: Dict[str, Any]):
         """Bulk-generate a measure suite; optionally write it (pbip TMDL or live TOM).
@@ -3816,7 +3854,7 @@ class PowerBIMCPServer:
                 return (out, result)
             # live
             msg = await self._batch_create_live(table, measures, bool(args.get("skip_validation", False)))
-            result["written"] = "Created" in msg
+            result["written"] = msg.startswith("Created")
             return (out + msg, result)
         except ValueError as e:
             return (f"Error: {e}", {"error": str(e), "measures": []})
@@ -3869,7 +3907,8 @@ class PowerBIMCPServer:
 
     @staticmethod
     def _dax_col(table: str, column: str) -> str:
-        return "'" + str(table).replace("'", "''") + "'[" + str(column) + "]"
+        return ("'" + str(table).replace("'", "''") + "'["
+                + str(column).replace("]", "]]") + "]")
 
     async def _handle_scan_referential_integrity(self, args: Dict[str, Any]):
         """Orphan-key scan across active relationships. Returns (text, result)."""
@@ -3882,7 +3921,10 @@ class PowerBIMCPServer:
             if err:
                 return (f"Error: {err}", {"error": err, "checked": 0, "violations": []})
             loop = asyncio.get_event_loop()
-            max_samples = int(args.get("max_samples", 5) or 5)
+            try:
+                max_samples = max(1, min(100, int(args.get("max_samples", 5) or 5)))
+            except (TypeError, ValueError):
+                max_samples = 5
             checked, violations = 0, []
             for r in model.get("relationships", []):
                 if not (r.get("from_table") and r.get("from_column") and r.get("to_table") and r.get("to_column")):
