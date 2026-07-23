@@ -173,8 +173,11 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 > the local named pipe `pbi-desktop-bridge-{pid}`. Pure Python, no dependencies. Requires the
 > Desktop preview option "Enable external tool access to Power BI Desktop through secure local
 > APIs" (on by default). The edit-and-verify loop: author offline with `pbir_*`/`pbip_*` tools,
-> `bridge_reload`, then `bridge_screenshot` to see the result. Snapshot/reload target PBIP/PBIR
-> projects opened from disk; one operation at a time per Desktop window.
+> `bridge_reload`, then `bridge_screenshot` to see the result. One operation at a time per
+> Desktop window. Known Desktop-side preview defect: on current builds
+> `report.snapshot.capture` can return an internal error (-32000) for any input, so
+> `bridge_screenshot` may fail until a Desktop update ships; status, manifest, and reload are
+> unaffected (all verified live).
 
 ## Documentation, diff & CI — 5
 | Tool | | Description |
@@ -216,13 +219,19 @@ Legend: 🟢 read-only · 🟡 write (non-destructive) · 🔴 destructive
 |----------|---------|
 | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` | Azure AD service principal for cloud/REST/admin |
 | `ADOMD_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.AdomdClient.dll` if auto-discovery misses it |
-| `POWERBI_MCP_READONLY` | `true` → refuse all write tools (lockdown mode) |
+| `TOM_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.Tabular.dll` for live writes (`ADOMD_DLL_PATH` is also searched) |
+| `POWERBI_MCP_READONLY` | `true` refuses all write tools, including file writers (lockdown mode) |
+| `POWERBI_MCP_AUDIT_KEY` | Secret key that switches the audit hash chain to HMAC-SHA256 |
 | `ENABLE_PII_DETECTION`, `ENABLE_AUDIT`, `ENABLE_POLICIES` | Toggle security subsystems (default true) |
 | `LOG_LEVEL` | `DEBUG` enables (redacted) argument logging |
 
 ## Verification status
-Tools that run purely on local files or pure logic (PBIP editing, BPA, AI-readiness,
-diff, security, refresh classification, governance parsing) are covered by the test
-suites. Tools that call a live Power BI Desktop / XMLA / REST / Admin endpoint are
-doc-verified against Microsoft Learn and mock-tested, but need a real Windows + Power BI
-/ Fabric environment for end-to-end verification.
+- **Pure logic and file tools** (PBIP/TMDL/PBIR authoring and editing, BPA, linters, auditors,
+  security, refresh classification, governance parsing): covered by the 24 assert suites, and
+  the TMDL/PBIR emitters are additionally verified against Microsoft's published schemas and
+  Microsoft's own `TmdlSerializer` engine.
+- **Desktop live paths** (ADOMD queries, TOM writes incl. validated batch creation, star-schema
+  audit, Desktop Bridge status/manifest/hot-reload): verified against a running Power BI
+  Desktop. `bridge_screenshot` awaits a Desktop-side preview fix (see the bridge section note).
+- **Cloud paths** (XMLA / REST / Admin Scanner and Activity): doc-verified against Microsoft
+  Learn and mock-tested; end-to-end verification still needs a real tenant.

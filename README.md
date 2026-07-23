@@ -26,12 +26,13 @@
 ## What it is
 
 Power BI MCP Server connects an AI assistant (Claude, GitHub Copilot, any MCP client) to your
-Power BI content through one consistent interface. It talks to a local Power BI Desktop model,
-a published Power BI Service dataset, or Power BI Project (PBIP) files on disk, and wraps every
-operation in a security and governance layer.
+Power BI content through one consistent interface. It talks to a local Power BI Desktop model
+(queries AND live writes), a published Power BI Service dataset, Power BI Project (PBIP) files
+on disk, and the running Power BI Desktop app itself (through Microsoft's Desktop Bridge, for
+hot-reload and screenshots), and wraps every operation in a security and governance layer.
 
 It exposes **82 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-24 assert-based test suites.
+25 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
@@ -58,12 +59,14 @@ This server is a bridge. On its own an AI assistant can only talk. This gives it
 "hands" so it can reach into Power BI and actually do the work for you. You ask in plain
 English, the assistant picks the right tool, and you get an answer or a change.
 
-It plugs into three places:
+It plugs into four places:
 
 1. **Power BI Desktop**: the app open on your PC. It talks to the live model inside it.
 2. **Power BI Service**: the cloud, your published datasets and workspaces.
 3. **PBIP files**: when you save a "Power BI Project", the model and report become text files
    on disk that it can edit directly, even with Desktop closed.
+4. **The running Desktop app itself** (June 2026+): through Microsoft's Desktop Bridge it can
+   hot-reload the open report after file edits and take page screenshots, no restart needed.
 
 A few terms used below: a **semantic model** (dataset) is the data brain behind a report
 (its tables, columns, relationships, and measures). A **measure** is a saved calculation
@@ -160,12 +163,12 @@ limit which rows a user can see).
 ### A realistic end-to-end example
 
 > 1. "Connect to my Power BI Desktop model."
-> 2. "Audit it and list the worst issues."
-> 3. "What would break if I rename the 'Customer ID' column?"
-> 4. "Rename it to 'CustomerKey' across model and report."
-> 5. "Create a 'YoY Sales %' measure, validate it, and format as a percentage."
-> 6. "Export a data dictionary so the team has docs."
-> 7. "Run the pre-deploy quality gate before I publish."
+> 2. "Audit it as a star schema and list what a warehouse architect would flag."
+> 3. "Create a date table with a July fiscal year and a time-intelligence calculation group."
+> 4. "Generate the full time-intelligence suite for 'Total Sales' and add it to the model."
+> 5. "What would break if I rename the 'Customer ID' column? Rename it across model and report."
+> 6. "Hot-reload Desktop and screenshot the overview page so you can check it."
+> 7. "Export a data dictionary and run the pre-deploy quality gate before I publish."
 
 Each step is one sentence; the server does the real Power BI work behind it.
 
@@ -179,9 +182,19 @@ chat-with-data and a local modeling one for authoring semantic models. This proj
 
 - **Report-aware safe renames.** The official local modeling MCP edits the model only and
   cannot touch the report layer. This server renames tables, columns, and measures across
-  both the model (TMDL) and the report (PBIR visuals, cultures, diagram), so visuals do not break.
+  both the model (TMDL) and the report (PBIR visuals, cultures, diagram, hierarchies, sort
+  wiring), so visuals do not break.
+- **Offline authoring of models AND reports.** Bulk measures, date dimensions, calculation
+  groups, hierarchies, report pages and visuals are written straight into PBIP files, no
+  Power BI required, in the exact shapes Desktop itself serializes (verified against
+  Microsoft's own TMDL engine and PBIR schemas).
+- **The full edit-and-verify loop.** Offline authoring + the Desktop Bridge (hot-reload the
+  running Desktop, no close/reopen) + one call that chains a bridge instance into live DAX/TOM.
+- **Warehouse-grade auditing.** Star-schema classification with findings and a score, a
+  referential-integrity orphan scan, a DAX anti-pattern linter, and custom BPA rule governance.
 - **A real governance and security layer.** Enforced column policies (block, mask, hash,
-  redact, numeric-mask), PII detection, a tamper-evident audit log, and a read-only lockdown mode.
+  redact, numeric-mask), PII detection, a tamper-evident (optionally HMAC-keyed) audit log,
+  and a read-only lockdown mode.
 - **Diagnostics and fleet ops.** Refresh-failure classification, unused-object cleanup, impact
   analysis, an RLS test matrix, and tenant-wide lineage and usage analytics.
 - **Offline, PBIP-first workflows.** The whole PBIP, analysis, and security subset runs
@@ -196,14 +209,28 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it fits together.
 ### Prerequisites
 
 **Live connectivity (Power BI Desktop / Service):** Windows 10/11, Power BI Desktop, Python 3.10+,
-and the ADOMD.NET client library. Newer Power BI Desktop builds no longer ship ADOMD.NET, so
-install SQL Server Management Studio (SSMS) or the `Microsoft.AnalysisServices.AdomdClient`
-NuGet package, or point `ADOMD_DLL_PATH` at the folder containing
-`Microsoft.AnalysisServices.AdomdClient.dll`. The server searches Power BI Desktop, SSMS, the
-SQL Server SDK, and NuGet automatically. Cloud also needs an Azure AD service principal and,
-for some operations, a Premium / PPU / Fabric capacity.
+and the ADOMD.NET client library (plus AMO/TOM for live writes). Newer Power BI Desktop builds no
+longer ship these, so install SQL Server Management Studio (SSMS), or grab both NuGet packages
+once and point the server at them:
 
-**Offline subset only (PBIP editing, BPA, analysis, security):** any OS, Python 3.10+, no .NET.
+```bash
+# one-time: fetch ADOMD + AMO/TOM from NuGet and extract the DLLs
+curl -L -o adomd.nupkg "https://www.nuget.org/api/v2/package/Microsoft.AnalysisServices.AdomdClient.retail.amd64"
+curl -L -o amo.nupkg   "https://www.nuget.org/api/v2/package/Microsoft.AnalysisServices.retail.amd64"
+# unzip both (they are ZIP files) and copy lib/net45/*.dll into one folder, e.g. C:\pbi-dlls
+# then set:  ADOMD_DLL_PATH=C:\pbi-dlls
+```
+
+The server also searches Power BI Desktop, the GAC, SSMS, the SQL Server SDK, and the NuGet
+cache automatically (`ADOMD_DLL_PATH` / `TOM_DLL_PATH` override). Cloud additionally needs an
+Azure AD service principal and, for some operations, a Premium / PPU / Fabric capacity.
+
+**Desktop Bridge tools (hot-reload, screenshots):** Power BI Desktop June 2026 or later with
+the preview option "Enable external tool access to Power BI Desktop through secure local APIs"
+(File > Options > Preview features; on by default).
+
+**Offline subset only (PBIP/TMDL/PBIR authoring and editing, BPA, linters, analysis, security):**
+any OS, Python 3.10+, no .NET.
 
 ### Install
 
@@ -313,7 +340,29 @@ The rename cascade is transactional (it rolls every file back on failure) and wr
 (temp file plus `os.replace`), preserving encoding and line endings.
 
 > **Always** use the `pbip_rename_*` tools for renames, not the deprecated TOM `batch_rename_*`
-> tools. Close Power BI Desktop before PBIP edits, then reopen.
+> tools. Close Power BI Desktop before PBIP edits, or keep it open and hot-reload afterwards
+> with `bridge_reload`.
+
+---
+
+## The edit-and-verify loop (Desktop Bridge)
+
+With Power BI Desktop June 2026+ the agent can drive a complete authoring loop against the
+RUNNING app, with the files on disk as the source of truth:
+
+```
+bridge_status          which file is open, unsaved-change state, pages, and the AS port
+   |
+pbip_* / pbir_* tools  author offline: measures, date table, calc groups, pages, visuals
+   |
+bridge_reload          hot-reload the open file from disk - no close/reopen
+   |
+bridge_screenshot      PNG of each page so the agent can SEE and fix its own work
+```
+
+`bridge_reload` refuses to run over unsaved Desktop changes (pass `force=true` to override),
+and `bridge_status` reports the matching Analysis Services port so the same window is one
+`desktop_connect` away from live DAX and TOM.
 
 ---
 
@@ -369,18 +418,29 @@ tables:
 
 ---
 
-## Testing
+## Testing and verification
 
-The suites in `tests/` are assert-based scripts that run without Power BI (pure logic is tested
-directly; live connectors are mocked).
+The 25 suites in `tests/` are assert-based scripts that run without Power BI (pure logic is
+tested directly; live connectors are mocked).
 
 ```bash
 python run_tests.py
 ```
 
-See [docs/TESTING.md](docs/TESTING.md) for what each suite covers. Live Desktop, XMLA, REST, and
-admin paths are doc-verified against Microsoft Learn and mock-tested; end-to-end verification of
-those paths needs a Windows + Power BI / Fabric environment.
+Verification goes four layers deep, using the strongest check available per surface:
+
+1. **Assert suites** for all pure logic (emitters, linters, auditors, security, parsers).
+2. **Adversarial doc-verification**: API contracts (PBIR schemas, TMDL shapes, REST/INFO
+   surfaces, the Desktop Bridge protocol) fact-checked against Microsoft Learn and real
+   exports before implementation.
+3. **Engine-level validation**: generated TMDL parses under Microsoft's own `TmdlSerializer`,
+   the code path Power BI Desktop runs when opening a PBIP.
+4. **Live testing** against a running Power BI Desktop: ADOMD queries, validated TOM batch
+   writes with rollback, the star-schema audit on a real model, and the Desktop Bridge
+   (discovery, manifest, state, hot-reload).
+
+Cloud XMLA/REST/admin paths are doc-verified and mock-tested; their end-to-end verification
+needs a real tenant. Details in [docs/TESTING.md](docs/TESTING.md).
 
 ---
 
@@ -414,6 +474,7 @@ powerbi-mcp/
 ├── tests/                           # Assert-based suites
 ├── docs/                            # TOOLS, ARCHITECTURE, TESTING
 ├── run_tests.py
+├── pbip_diagnostic_tool.py            # Standalone PBIP diagnostic utility
 ├── AGENTS.md, CLAUDE.md
 ├── Dockerfile, requirements-core.txt
 ├── pyproject.toml, .editorconfig
@@ -427,11 +488,13 @@ powerbi-mcp/
 
 | Limitation | Notes |
 |------------|-------|
-| Live connectivity is Windows only | ADOMD.NET and TOM require Windows. The offline subset runs cross-platform via Docker. |
+| Live connectivity is Windows only | ADOMD.NET, TOM, and the Desktop Bridge named pipe require Windows. The offline subset runs cross-platform via Docker. |
 | TOM renames break visuals | Use the PBIP tools for safe renames (they update the report layer too). |
+| `bridge_screenshot` depends on a Desktop preview fix | On current Desktop builds `report.snapshot.capture` can return an internal error for any input (a Desktop-side preview defect; verified independent of this client). Status, manifest, and hot-reload work. |
+| Cloud paths are doc-verified, not live-verified | XMLA/REST/admin tools are mock-tested and fact-checked against Microsoft Learn; they have not yet been exercised against a production tenant. |
 | Cloud enhanced refresh needs Premium | XMLA and enhanced refresh need PPU / Premium / Fabric capacity. Basic refresh and history work on Pro. |
 | Fleet governance is admin-gated | Scanner and Activity tools need Fabric admin, or a service principal allowed to use read-only admin APIs. |
-| Deep server timings | `analyze_query_performance` gives duration and hints; use DAX Studio for storage-vs-formula-engine timings. |
+| Deep server timings | `analyze_query_performance` gives duration and hints; use DAX Studio for storage-vs-formula-engine timings (a trace-based loop is on the roadmap). |
 
 ---
 
@@ -442,21 +505,34 @@ powerbi-mcp/
 - Power BI Desktop and Service connectivity, RLS testing, TOM writes, PBIP safe editing.
 - DAX validate-before-commit loop, atomic transactions, dependency and impact analysis.
 - Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage and query analysis.
-- Transactional, atomic, encoding-faithful PBIP renames.
-- Enforced column policies, PII masking, numeric masking, tamper-evident audit, read-only mode.
+- Transactional, atomic, encoding-faithful PBIP renames (model + report + hierarchies + sort wiring).
+- Enforced column policies, PII masking, numeric masking, HMAC-capable tamper-evident audit,
+  read-only mode, response-boundary secret redaction.
 - Documentation export, model snapshot and diff, pre-deploy gate, DAX regression runner.
 - Refresh doctor, unused-object detection, RLS test matrix.
 - Cross-workspace lineage, fleet refresh monitor, usage analytics.
 - Modern MCP surface: annotations, structured output, resources, prompts, completion.
 - Docker image for the cross-platform offline subset.
+- PBIR report authoring (pages, visuals, field bindings) with schema-verified output.
+- DAX anti-pattern linter with rewrite hints; SVG micro-visual measure generators.
+- Naming audit with rename plans; PBIX inspection/extraction; custom BPA rule governance.
+- Bulk DAX creation (time intelligence, ratios, ranks) written offline into TMDL or live via
+  validated TOM batches with intra-batch references and rollback.
+- Offline data modelling: generated date dimensions, calculation groups, hierarchies,
+  engine-verified against Microsoft's TmdlSerializer and a live Desktop.
+- Star-schema audit and referential-integrity orphan scanning.
+- Power BI Desktop Bridge integration: status, manifest, hot-reload, screenshots.
 
 ### Planned
 
+- Trace-based DAX optimization loop (formula-engine vs storage-engine timings) and an
+  EVALUATEANDLOG debugger.
+- Refresh trigger/monitor/cancel (Enhanced Refresh API + Desktop TMSL).
+- PyPI packaging, CI pipeline, and tagged releases.
+- Live validation of the cloud XMLA/REST/admin paths against a production tenant.
+- Best Practice Analyzer auto-fix; field parameters, object-level security, translations.
 - Remote HTTP transport with Microsoft Entra OAuth (today, use the official remote Power BI MCP
   server for cloud auth).
-- Best Practice Analyzer auto-fix and custom team rule packs.
-- Deeper VertiPaq (per-column cardinality) and server-timings capture.
-- Optional local / open-source LLM support.
 
 ---
 
