@@ -40,6 +40,7 @@ python tests/test_security_enforcement.py
 | `test_star_schema.py` | Fact/dim/date/bridge/measure-table classification + warehouse findings |
 | `test_tmdl_authoring.py` | TMDL emitters, connector round-trips, filename safety, rename integration |
 | `test_desktop_bridge.py` | Bridge JSON-RPC framing, fake-pipe client, discovery, page resolution, reload guard |
+| `test_registry_parity.py` | Tool list, dispatch map, and annotation map contain exactly the same names; write-gate names real tools |
 
 ## Engine-level verification of generated TMDL
 
@@ -62,14 +63,19 @@ Note for live (TOM) workflows: a calculated table created through TOM needs a **
 refresh** to materialize rows; a PBIP-authored one materializes when Desktop opens the project.
 
 ## Coverage philosophy
-- **Offline / pure logic** (security, PBIP rename, model analysis, diff, refresh
-  classification, governance parsing) — fully unit/mock tested here.
-- **Live paths** (Desktop/XMLA/TOM/REST/Admin) — orchestration is mock-tested and the API
-  contracts are doc-verified against Microsoft Learn; **end-to-end verification needs a
-  Windows + Power BI / Fabric environment** (see the live smoke-test checklist in the README).
+- **Offline / pure logic** (security, PBIP rename, authoring emitters, model analysis, diff,
+  refresh classification, governance parsing) — fully unit/mock tested here, with the TMDL and
+  PBIR emitters additionally verified at engine level (see above).
+- **Desktop live paths** — verified against a running Power BI Desktop (2026-07): ADOMD
+  queries, validated TOM batch creation with compensating rollback, the star-schema audit on a
+  real model, and the Desktop Bridge (pipe discovery, manifest, application state, hot-reload
+  in both the clean and unsaved-guard states). `bridge_screenshot` is blocked by a Desktop-side
+  preview defect (internal error for any input, including unknown page ids).
+- **Cloud paths** (XMLA/REST/Admin) — orchestration is mock-tested and the API contracts are
+  doc-verified against Microsoft Learn; **end-to-end verification needs a real tenant**.
 
 ## Adding a tool (keep the registry in sync)
 A tool must be registered in three places in `src/server.py`: `handle_list_tools` (the `Tool`
 spec), `_build_tool_dispatch` (the handler), and `_build_tool_annotations` (the safety hints).
-A parity check (in the verification scripts) asserts all three contain the same names — keep
-them aligned or `list_tools`/`call_tool` will drift.
+`tests/test_registry_parity.py` asserts all three contain exactly the same names (and that
+the read-only write gate only names real tools) — keep them aligned or the suite fails.

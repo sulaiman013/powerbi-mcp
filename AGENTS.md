@@ -10,7 +10,10 @@ govern, and safely refactor Power BI semantic models and reports. It connects to
 
 - **Power BI Desktop** (local Analysis Services) - read + write, RLS testing
 - **Power BI Service** (XMLA + REST) - cloud datasets
-- **PBIP / TMDL / PBIR files** (offline) - safe, report-aware refactoring
+- **PBIP / TMDL / PBIR files** (offline) - safe, report-aware refactoring AND authoring
+  (measures, date tables, calculation groups, hierarchies, report pages/visuals)
+- **The running Desktop app** (Desktop Bridge, preview) - open-file state, hot-reload
+  from disk, page screenshots
 
 It also runs fully cross-platform for the offline + analysis subset (PBIP editing,
 Best Practice Analyzer, AI-readiness, security) even without ADOMD/.NET.
@@ -20,7 +23,10 @@ Best Practice Analyzer, AI-readiness, security) even without ADOMD/.NET.
 1. **Renaming: always use the PBIP tools, never the TOM `batch_rename_*` tools.**
    TOM renames only touch the model and break report visuals. `pbip_rename_tables`
    / `pbip_rename_columns` / `pbip_rename_measures` update the model AND the report
-   layer (visual.json, cultures, diagram). Close Power BI Desktop before PBIP edits.
+   layer (visual.json, cultures, diagram, hierarchy levels, sortByColumn). After any
+   offline PBIP edit, hot-reload the open Desktop with `bridge_reload` (check
+   `bridge_status` first; never reload over unsaved changes) instead of asking the
+   user to close and reopen.
 2. **Validate DAX before you commit it.** Call `validate_dax` on any new/edited
    measure expression. `create_measure` and `batch_update_measures` validate
    automatically (pass `skip_validation: true` only if you must).
@@ -60,13 +66,15 @@ Best Practice Analyzer, AI-readiness, security) even without ADOMD/.NET.
 ## Prompts (guided workflows)
 
 `optimize_measure`, `explain_measure`, `audit_model`, `document_model`,
-`plan_safe_rename` - invoke these for ready-made, tool-orchestrated playbooks.
+`plan_safe_rename`, `pre_deploy_review` - invoke these for ready-made, tool-orchestrated
+playbooks.
 
 ## Resources
 
-`powerbi://desktop/schema`, `.../measures`, `.../bpa`, `.../ai-readiness`, and the
-template `powerbi://cloud/{workspace}/{dataset}/schema` expose model context as
-read-only resources (no tool call needed).
+`powerbi://desktop/schema`, `.../measures`, `.../bpa`, `.../ai-readiness`, the template
+`powerbi://cloud/{workspace}/{dataset}/schema`, and the reference resources
+`powerbi://reference/bpa-rules` and `powerbi://reference/refresh-errors` expose model
+context as read-only resources (no tool call needed).
 
 ## DAX patterns the agent should prefer
 

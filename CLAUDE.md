@@ -9,6 +9,8 @@ Quick reminders:
   `tom_begin_transaction` / `tom_commit_transaction` scope.
 - `scan_measure_dependencies` + `pbip_scan_broken_refs` before destructive changes.
 - Read the `powerbi://desktop/schema` resource to ground DAX in real object names.
+- After offline PBIP/PBIR edits, hot-reload the open Desktop with `bridge_reload`
+  (never over unsaved changes) instead of asking the user to close and reopen.
 
 ## Developer notes
 
