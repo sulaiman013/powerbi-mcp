@@ -10,6 +10,12 @@ TOM writes, star-schema audit, referential integrity) plus a 5-dimension adversa
 review (44 findings raised, 39 confirmed after independent verification). All confirmed
 findings fixed; 23/23 suites pass; every fix re-verified against the live model.
 
+The generated TMDL was additionally verified at ENGINE level: Microsoft's own
+`TmdlSerializer` (the AMO code path Desktop uses on open) parses a full generated project
+with every property round-tripping, and the same structures were created, calculate-refreshed,
+and evaluated on a live Desktop model via TOM (correct row counts and fiscal-year values),
+then fully removed. See docs/TESTING.md "Engine-level verification".
+
 ### Fixed — live connectivity
 - **TOM discovery now honors `TOM_DLL_PATH` / `ADOMD_DLL_PATH`** (folder or DLL path) and the
   AMO NuGet package cache, matching the ADOMD loader; previously a NuGet-installed
