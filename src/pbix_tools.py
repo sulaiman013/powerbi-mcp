@@ -5,7 +5,9 @@ A .pbix file is an OPC (ZIP) package. Most real-world reports start life as .pbi
 .pbip project, so being able to crack one open, see what is inside, and pull out the report layout
 is a key onboarding step before the rest of the PBIP/PBIR tooling can act on a report.
 
-Pure stdlib (zipfile), cross-platform, no Power BI required. Zip-Slip protected on extraction.
+Pure stdlib (zipfile), cross-platform, no Power BI required. Extraction is Zip-Slip protected,
+streams each member to disk (a multi-gigabyte DataModel never sits in memory) and stops at a
+size cap, so a crafted archive cannot fill the disk.
 
 Key entries:
   - DataModel              the imported VertiPaq model (opaque) -> a "thick" report
@@ -25,6 +27,12 @@ import zipfile
 from typing import Any, Dict, List, Optional
 
 _LAYOUT_NAMES = ("Report/Layout", "Report/layout")
+# Most .pbix files are tens or hundreds of megabytes; the largest imported models reach a few
+# gigabytes. Anything that claims (or turns out) to unpack beyond this is refused.
+DEFAULT_MAX_EXTRACT_BYTES = 8 * 1024 ** 3
+# The report layout and page files are JSON read into memory; real ones are a few megabytes.
+MAX_JSON_MEMBER_BYTES = 256 * 1024 ** 2
+_CHUNK = 1024 * 1024
 
 
 def _layout_name(names: List[str]) -> Optional[str]:
@@ -32,6 +40,17 @@ def _layout_name(names: List[str]) -> Optional[str]:
         if n in names:
             return n
     return None
+
+
+def _read_member(z: zipfile.ZipFile, name: str, limit: Optional[int] = None) -> bytes:
+    """A member's bytes, refusing one that unpacks to more than ``limit`` (by default
+    MAX_JSON_MEMBER_BYTES)."""
+    limit = MAX_JSON_MEMBER_BYTES if limit is None else limit
+    with z.open(name) as src:
+        data = src.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"Archive member '{name}' is larger than {limit:,} bytes; not read")
+    return data
 
 
 def _decode_layout_bytes(raw: bytes) -> Optional[Dict[str, Any]]:
@@ -69,7 +88,7 @@ def inspect(path: str) -> Dict[str, Any]:
         page_count = None
         if layout:
             try:
-                lj = _decode_layout_bytes(z.read(layout))
+                lj = _decode_layout_bytes(_read_member(z, layout))
                 if isinstance(lj, dict):
                     page_count = len(lj.get("sections", []) or [])
             except Exception:
@@ -97,7 +116,7 @@ def read_layout(path: str) -> Optional[Dict[str, Any]]:
         layout = _layout_name(z.namelist())
         if not layout:
             return None
-        return _decode_layout_bytes(z.read(layout))
+        return _decode_layout_bytes(_read_member(z, layout))
 
 
 def read_pbir_pages(path: str) -> List[Dict[str, Any]]:
@@ -114,7 +133,7 @@ def read_pbir_pages(path: str) -> List[Dict[str, Any]]:
         meta_name = "Report/definition/pages/pages.json"
         if meta_name in names:
             try:
-                meta = json.loads(z.read(meta_name).decode("utf-8-sig"))
+                meta = json.loads(_read_member(z, meta_name).decode("utf-8-sig"))
                 order = list(meta.get("pageOrder", []))
                 active = meta.get("activePageName")
             except Exception:
@@ -124,7 +143,7 @@ def read_pbir_pages(path: str) -> List[Dict[str, Any]]:
             if (len(parts) == 5 and parts[:3] == ["Report", "definition", "pages"]
                     and parts[4] == "page.json"):
                 try:
-                    data = json.loads(z.read(n).decode("utf-8-sig"))
+                    data = json.loads(_read_member(z, n).decode("utf-8-sig"))
                 except Exception:
                     continue
                 pid = data.get("name") or parts[3]
@@ -142,39 +161,74 @@ def _safe_target(dest: str, name: str) -> str:
     """Resolve an archive member to a path inside dest, rejecting Zip-Slip traversal."""
     dest_abs = os.path.abspath(dest)
     target = os.path.abspath(os.path.join(dest_abs, name))
-    if target != dest_abs and not target.startswith(dest_abs + os.sep):
+    try:
+        inside = os.path.commonpath([dest_abs, target]) == dest_abs
+    except ValueError:                      # different drives
+        inside = False
+    if not inside or target == dest_abs:
         raise ValueError(f"Unsafe path in archive (path traversal): {name}")
     return target
 
 
-def extract(path: str, dest: str, decode_layout: bool = True) -> Dict[str, Any]:
-    """Extract every member into dest (Zip-Slip protected). When decode_layout is set and a
-    legacy layout exists, also write a UTF-8 'Report/Layout.json' for easy inspection/editing."""
+def extract(path: str, dest: str, decode_layout: bool = True,
+            max_bytes: Optional[int] = DEFAULT_MAX_EXTRACT_BYTES) -> Dict[str, Any]:
+    """Extract every member into dest. When decode_layout is set and a legacy layout exists,
+    also write a UTF-8 'Report/Layout.json' for easy inspection/editing.
+
+    Every member path is checked before anything is written, so an archive with a traversal
+    entry leaves nothing behind. Extraction is refused with a ValueError when the archive
+    declares more than ``max_bytes`` of unpacked data (None disables the cap); zipfile never
+    yields more than a member's declared size, so that check bounds what reaches the disk.
+    Members are copied in chunks, and if a copy fails the files this call wrote are removed."""
     if not zipfile.is_zipfile(path):
         raise ValueError(f"Not a valid PBIX/ZIP package: {path}")
-    os.makedirs(dest, exist_ok=True)
     written: List[str] = []
+    created: List[str] = []
+    total = 0
     with zipfile.ZipFile(path) as z:
-        for info in z.infolist():
-            if info.is_dir():
-                continue
-            target = _safe_target(dest, info.filename)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with z.open(info) as src, open(target, "wb") as out:
-                out.write(src.read())
-            written.append(info.filename)
+        members = [info for info in z.infolist() if not info.is_dir()]
+        targets = [_safe_target(dest, info.filename) for info in members]
+        declared = sum(info.file_size for info in members)
+        if max_bytes is not None and declared > max_bytes:
+            raise ValueError(f"Archive unpacks to {declared:,} bytes, over the {max_bytes:,} byte limit; "
+                             "nothing was extracted")
+        os.makedirs(dest, exist_ok=True)
+        try:
+            for info, target in zip(members, targets):
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                created.append(target)
+                with z.open(info) as src, open(target, "wb") as out:
+                    while True:
+                        chunk = src.read(_CHUNK)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        out.write(chunk)
+                written.append(info.filename)
 
-        layout_decoded = False
-        if decode_layout:
-            layout = _layout_name(z.namelist())
-            if layout:
-                lj = _decode_layout_bytes(z.read(layout))
-                if lj is not None:
-                    out_path = _safe_target(dest, "Report/Layout.json")
-                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                    with open(out_path, "w", encoding="utf-8") as f:
-                        json.dump(lj, f, indent=2, ensure_ascii=False)
-                    layout_decoded = True
+            layout_decoded = False
+            if decode_layout:
+                layout = _layout_name(z.namelist())
+                # Decode from the copy just written; a layout too large to be a real one is
+                # left as extracted rather than loaded into memory.
+                extracted = _safe_target(dest, layout) if layout else None
+                if extracted and os.path.getsize(extracted) <= MAX_JSON_MEMBER_BYTES:
+                    with open(extracted, "rb") as f:
+                        lj = _decode_layout_bytes(f.read())
+                    if lj is not None:
+                        out_path = _safe_target(dest, "Report/Layout.json")
+                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                        created.append(out_path)
+                        with open(out_path, "w", encoding="utf-8") as f:
+                            json.dump(lj, f, indent=2, ensure_ascii=False)
+                        layout_decoded = True
+        except BaseException:
+            for target in created:
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+            raise
 
     return {"dest": str(dest), "files": written, "file_count": len(written),
-            "layout_decoded": layout_decoded}
+            "layout_decoded": layout_decoded, "total_bytes": total}

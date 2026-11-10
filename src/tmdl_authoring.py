@@ -22,9 +22,11 @@ add_hierarchy methods.
 """
 import datetime
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import dax_generator
+import tmdl_scan
 
 TAB = "\t"
 _NEEDS_QUOTE = re.compile(r"[\s.='':]|^\d")
@@ -58,18 +60,21 @@ def _doc_comment(description: Optional[str], indent: str) -> List[str]:
 def render_measure(measure: Dict[str, Any], depth: int = 1) -> str:
     """Render one measure block at the given tab depth (1 = direct table child).
 
-    measure: {name, expression, format_string?, display_folder?, description?, is_hidden?}
+    measure: {name, expression, format_string?, display_folder?, description?, is_hidden?,
+              lineage_tag?}
     """
     ind = TAB * depth
     prop = TAB * (depth + 1)
     body = TAB * (depth + 2)
     name = quote_name(measure["name"])
-    expr = str(measure["expression"]).strip()
+    # A bare carriage return would be read as a line break by TMDL and end the expression
+    # early, so every line-break form is treated as a new expression line.
+    expr = str(measure["expression"]).replace("\r\n", "\n").replace("\r", "\n").strip()
     lines: List[str] = []
     lines.extend(_doc_comment(measure.get("description"), ind))
     if "\n" in expr:
         lines.append(f"{ind}measure {name} =")
-        for raw in expr.splitlines():
+        for raw in expr.split("\n"):
             lines.append(f"{body}{raw.rstrip()}" if raw.strip() else "")
     else:
         lines.append(f"{ind}measure {name} = {expr}")
@@ -79,6 +84,8 @@ def render_measure(measure: Dict[str, Any], depth: int = 1) -> str:
         lines.append(f"{prop}displayFolder: {measure['display_folder']}")
     if measure.get("is_hidden"):
         lines.append(f"{prop}isHidden")
+    if measure.get("lineage_tag"):
+        lines.append(f"{prop}lineageTag: {measure['lineage_tag']}")
     return "\n".join(lines)
 
 
@@ -273,18 +280,53 @@ def build_calculation_group(name: str, items: List[Dict[str, Any]],
 
 # ---------------------------------------------------------------- table-file helpers
 
-def find_table_end(content: str) -> int:
-    """Index in content where new table children can be appended (end of the single-table
-    file, trimmed of trailing whitespace)."""
-    return len(content.rstrip())
+@dataclass
+class MeasureBlock:
+    """Where one measure sits in a table file: ``content[start:end]`` runs from the first
+    line of its /// description (or its declaration) to the end of its last property or
+    annotation line, without the trailing newline."""
+    name: str
+    start: int
+    end: int
+    lineage_tag: Optional[str] = None
+
+
+def find_measure_block(content: str, table: str, measure: str) -> Optional[MeasureBlock]:
+    """Locate measure ``measure`` of ``table`` in TMDL text by its position in the object
+    tree, so the block is found whatever order its properties are written in."""
+    doc = tmdl_scan.scan(content)
+    for root in doc.roots:
+        if root.keyword != "table" or root.is_ref or (root.name or "").casefold() != table.casefold():
+            continue
+        for node in root.children_of("measure"):
+            if (node.name or "").casefold() != measure.casefold():
+                continue
+            end = node.end
+            stack = [node]
+            while stack:
+                n = stack.pop()
+                end = max(end, n.end, n.expr_span[1] if n.expr_span else 0)
+                stack.extend(n.children)
+            start = content.rfind("\n", 0, node.start) + 1
+            while start > 0:                       # take the /// lines directly above with it
+                prev = content.rfind("\n", 0, start - 1) + 1
+                if not content[prev:start - 1].strip().startswith("///"):
+                    break
+                start = prev
+            tag = node.child("lineageTag")
+            return MeasureBlock(node.name, start, end, tag.value if tag is not None and tag.value else None)
+    return None
 
 
 def append_block(content: str, block: str) -> str:
     """Append a rendered block to a table .tmdl, separated by one blank line, preserving a
     trailing newline and the file's existing line-ending convention (CRLF vs LF)."""
-    nl = "\r\n" if "\r\n" in content else "\n"
+    # Text read through safe_io uses "\n" unless the file mixes styles, in which case it is
+    # handed over as stored; the block then follows the style the file ends with.
     head = content.rstrip()
-    body = block.rstrip()
+    tail = content[len(head):]
+    nl = "\r\n" if "\r\n" in (tail or content) else "\n"
+    body = block.rstrip().replace("\r\n", "\n")
     if nl == "\r\n":
-        body = body.replace("\r\n", "\n").replace("\n", "\r\n")
+        body = body.replace("\n", "\r\n")
     return head + nl * 2 + body + nl

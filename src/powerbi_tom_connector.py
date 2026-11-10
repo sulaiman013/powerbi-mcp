@@ -2,95 +2,56 @@
 Power BI TOM (Tabular Object Model) Connector
 Provides write operations: rename, update, create, delete for tables, columns, measures
 Uses Microsoft.AnalysisServices.Tabular for model modifications
+
+How writes work, because every guarantee below depends on it:
+
+* TOM keeps a local copy of the model. An edit changes that copy; ``Model.SaveChanges()`` sends
+  all pending edits to the engine as ONE batch, which the engine applies entirely or not at all.
+* Outside a transaction the mutating methods only stage an edit; the caller follows up with
+  ``save_changes()`` (the batch methods do it themselves when ``auto_save`` is true). If that
+  save fails, the staged edits are undone, so a rejected edit can never ride along with the
+  next, unrelated save.
+* A transaction (``begin_transaction`` / ``commit_transaction`` / ``rollback_transaction``) is
+  owned by this connector, not by its caller: while it is open nothing saves implicitly, not
+  even an explicit ``save_changes()`` or ``auto_save=True``. Commit is the single SaveChanges,
+  rollback is ``UndoLocalChanges()``. A failed commit leaves the transaction open with its
+  edits intact, so the caller can fix the cause or roll back. "Reversible" therefore means
+  until commit; a committed transaction is not undone by this class.
+* Every operation is atomic on the local copy: if it fails halfway (a rename that rewrote
+  three expressions before the engine rejected the new name) its own edits are reverted, in or
+  out of a transaction, without touching anything else that is staged.
+* The local copy is re-synchronised from the engine before a write when nothing is staged, so
+  objects created in Power BI Desktop after ``connect`` are seen.
+
+Renames rewrite DAX with the shared tokenizer (dax_tokens), never with regular expressions over
+raw text: strings, comments and same-named objects of other kinds are left alone.
 """
 import logging
-import os
-import sys
-from typing import Any, Dict, List, Optional, Tuple
-from pathlib import Path
+import threading
 from dataclasses import dataclass
+from functools import wraps
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+import adomd_loader
+import dax_tokens as dt
+from adomd_query import clean_error
+from connection_strings import ConnectionStringError, local_data_source
 
 logger = logging.getLogger(__name__)
 
-# Find and load TOM DLLs
+# Load TOM (runtime-aware discovery with fall-through; see adomd_loader). TOM_DLL_PATH, then
+# ADOMD_DLL_PATH, are tried before any system location.
+_tom = adomd_loader.load_tom()
+_tom_available = _tom.available
+_tom_path = _tom.directory
+TOM = _tom.value if _tom.available else None
+
+
 def _find_tom_dll() -> Optional[Path]:
-    """Find Microsoft.AnalysisServices.Tabular.dll.
-
-    Honors TOM_DLL_PATH (folder or full DLL path) and, as a convenience, ADOMD_DLL_PATH,
-    since the AMO NuGet package's DLLs are commonly extracted alongside the ADOMD client."""
-    for env_var in ("TOM_DLL_PATH", "ADOMD_DLL_PATH"):
-        override = os.environ.get(env_var)
-        if override:
-            p = Path(override)
-            candidate = p if p.suffix.lower() == ".dll" else p / "Microsoft.AnalysisServices.Tabular.dll"
-            if candidate.name.lower() == "microsoft.analysisservices.tabular.dll" and candidate.exists():
-                return candidate.parent
-            if p.is_dir():
-                hits = list(p.glob("**/Microsoft.AnalysisServices.Tabular.dll"))
-                if hits:
-                    return hits[0].parent
-
-    possible_paths = [
-        # Power BI Desktop installation (preferred)
-        Path(r"C:\Program Files\Microsoft Power BI Desktop\bin"),
-        Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Power BI Desktop\bin")),
-        # SQL Server installations
-        Path(r"C:\Program Files\Microsoft SQL Server\160\SDK\Assemblies"),
-        Path(r"C:\Program Files\Microsoft SQL Server\150\SDK\Assemblies"),
-        Path(r"C:\Program Files (x86)\Microsoft SQL Server\160\SDK\Assemblies"),
-        # Update Cache
-        Path(r"C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Update Cache"),
-    ]
-
-    # AMO NuGet package cache (Microsoft.AnalysisServices[.retail.amd64])
-    nuget_root = Path(os.path.expandvars(r"%USERPROFILE%\.nuget\packages"))
-    if nuget_root.exists():
-        for pkg_dir in nuget_root.glob("microsoft.analysisservices*"):
-            possible_paths.append(pkg_dir)
-
-    # Check Update Cache for latest version
-    update_cache = Path(r"C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Update Cache")
-    if update_cache.exists():
-        update_folders = list(update_cache.glob("*/GDR/x64"))
-        if update_folders:
-            possible_paths.insert(0, sorted(update_folders)[-1])
-
-    for path in possible_paths:
-        if path.exists():
-            # Check for Tabular DLL
-            tabular_dll = path / "Microsoft.AnalysisServices.Tabular.dll"
-            if tabular_dll.exists():
-                return path
-            # Also check subdirectories
-            for dll in path.glob("**/Microsoft.AnalysisServices.Tabular.dll"):
-                return dll.parent
-
-    return None
-
-
-# Initialize TOM
-_tom_path = _find_tom_dll()
-_tom_available = False
-TOM = None
-TOMServer = None
-
-if _tom_path:
-    path_str = str(_tom_path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
-    if path_str not in os.environ.get('PATH', ''):
-        os.environ['PATH'] = path_str + os.pathsep + os.environ.get('PATH', '')
-
-    try:
-        import clr
-        clr.AddReference("Microsoft.AnalysisServices.Tabular")
-        import Microsoft.AnalysisServices.Tabular as TOM
-        _tom_available = True
-        logger.info(f"Loaded TOM from: {_tom_path}")
-    except Exception as e:
-        logger.warning(f"Failed to load TOM: {e}")
-else:
-    logger.warning("TOM DLL not found - write operations unavailable")
+    """Directory of the TOM build preferred for the active runtime (kept for older callers)."""
+    candidates = adomd_loader.tom_candidates()
+    return candidates[0].parent if candidates else None
 
 
 @dataclass
@@ -109,6 +70,134 @@ class OperationResult:
     details: Optional[Dict[str, Any]] = None
 
 
+TABLE_RENAME_WARNING = (
+    "IMPORTANT: Renaming tables will update model references (measures, relationships) but CANNOT "
+    "update report visuals. Visuals using this table will break and need manual fixing in Power BI Desktop."
+)
+
+# expression kind -> key of the list in a result's details
+_KIND_KEYS = {
+    "measure": "updated_measures",
+    "calculated_column": "updated_calculated_columns",
+    "calculated_table": "updated_calculated_tables",
+    "calculation_item": "updated_calculation_items",
+    "rls_filter": "updated_rls_filters",
+    "kpi": "updated_kpis",
+}
+_OTHER_KEY = "updated_other"
+_DETAIL_KEYS = tuple(_KIND_KEYS.values()) + (_OTHER_KEY,)
+_PAST = {"rename": "Renamed", "update": "Updated"}
+
+
+def _opt(obj: Any, attr: str) -> Any:
+    """An optional member of a TOM object, or None.
+
+    Newer members (FormatStringDefinition, CalculationGroup, Functions, ...) are missing on
+    older TOM builds, and some getters refuse below a compatibility level. Either way the
+    object simply has nothing there, which is what None says.
+    """
+    try:
+        return getattr(obj, attr, None)
+    except Exception:
+        return None
+
+
+def _enum_name(value: Any) -> str:
+    """'Calculated' for PartitionSourceType.Calculated, however the runtime renders the enum."""
+    return "" if value is None else str(value).rsplit(".", 1)[-1]
+
+
+def _locked(method: Callable) -> Callable:
+    """Serialise a public method: TOM objects are not thread-safe and handlers run in a pool."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+class _Journal:
+    """Undo log for one operation on the local model."""
+
+    def __init__(self) -> None:
+        self._undo: List[Callable[[], None]] = []
+
+    def __len__(self) -> int:
+        return len(self._undo)
+
+    def set(self, obj: Any, attr: str, value: Any) -> None:
+        old = getattr(obj, attr)
+        setattr(obj, attr, value)
+        self._undo.append(lambda: setattr(obj, attr, old))
+
+    def add(self, collection: Any, item: Any) -> None:
+        collection.Add(item)
+        self._undo.append(lambda: collection.Remove(item))
+
+    def rollback(self) -> List[str]:
+        """Revert everything recorded, newest first. Returns the problems met while doing so."""
+        problems: List[str] = []
+        while self._undo:
+            undo = self._undo.pop()
+            try:
+                undo()
+            except Exception as e:
+                problems.append(clean_error(e))
+        return problems
+
+
+@dataclass
+class _Slot:
+    """One DAX expression stored in the model."""
+    obj: Any
+    attr: str
+    kind: str
+    label: str                   # how the expression is named in results, e.g. "Sales[Total]"
+    home: Optional[str] = None   # the table that owns the object
+    name: Optional[str] = None   # the object's own name, where it has one
+    table: Optional[str] = None  # the table whose row context the expression runs in, if any
+
+    @property
+    def text(self) -> str:
+        value = _opt(self.obj, self.attr)
+        return value if isinstance(value, str) else ""
+
+
+def _has_string_literal(expr: str, name: str) -> bool:
+    """True when ``expr`` contains the string literal "name": the usual sign of an extension
+    column of that name (ADDCOLUMNS(..., "name", ...)), which an unqualified [name] may mean."""
+    for token in dt.tokenize(expr):
+        if token.kind == dt.STRING:
+            body = token.text[1:-1] if len(token.text) >= 2 and token.text.endswith('"') else token.text[1:]
+            if dt.names_equal(body.replace('""', '"'), name):
+                return True
+    return False
+
+
+def _rename_measure_qualified_only(expr: str, old: str, new: str, is_column: Callable[[str, str], bool],
+                                   measure_table: str) -> Tuple[str, int, int]:
+    """Like dax_tokens.rename_measure, but unqualified [old] is left alone and counted.
+
+    Used for expressions evaluated in the row context of a table that has a COLUMN called
+    ``old``: there an unqualified [old] is far more likely that column than the measure.
+    Returns (new_expr, replacements, unqualified_left).
+    """
+    tokens = dt.tokenize(expr)
+    replacements: Dict[int, str] = {}
+    left = 0
+    for ref in dt.iter_references(tokens):
+        if not dt.names_equal(ref.name, old):
+            continue
+        if ref.kind == "bare":
+            left += 1
+        elif (ref.kind == "column" and dt.names_equal(ref.table, measure_table)
+              and not is_column(ref.table, ref.name)):
+            replacements[ref.index] = dt.bracket(new)
+    if not replacements:
+        return expr, 0, left
+    return "".join(replacements.get(i, t.text) for i, t in enumerate(tokens)), len(replacements), left
+
+
 class PowerBITOMConnector:
     """
     TOM Connector for Power BI Desktop write operations
@@ -117,6 +206,7 @@ class PowerBITOMConnector:
     - Rename tables, columns, measures
     - Update measure expressions
     - Batch operations for bulk changes
+    - Connector-owned transactions (see the module docstring)
     """
 
     def __init__(self):
@@ -126,13 +216,65 @@ class PowerBITOMConnector:
         self.model = None
         self.current_port: Optional[int] = None
         self.connection_string: Optional[str] = None
+        self.last_error: Optional[str] = None  # why the last connect() returned False
         self._changes_pending = False
+        self._txn_open = False
+        self._lock = threading.RLock()
 
     @staticmethod
     def is_available() -> bool:
         """Check if TOM is available"""
         return _tom_available
 
+    @staticmethod
+    def availability_details() -> str:
+        """Which TOM DLL was loaded, or exactly why none could be."""
+        return _tom.describe()
+
+    # ==================== CONNECTION ====================
+
+    def _drop_connection(self) -> None:
+        """Forget the local model (and with it anything staged) and release the session."""
+        server = self.server
+        self.server = None
+        self.database = None
+        self.model = None
+        self._changes_pending = False
+        if server is not None:
+            try:
+                server.Disconnect()
+            except Exception as e:
+                # The session is gone either way; a failed goodbye changes nothing.
+                logger.debug(f"TOM disconnect failed: {clean_error(e)}")
+
+    def _connect_fresh(self, port: int) -> None:
+        """Open a new session and take its (single) database. Raises on any problem."""
+        server = TOM.Server()
+        server.Connect(local_data_source(port))
+        try:
+            count = int(server.Databases.Count)
+            if count != 1:
+                # Power BI Desktop hosts exactly one database. Anything else is a full Analysis
+                # Services server, and "the first database" there is not ours to edit.
+                raise RuntimeError(
+                    f"expected the single database of a Power BI Desktop instance, found {count}; "
+                    "refusing to pick one to write to")
+            database = server.Databases[0]
+            model = database.Model
+            if model is None:
+                raise RuntimeError("the database has no tabular model")
+        except Exception:
+            try:
+                server.Disconnect()
+            except Exception as e:
+                logger.debug(f"TOM disconnect failed: {clean_error(e)}")
+            raise
+        self.server, self.database, self.model = server, database, model
+        self.current_port = port
+        self.connection_string = local_data_source(port)
+        self._changes_pending = False
+
+    @_locked
     def connect(self, port: int) -> bool:
         """
         Connect to Power BI Desktop instance via TOM
@@ -141,49 +283,52 @@ class PowerBITOMConnector:
             port: Port number of the Power BI Desktop instance
 
         Returns:
-            True if connection successful
+            True if connection successful; on False, ``last_error`` says why.
+
+        Connecting to a different port is refused while a transaction is open or edits are
+        staged: the staged edits belong to the current model and would be lost silently.
+        Reconnecting to the same port in that situation is a no-op that keeps them.
         """
+        self.last_error = None
         if not _tom_available:
+            self.last_error = self.availability_details()
             logger.error("TOM not available - cannot connect for write operations")
             return False
-
         try:
-            self.current_port = port
-            self.connection_string = f"localhost:{port}"
+            local_data_source(port)
+        except ConnectionStringError as e:
+            self.last_error = str(e)
+            logger.error(f"TOM connection failed: {self.last_error}")
+            return False
+        port = int(port)
 
-            # Create TOM Server and connect
-            self.server = TOM.Server()
-            self.server.Connect(self.connection_string)
-
-            # Get the database (Power BI Desktop has one database)
-            if self.server.Databases.Count > 0:
-                self.database = self.server.Databases[0]
-                self.model = self.database.Model
-                logger.info(f"TOM connected to: {self.database.Name}")
+        if self.model is not None and (self._txn_open or self._has_local_changes()):
+            if port == self.current_port:
                 return True
-            else:
-                logger.error("No database found in Power BI Desktop")
-                return False
-
-        except Exception as e:
-            logger.error(f"TOM connection failed: {e}")
-            self.server = None
-            self.database = None
-            self.model = None
+            what = "A transaction is open" if self._txn_open else "There are unsaved edits"
+            self.last_error = (f"{what} on port {self.current_port}; commit or roll back "
+                               f"(save or discard) before connecting to port {port}.")
+            logger.error(f"TOM connection refused: {self.last_error}")
             return False
 
+        self._drop_connection()
+        self._txn_open = False
+        try:
+            self._connect_fresh(port)
+        except Exception as e:
+            self.last_error = clean_error(e)
+            logger.error(f"TOM connection failed: {self.last_error}")
+            return False
+        logger.info(f"TOM connected to: {self.database.Name}")
+        return True
+
+    @_locked
     def disconnect(self):
-        """Disconnect from the model"""
-        if self.server:
-            try:
-                self.server.Disconnect()
-            except:
-                pass
-        self.server = None
-        self.database = None
-        self.model = None
+        """Disconnect from the model. Staged edits and an open transaction are discarded;
+        nothing that was not saved reaches the model."""
+        self._drop_connection()
         self.current_port = None
-        self._changes_pending = False
+        self._txn_open = False
 
     def _ensure_connected(self) -> bool:
         """Ensure we have a valid connection"""
@@ -192,153 +337,316 @@ class PowerBITOMConnector:
             return False
         return True
 
-    def save_changes(self) -> OperationResult:
-        """Save pending changes to the model"""
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+    def _has_local_changes(self) -> bool:
+        return bool(self._changes_pending or _opt(self.model, "HasLocalChanges"))
 
+    def _sync(self) -> Optional[str]:
+        """Bring the local model up to date with the engine. Returns an error text or None.
+
+        ``Model.Sync()`` is the cheap way. If the session behind it is gone, a new connection
+        yields the same fresh copy; only when that fails too is there an error to report.
+        """
         try:
-            self.model.SaveChanges()
-            self._changes_pending = False
-            logger.info("Changes saved successfully")
-            return OperationResult(True, "Changes saved successfully")
+            self.model.Sync()
+            return None
         except Exception as e:
-            logger.error(f"Failed to save changes: {e}")
-            return OperationResult(False, f"Failed to save changes: {e}")
+            first = clean_error(e)
+        port = self.current_port
+        self._drop_connection()
+        try:
+            self._connect_fresh(port)
+        except Exception as e:
+            return f"{first}; reconnecting also failed: {clean_error(e)}"
+        return None
 
-    def discard_changes(self) -> OperationResult:
-        """Discard pending changes"""
+    def _begin_write(self) -> Optional[OperationResult]:
+        """Common entry of every mutating method. Returns a failure result, or None to go on.
+
+        With nothing staged the local model is re-synchronised first, so the edit is checked
+        against the model as it is now, not as it was at connect time. With edits staged (an
+        open transaction, or a stage-then-save in progress) the local model IS the working
+        state and must not be replaced.
+        """
         if not self._ensure_connected():
             return OperationResult(False, "Not connected")
+        if self._txn_open or self._has_local_changes():
+            return None
+        error = self._sync()
+        if error:
+            return OperationResult(
+                False, f"Could not refresh the model from Power BI Desktop before writing: {error}")
+        return None
 
+    # ==================== SAVE / DISCARD / TRANSACTIONS ====================
+
+    def _discard_local(self) -> Tuple[bool, str]:
+        """Throw away everything staged on the local model. Returns (ok, what happened)."""
         try:
             self.model.UndoLocalChanges()
             self._changes_pending = False
-            return OperationResult(True, "Changes discarded")
+            return True, "Local edits were undone; the model is unchanged."
         except Exception as e:
-            return OperationResult(False, f"Failed to discard changes: {e}")
+            first = clean_error(e)
+        # UndoLocalChanges needs a live session. Dropping the local model discards the edits
+        # just as surely; a fresh connection then gives a clean copy to work on.
+        port = self.current_port
+        self._drop_connection()
+        try:
+            self._connect_fresh(port)
+        except Exception as e:
+            return False, (f"Local edits were dropped by disconnecting (undo failed: {first}; "
+                           f"reconnect failed: {clean_error(e)}). Nothing was saved; connect again.")
+        return True, "Local edits were discarded by reconnecting; the model is unchanged."
+
+    def _save(self, undo_on_failure: bool) -> OperationResult:
+        try:
+            self.model.SaveChanges()
+        except Exception as e:
+            error = clean_error(e)
+            logger.error(f"Failed to save changes: {error}")
+            if not undo_on_failure:
+                return OperationResult(False, f"Failed to save changes: {error}",
+                                       {"saved": False, "undone": False, "error": error})
+            _, note = self._discard_local()
+            return OperationResult(False, f"Failed to save changes: {error}. {note}",
+                                   {"saved": False, "undone": True, "error": error})
+        self._changes_pending = False
+        logger.info("Changes saved successfully")
+        return OperationResult(True, "Changes saved successfully", {"saved": True})
+
+    def _autosave(self, auto_save: bool) -> Optional[OperationResult]:
+        """Save now if asked to and no transaction is open. Returns a FAILED save, else None."""
+        if not auto_save or self._txn_open:
+            return None
+        save = self._save(undo_on_failure=True)
+        return None if save.success else save
+
+    @_locked
+    def save_changes(self) -> OperationResult:
+        """Save pending changes to the model.
+
+        Inside a transaction this does not save: it reports success with ``details['deferred']``
+        set, because the edits belong to the transaction and commit saves them. Outside one, a
+        failed save undoes the pending edits (``details['undone']``).
+        """
+        if not self._ensure_connected():
+            return OperationResult(False, "Not connected")
+        if self._txn_open:
+            return OperationResult(
+                True, "Deferred: a transaction is open; commit_transaction() will save this edit.",
+                {"saved": False, "deferred": True})
+        return self._save(undo_on_failure=True)
+
+    @_locked
+    def discard_changes(self) -> OperationResult:
+        """Discard pending changes (outside a transaction; use rollback_transaction inside one)."""
+        if not self._ensure_connected():
+            return OperationResult(False, "Not connected")
+        if self._txn_open:
+            return OperationResult(False, "A transaction is open; use rollback_transaction() to discard it.")
+        ok, note = self._discard_local()
+        return OperationResult(ok, "Changes discarded" if ok else f"Failed to discard changes: {note}")
+
+    @property
+    def in_transaction(self) -> bool:
+        """True while a transaction started by begin_transaction() is open."""
+        return self._txn_open
+
+    @property
+    def has_pending_changes(self) -> bool:
+        """True while edits are staged on the local model and not yet saved."""
+        with self._lock:
+            return self.model is not None and self._has_local_changes()
+
+    @_locked
+    def begin_transaction(self) -> OperationResult:
+        """Open a transaction: from now on edits are only staged, until commit or rollback."""
+        if not self._ensure_connected():
+            return OperationResult(False, "Not connected")
+        if self._txn_open:
+            return OperationResult(False, "A transaction is already open. Commit or roll it back first.")
+        if self._has_local_changes():
+            return OperationResult(False, "There are unsaved edits from an earlier call; save_changes() or "
+                                          "discard_changes() first, so the transaction starts clean.")
+        error = self._sync()
+        if error:
+            return OperationResult(
+                False, f"Could not refresh the model before starting a transaction: {error}")
+        self._txn_open = True
+        return OperationResult(True, "Transaction started. Edits are staged until commit_transaction(); "
+                                     "rollback_transaction() discards them.")
+
+    @_locked
+    def commit_transaction(self) -> OperationResult:
+        """Save every edit staged since begin_transaction() as one batch and close the
+        transaction. If the engine rejects the batch, nothing is saved and the transaction STAYS
+        OPEN (``details['transaction_open']``): fix the cause and commit again, or roll back."""
+        if not self._txn_open:
+            return OperationResult(False, "No transaction is open.", {"transaction_open": False})
+        if not self._ensure_connected():
+            self._txn_open = False
+            return OperationResult(False, "Not connected; the transaction's edits are gone and nothing "
+                                          "was saved.", {"transaction_open": False})
+        save = self._save(undo_on_failure=False)
+        if not save.success:
+            error = (save.details or {}).get("error", save.message)
+            return OperationResult(
+                False, f"Commit failed and nothing was saved: {error}. The transaction is still open: "
+                       "fix the cause and commit again, or roll back.",
+                {"transaction_open": True, "saved": False, "error": error})
+        self._txn_open = False
+        return OperationResult(True, "Transaction committed. Changes saved successfully",
+                               {"transaction_open": False, "saved": True})
+
+    @_locked
+    def rollback_transaction(self) -> OperationResult:
+        """Discard every edit staged since begin_transaction() and close the transaction."""
+        if not self._txn_open:
+            return OperationResult(False, "No transaction is open.", {"transaction_open": False})
+        if not self._ensure_connected():
+            self._txn_open = False
+            return OperationResult(True, "Transaction closed; the connection was already gone and nothing "
+                                         "had been saved.", {"transaction_open": False})
+        ok, note = self._discard_local()
+        # Either the edits were undone or the local model holding them was dropped: in both
+        # cases nothing of the transaction is left, so it is closed.
+        self._txn_open = False
+        prefix = "Transaction rolled back." if ok else "Transaction closed."
+        return OperationResult(ok, f"{prefix} {note}", {"transaction_open": False})
+
+    def _run(self, operation: Callable[[_Journal], OperationResult], what: str) -> OperationResult:
+        """Run one operation atomically on the local model: on an exception or a failed result,
+        exactly the edits it made are reverted."""
+        journal = _Journal()
+        try:
+            result = operation(journal)
+        except Exception as e:
+            problems = journal.rollback()
+            message = f"Failed to {what}: {clean_error(e)}"
+            if problems:
+                message += f" (reverting the partial edit also failed: {'; '.join(problems)})"
+            logger.error(message)
+            return OperationResult(False, message)
+        if not result.success:
+            journal.rollback()
+        elif len(journal):
+            self._changes_pending = True
+        return result
+
+    def _pending_note(self) -> str:
+        if not self._txn_open:
+            return ""
+        return " Staged in the open transaction; nothing is saved until commit_transaction()."
+
+    # ==================== MODEL TRAVERSAL ====================
+
+    def _find_table(self, name: str) -> Any:
+        return self.model.Tables.Find(name) if name else None
+
+    def _find_measure(self, name: str, table_name: Optional[str] = None) -> Tuple[Any, Any]:
+        """(table, measure) for a measure name, searching one table or the whole model."""
+        if table_name:
+            table = self._find_table(table_name)
+            return (table, table.Measures.Find(name)) if table is not None else (None, None)
+        for table in self.model.Tables:
+            measure = table.Measures.Find(name)
+            if measure is not None:
+                return table, measure
+        return None, None
+
+    def _is_column(self, table_name: Optional[str], column_name: Optional[str]) -> bool:
+        table = self._find_table(table_name) if table_name else None
+        return table is not None and bool(column_name) and table.Columns.Find(column_name) is not None
+
+    def _slots(self) -> Iterator[_Slot]:
+        """Every DAX expression in the model: measures (with KPI, detail-rows and dynamic format
+        string expressions), calculated columns, calculated tables, calculation items, RLS
+        filters, and user-defined functions where the model has them."""
+        for table in self.model.Tables:
+            tname = table.Name
+            for measure in table.Measures:
+                label = f"{tname}[{measure.Name}]"
+                yield _Slot(measure, "Expression", "measure", label, tname, measure.Name)
+                kpi = _opt(measure, "KPI")
+                if kpi is not None:
+                    for attr in ("TargetExpression", "StatusExpression", "TrendExpression"):
+                        yield _Slot(kpi, attr, "kpi", f"{label} KPI {attr[:-10].lower()}", tname)
+                for attr, what in (("DetailRowsDefinition", "detail rows"),
+                                   ("FormatStringDefinition", "format string")):
+                    definition = _opt(measure, attr)
+                    if definition is not None:
+                        yield _Slot(definition, "Expression", "other", f"{label} {what}", tname)
+            for column in table.Columns:
+                # Only calculated columns carry a DAX expression (DataColumn has no such member).
+                calculated = _enum_name(_opt(column, "Type")) == "Calculated"
+                if calculated or isinstance(_opt(column, "Expression"), str):
+                    yield _Slot(column, "Expression", "calculated_column", f"{tname}[{column.Name}]",
+                                tname, column.Name, table=tname)
+            for partition in (_opt(table, "Partitions") or ()):
+                # M and query partitions also have an Expression/Query; only a calculated
+                # partition's is DAX.
+                if _enum_name(_opt(partition, "SourceType")) == "Calculated":
+                    source = _opt(partition, "Source")
+                    if source is not None:
+                        yield _Slot(source, "Expression", "calculated_table",
+                                    f"{tname} (calculated table)", tname)
+            group = _opt(table, "CalculationGroup")
+            if group is not None:
+                for item in (_opt(group, "CalculationItems") or ()):
+                    yield _Slot(item, "Expression", "calculation_item", f"{tname}[{item.Name}]",
+                                tname, item.Name)
+                    definition = _opt(item, "FormatStringDefinition")
+                    if definition is not None:
+                        yield _Slot(definition, "Expression", "calculation_item",
+                                    f"{tname}[{item.Name}] format string", tname)
+                for attr in ("NoSelectionExpression", "MultipleOrEmptySelectionExpression"):
+                    selection = _opt(group, attr)
+                    if selection is not None:
+                        yield _Slot(selection, "Expression", "calculation_item", f"{tname} {attr}", tname)
+            definition = _opt(table, "DefaultDetailRowsDefinition")
+            if definition is not None:
+                yield _Slot(definition, "Expression", "other", f"{tname} default detail rows", tname)
+        for role in (_opt(self.model, "Roles") or ()):
+            for permission in (_opt(role, "TablePermissions") or ()):
+                owner = _opt(_opt(permission, "Table"), "Name")
+                yield _Slot(permission, "FilterExpression", "rls_filter",
+                            f"role '{role.Name}' on {owner}", owner, table=owner)
+        for function in (_opt(self.model, "Functions") or ()):
+            yield _Slot(function, "Expression", "other", f"function {function.Name}")
+
+    def _rewrite(self, journal: _Journal,
+                 rewrite: Callable[[_Slot, str], Tuple[str, int]]) -> Dict[str, List[str]]:
+        """Apply ``rewrite`` to every expression; record the edits; return labels per kind."""
+        updated: Dict[str, List[str]] = {key: [] for key in _DETAIL_KEYS}
+        for slot in list(self._slots()):
+            text = slot.text
+            if not text:
+                continue
+            new_text, count = rewrite(slot, text)
+            if count and new_text != text:
+                journal.set(slot.obj, slot.attr, new_text)
+                updated[_KIND_KEYS.get(slot.kind, _OTHER_KEY)].append(slot.label)
+        return updated
+
+    @staticmethod
+    def _with_recalc_note(details: Dict[str, Any]) -> Dict[str, Any]:
+        """Flag results that changed calculated columns/tables: the engine has to recalculate
+        them (Refresh in Power BI Desktop) before they can be queried again."""
+        if details.get("updated_calculated_columns") or details.get("updated_calculated_tables"):
+            details["recalculation_needed"] = True
+        return details
+
+    @staticmethod
+    def _checked_name(name: Any, what: str) -> str:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{what} must be a non-empty name")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+            raise ValueError(f"{what} contains a control character")
+        return name
 
     # ==================== DEPENDENCY SCANNING ====================
 
-    def _find_table_references(self, table_name: str) -> Dict[str, List[Dict[str, str]]]:
-        """
-        Find all references to a table in measures, calculated columns, and relationships
-
-        Args:
-            table_name: Name of the table to search for
-
-        Returns:
-            Dictionary with lists of references found
-        """
-        references = {
-            "measures": [],
-            "calculated_columns": [],
-            "relationships": [],
-            "hierarchies": []
-        }
-
-        if not self._ensure_connected():
-            return references
-
-        try:
-            # Search patterns for table references in DAX
-            # Tables are referenced as 'TableName'[Column] or TableName[Column] or just 'TableName'
-            import re
-            patterns = [
-                rf"'{re.escape(table_name)}'\s*\[",  # 'TableName'[Column]
-                rf"(?<!['\w]){re.escape(table_name)}\s*\[",  # TableName[Column] (not preceded by ' or word char)
-                rf"RELATED\s*\(\s*'{re.escape(table_name)}'",  # RELATED('TableName'
-                rf"RELATEDTABLE\s*\(\s*'{re.escape(table_name)}'",  # RELATEDTABLE('TableName'
-                rf"CALCULATETABLE\s*\(\s*'{re.escape(table_name)}'",  # CALCULATETABLE('TableName'
-                rf"ALL\s*\(\s*'{re.escape(table_name)}'",  # ALL('TableName'
-                rf"VALUES\s*\(\s*'{re.escape(table_name)}'",  # VALUES('TableName'
-                rf"FILTER\s*\(\s*'{re.escape(table_name)}'",  # FILTER('TableName'
-            ]
-            combined_pattern = "|".join(patterns)
-
-            # Check all measures
-            for table in self.model.Tables:
-                for measure in table.Measures:
-                    if measure.Expression and re.search(combined_pattern, measure.Expression, re.IGNORECASE):
-                        references["measures"].append({
-                            "name": measure.Name,
-                            "table": table.Name,
-                            "expression": measure.Expression[:200] + "..." if len(measure.Expression) > 200 else measure.Expression
-                        })
-
-                # Check calculated columns
-                for column in table.Columns:
-                    if hasattr(column, 'Expression') and column.Expression:
-                        if re.search(combined_pattern, column.Expression, re.IGNORECASE):
-                            references["calculated_columns"].append({
-                                "name": column.Name,
-                                "table": table.Name,
-                                "expression": column.Expression[:200] + "..." if len(column.Expression) > 200 else column.Expression
-                            })
-
-            # Check relationships
-            for relationship in self.model.Relationships:
-                if relationship.FromTable.Name == table_name:
-                    references["relationships"].append({
-                        "name": relationship.Name if relationship.Name else f"{relationship.FromTable.Name} -> {relationship.ToTable.Name}",
-                        "type": "from_table",
-                        "from_table": relationship.FromTable.Name,
-                        "to_table": relationship.ToTable.Name
-                    })
-                elif relationship.ToTable.Name == table_name:
-                    references["relationships"].append({
-                        "name": relationship.Name if relationship.Name else f"{relationship.FromTable.Name} -> {relationship.ToTable.Name}",
-                        "type": "to_table",
-                        "from_table": relationship.FromTable.Name,
-                        "to_table": relationship.ToTable.Name
-                    })
-
-        except Exception as e:
-            logger.error(f"Error scanning references: {e}")
-
-        return references
-
-    def _update_expression_table_references(self, expression: str, old_table: str, new_table: str) -> str:
-        """
-        Update table references in a DAX expression
-
-        Args:
-            expression: The DAX expression to update
-            old_table: Old table name
-            new_table: New table name
-
-        Returns:
-            Updated expression
-        """
-        import re
-
-        # Replace 'OldTable'[Column] with 'NewTable'[Column]
-        expression = re.sub(
-            rf"'{re.escape(old_table)}'\s*\[",
-            f"'{new_table}'[",
-            expression,
-            flags=re.IGNORECASE
-        )
-
-        # Replace OldTable[Column] with NewTable[Column] (unquoted)
-        # Be careful not to replace inside quotes
-        expression = re.sub(
-            rf"(?<!['\w]){re.escape(old_table)}(?=\s*\[)",
-            new_table,
-            expression,
-            flags=re.IGNORECASE
-        )
-
-        # Replace 'OldTable' in function calls
-        expression = re.sub(
-            rf"'{re.escape(old_table)}'(?=\s*[,\)])",
-            f"'{new_table}'",
-            expression,
-            flags=re.IGNORECASE
-        )
-
-        return expression
-
+    @_locked
     def scan_table_dependencies(self, table_name: str) -> OperationResult:
         """
         Scan for all dependencies on a table before renaming
@@ -352,474 +660,411 @@ class PowerBITOMConnector:
         if not self._ensure_connected():
             return OperationResult(False, "Not connected")
 
-        table = self.model.Tables.Find(table_name)
+        table = self._find_table(table_name)
         if not table:
             return OperationResult(False, f"Table '{table_name}' not found")
+        name = table.Name
 
-        refs = self._find_table_references(table_name)
+        found: Dict[str, List[Dict[str, Any]]] = {key: [] for key in _DETAIL_KEYS}
+        for slot in self._slots():
+            text = slot.text
+            if not text:
+                continue
+            # A table is referenced as a qualifier (Sales[Amount]) or on its own (COUNTROWS(Sales)).
+            hits = sum(1 for ref in dt.references(text)
+                       if ref.kind in ("column", "table") and dt.names_equal(ref.table, name))
+            if hits:
+                found[_KIND_KEYS.get(slot.kind, _OTHER_KEY)].append({
+                    "name": slot.name or slot.label,   # with "table": the shape callers print
+                    "table": slot.home,
+                    "label": slot.label,
+                    "references": hits,
+                    "expression": text[:200] + "..." if len(text) > 200 else text,
+                })
 
-        total_refs = sum(len(v) for v in refs.values())
+        relationships = []
+        for relationship in self.model.Relationships:
+            from_table, to_table = relationship.FromTable.Name, relationship.ToTable.Name
+            if dt.names_equal(from_table, name) or dt.names_equal(to_table, name):
+                relationships.append({
+                    "name": _opt(relationship, "Name") or f"{from_table} -> {to_table}",
+                    "type": "from_table" if dt.names_equal(from_table, name) else "to_table",
+                    "from_table": from_table,
+                    "to_table": to_table,
+                })
 
+        total_refs = sum(len(v) for v in found.values()) + len(relationships)
         return OperationResult(
             True,
-            f"Found {total_refs} references to table '{table_name}'",
+            f"Found {total_refs} references to table '{name}'",
             {
-                "table_name": table_name,
+                "table_name": name,
                 "total_references": total_refs,
-                "measures": refs["measures"],
-                "calculated_columns": refs["calculated_columns"],
-                "relationships": refs["relationships"],
-                "warning": "⚠️ IMPORTANT: Renaming tables will update model references (measures, relationships) but CANNOT update report visuals. Visuals using this table will break and need manual fixing in Power BI Desktop."
+                "measures": found["updated_measures"],
+                "calculated_columns": found["updated_calculated_columns"],
+                "calculated_tables": found["updated_calculated_tables"],
+                "calculation_items": found["updated_calculation_items"],
+                "rls_filters": found["updated_rls_filters"],
+                "kpis": found["updated_kpis"],
+                "other": found[_OTHER_KEY],
+                "relationships": relationships,
+                "warning": TABLE_RENAME_WARNING,
             }
         )
 
     # ==================== TABLE OPERATIONS ====================
 
+    def _rename_table(self, journal: _Journal, old_name: str, new_name: str,
+                      update_references: bool) -> OperationResult:
+        new_name = self._checked_name(new_name, "New table name")
+        table = self._find_table(old_name)
+        if not table:
+            return OperationResult(False, f"Table '{old_name}' not found")
+        current = table.Name
+        if current == new_name:
+            return OperationResult(False, f"Table '{current}' already has that name")
+        # Names are case-insensitive: a hit that is not this very table is a collision.
+        if self._find_table(new_name) is not None and not dt.names_equal(current, new_name):
+            return OperationResult(False, f"Table '{new_name}' already exists")
+
+        updated = {key: [] for key in _DETAIL_KEYS}
+        if update_references:
+            updated = self._rewrite(journal, lambda slot, text: dt.rename_table(text, current, new_name))
+        journal.set(table, "Name", new_name)
+
+        total_updated = sum(len(v) for v in updated.values())
+        logger.info(f"Table renamed: '{current}' -> '{new_name}', updated {total_updated} references")
+        details = {"old_name": current, "new_name": new_name, **updated,
+                   "warning": "Report visuals using this table will need manual updating in "
+                              "Power BI Desktop."}
+        return OperationResult(
+            True,
+            f"Table renamed: '{current}' -> '{new_name}'. Updated {total_updated} model references.",
+            self._with_recalc_note(details))
+
+    @_locked
     def rename_table(self, old_name: str, new_name: str, update_references: bool = True) -> OperationResult:
         """
-        Rename a table and optionally update all references in measures/calculations
+        Rename a table and optionally update all references in the model's DAX
 
-        NOTE: This will update model-level references (measures, calculated columns,
-        relationships) but CANNOT update report-level visual bindings. Visuals
-        that use this table will need to be manually updated in Power BI Desktop.
+        NOTE: This will update model-level references (measures, KPIs, calculated columns and
+        tables, calculation items, RLS filters; relationships follow automatically) but CANNOT
+        update report-level visual bindings. Visuals that use this table will need to be
+        manually updated in Power BI Desktop.
+
+        The edit is staged; call save_changes() (or commit the open transaction) to persist it.
 
         Args:
             old_name: Current table name
             new_name: New table name
-            update_references: Whether to update references in measures/calculations (default: True)
+            update_references: Whether to update references in DAX expressions (default: True)
 
         Returns:
             OperationResult with success status and details of updated references
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
+        return self._run(lambda j: self._rename_table(j, old_name, new_name, update_references),
+                         "rename table")
 
-        try:
-            table = self.model.Tables.Find(old_name)
-            if not table:
-                return OperationResult(False, f"Table '{old_name}' not found")
+    def _batch(self, items: List[Dict[str, Any]], auto_save: bool, action: str, thing: str,
+               required: Tuple[str, ...], echo: Tuple[str, ...], missing: str,
+               apply: Callable[[_Journal, Dict[str, Any]], OperationResult],
+               references: bool = True) -> OperationResult:
+        """Shared loop of the batch methods (``action`` 'rename' / 'update', ``thing`` 'table').
 
-            # Check if new name already exists
-            if self.model.Tables.Find(new_name):
-                return OperationResult(False, f"Table '{new_name}' already exists")
+        Each item is applied atomically and reported on its own; then ONE save covers the batch,
+        unless a transaction is open or ``auto_save`` is off. If that save fails, every item of
+        the batch has been undone and is reported as not applied.
+        """
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
 
-            updated_refs = {
-                "measures": [],
-                "calculated_columns": []
-            }
+        results: List[Dict[str, Any]] = []
+        totals: Dict[str, List[str]] = {key: [] for key in _DETAIL_KEYS}
+        for item in items or []:
+            is_dict = isinstance(item, dict)
+            entry: Dict[str, Any] = {key: (item.get(key) if is_dict else None) for key in echo}
+            if not is_dict or not all(item.get(key) for key in required):
+                entry.update(success=False, error=missing)
+                results.append(entry)
+                continue
+            result = self._run(lambda journal, it=item: apply(journal, it), f"{action} {thing}")
+            details = result.details or {}
+            entry.update(success=result.success, error=None if result.success else result.message)
+            if references:
+                for key in _DETAIL_KEYS:
+                    entry[key] = list(details.get(key, []))
+                    if result.success:
+                        totals[key].extend(entry[key])
+                for key in ("unqualified_references_left", "ambiguous_references"):
+                    if details.get(key):
+                        entry[key] = details[key]
+            results.append(entry)
 
-            # Update references in measures and calculated columns if requested
-            if update_references:
-                for t in self.model.Tables:
-                    # Update measures
-                    for measure in t.Measures:
-                        if measure.Expression:
-                            new_expr = self._update_expression_table_references(measure.Expression, old_name, new_name)
-                            if new_expr != measure.Expression:
-                                measure.Expression = new_expr
-                                updated_refs["measures"].append(f"{t.Name}[{measure.Name}]")
+        success_count = sum(1 for r in results if r["success"])
+        saved = False
+        if success_count:
+            failed_save = self._autosave(auto_save)
+            if failed_save is not None:
+                for entry in results:
+                    if entry["success"]:
+                        entry.update(success=False, error="Not saved; the edit was undone")
+                return OperationResult(
+                    False, f"No {thing} was {_PAST[action].lower()}: {failed_save.message}",
+                    {"results": results, "success_count": 0, "fail_count": len(results), "saved": False})
+            saved = bool(auto_save) and not self._txn_open
 
-                    # Update calculated columns
-                    for column in t.Columns:
-                        if hasattr(column, 'Expression') and column.Expression:
-                            new_expr = self._update_expression_table_references(column.Expression, old_name, new_name)
-                            if new_expr != column.Expression:
-                                column.Expression = new_expr
-                                updated_refs["calculated_columns"].append(f"{t.Name}[{column.Name}]")
+        fail_count = len(results) - success_count
+        message = f"{_PAST[action]} {success_count} {thing}(s), {fail_count} failed"
+        details: Dict[str, Any] = {
+            "results": results,
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "saved": saved,
+            "pending": bool(success_count) and not saved,
+        }
+        if references:
+            total = sum(len(v) for v in totals.values())
+            message += f". Updated {total} {'references' if thing == 'measure' else 'model references'}."
+            details.update(totals)
+            details["total_updated_measures"] = len(totals["updated_measures"])
+            details["total_updated_calculated_columns"] = len(totals["updated_calculated_columns"])
+            details["total_updated_references"] = total
+            self._with_recalc_note(details)
+        if success_count and not saved:
+            message += self._pending_note()
+        return OperationResult(success_count > 0, message, details)
 
-            # Now rename the table
-            table.Name = new_name
-            self._changes_pending = True
-
-            total_updated = len(updated_refs["measures"]) + len(updated_refs["calculated_columns"])
-
-            logger.info(f"Table renamed: '{old_name}' -> '{new_name}', updated {total_updated} references")
-
-            return OperationResult(
-                True,
-                f"Table renamed: '{old_name}' -> '{new_name}'. Updated {total_updated} model references.",
-                {
-                    "old_name": old_name,
-                    "new_name": new_name,
-                    "updated_measures": updated_refs["measures"],
-                    "updated_calculated_columns": updated_refs["calculated_columns"],
-                    "warning": "⚠️ Report visuals using this table will need manual updating in Power BI Desktop."
-                }
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to rename table: {e}")
-            return OperationResult(False, f"Failed to rename table: {e}")
-
-    def batch_rename_tables(self, renames: List[Dict[str, str]], auto_save: bool = True, update_references: bool = True) -> OperationResult:
+    @_locked
+    def batch_rename_tables(self, renames: List[Dict[str, str]], auto_save: bool = True,
+                            update_references: bool = True) -> OperationResult:
         """
         Batch rename multiple tables with automatic reference updates
 
-        NOTE: This will update model-level references (measures, calculated columns,
-        relationships) but CANNOT update report-level visual bindings. Visuals
-        that use renamed tables will need to be manually updated in Power BI Desktop.
+        NOTE: This will update model-level references but CANNOT update report-level visual
+        bindings. Visuals that use renamed tables will need to be manually updated in Power BI
+        Desktop.
 
         Args:
             renames: List of {"old_name": "...", "new_name": "..."} dicts
-            auto_save: Whether to auto-save changes (default: True)
-            update_references: Whether to update references in measures/calculations (default: True)
+            auto_save: Save at the end (default: True). Ignored while a transaction is open:
+                       the renames are then staged and saved by commit_transaction().
+            update_references: Whether to update references in DAX expressions (default: True)
 
         Returns:
             OperationResult with details of each rename and updated references
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
-
-        results = []
-        success_count = 0
-        fail_count = 0
-        all_updated_measures = []
-        all_updated_columns = []
-
-        for rename in renames:
-            old_name = rename.get("old_name")
-            new_name = rename.get("new_name")
-
-            if not old_name or not new_name:
-                results.append({"old_name": old_name, "new_name": new_name, "success": False, "error": "Missing name"})
-                fail_count += 1
-                continue
-
-            result = self.rename_table(old_name, new_name, update_references=update_references)
-            results.append({
-                "old_name": old_name,
-                "new_name": new_name,
-                "success": result.success,
-                "error": result.message if not result.success else None,
-                "updated_measures": result.details.get("updated_measures", []) if result.details else [],
-                "updated_calculated_columns": result.details.get("updated_calculated_columns", []) if result.details else []
-            })
-
-            if result.success:
-                success_count += 1
-                if result.details:
-                    all_updated_measures.extend(result.details.get("updated_measures", []))
-                    all_updated_columns.extend(result.details.get("updated_calculated_columns", []))
-            else:
-                fail_count += 1
-
-        # Auto-save if requested and there were successes
-        if auto_save and success_count > 0:
-            save_result = self.save_changes()
-            if not save_result.success:
-                return OperationResult(False, f"Renamed {success_count} tables but failed to save: {save_result.message}", {"results": results})
-
-        total_ref_updates = len(all_updated_measures) + len(all_updated_columns)
-        message = f"Renamed {success_count} table(s), {fail_count} failed. Updated {total_ref_updates} model references."
-
-        return OperationResult(
-            success_count > 0,
-            message,
-            {
-                "results": results,
-                "success_count": success_count,
-                "fail_count": fail_count,
-                "total_updated_measures": len(all_updated_measures),
-                "total_updated_calculated_columns": len(all_updated_columns),
-                "updated_measures": all_updated_measures,
-                "updated_calculated_columns": all_updated_columns,
-                "warning": "⚠️ IMPORTANT: Report visuals using these tables will need manual updating in Power BI Desktop. The model references (measures, calculated columns) have been automatically updated."
-            }
-        )
+        result = self._batch(
+            renames, auto_save, "rename", "table", ("old_name", "new_name"), ("old_name", "new_name"),
+            "Missing name",
+            lambda j, it: self._rename_table(j, it["old_name"], it["new_name"], update_references))
+        if result.details and "results" in result.details and result.success:
+            result.details["warning"] = (
+                "IMPORTANT: Report visuals using these tables will need manual updating in Power BI "
+                "Desktop. The model references have been automatically updated.")
+        return result
 
     # ==================== COLUMN OPERATIONS ====================
 
-    def _update_expression_column_references(self, expression: str, table_name: str, old_column: str, new_column: str) -> str:
+    def _rename_column(self, journal: _Journal, table_name: str, old_name: str, new_name: str,
+                       update_references: bool) -> OperationResult:
+        new_name = self._checked_name(new_name, "New column name")
+        table = self._find_table(table_name)
+        if not table:
+            return OperationResult(False, f"Table '{table_name}' not found")
+        column = table.Columns.Find(old_name)
+        if not column:
+            return OperationResult(False, f"Column '{old_name}' not found in table '{table_name}'")
+        tname, current = table.Name, column.Name
+        if current == new_name:
+            return OperationResult(False, f"Column '{tname}'[{current}] already has that name")
+        if table.Columns.Find(new_name) is not None and not dt.names_equal(current, new_name):
+            return OperationResult(False, f"Column '{new_name}' already exists in table '{tname}'")
+        if table.Measures.Find(new_name) is not None:
+            return OperationResult(False, f"A measure named '{new_name}' already exists in table '{tname}'; "
+                                          "a column cannot share its name")
+
+        updated = {key: [] for key in _DETAIL_KEYS}
+        left: List[str] = []
+        if update_references:
+            # An unqualified [name] can only be rewritten when it cannot mean anything else:
+            # no measure of that name, and either the expression runs in this table's row
+            # context or no other table has a column of that name. Otherwise it is reported.
+            measure_same_name = self._find_measure(current)[1] is not None
+            elsewhere = any(not dt.names_equal(t.Name, tname) and t.Columns.Find(current) is not None
+                            for t in self.model.Tables)
+
+            def rewrite(slot: _Slot, text: str) -> Tuple[str, int]:
+                unqualified = (not measure_same_name and not _has_string_literal(text, current)
+                               and (dt.names_equal(slot.table, tname) or not elsewhere))
+                new_text, count, skipped = dt.rename_column(text, tname, current, new_name,
+                                                            unqualified=unqualified)
+                if skipped:
+                    left.append(slot.label)
+                return new_text, count
+
+            updated = self._rewrite(journal, rewrite)
+        journal.set(column, "Name", new_name)
+
+        total_updated = sum(len(v) for v in updated.values())
+        renamed = f"Column renamed: '{tname}'[{current}] -> [{new_name}]"
+        logger.info(f"{renamed}, updated {total_updated} references")
+        message = f"{renamed}. Updated {total_updated} model references."
+        details = {"table_name": tname, "old_name": current, "new_name": new_name, **updated}
+        if left:
+            details["unqualified_references_left"] = left
+            message += (f" {len(left)} expression(s) use an unqualified [{current}] that could not be "
+                        "attributed to this column and were left as written; review them.")
+        return OperationResult(True, message, self._with_recalc_note(details))
+
+    @_locked
+    def rename_column(self, table_name: str, old_name: str, new_name: str,
+                      update_references: bool = True) -> OperationResult:
         """
-        Update column references in a DAX expression
+        Rename a column and optionally update all references in the model's DAX
 
-        Args:
-            expression: The DAX expression to update
-            table_name: Table containing the column
-            old_column: Old column name
-            new_column: New column name
-
-        Returns:
-            Updated expression
-        """
-        import re
-
-        # Replace 'TableName'[OldColumn] with 'TableName'[NewColumn]
-        expression = re.sub(
-            rf"'{re.escape(table_name)}'\s*\[\s*{re.escape(old_column)}\s*\]",
-            f"'{table_name}'[{new_column}]",
-            expression,
-            flags=re.IGNORECASE
-        )
-
-        # Replace TableName[OldColumn] with TableName[NewColumn] (unquoted table)
-        expression = re.sub(
-            rf"(?<!['\w]){re.escape(table_name)}\s*\[\s*{re.escape(old_column)}\s*\]",
-            f"{table_name}[{new_column}]",
-            expression,
-            flags=re.IGNORECASE
-        )
-
-        return expression
-
-    def rename_column(self, table_name: str, old_name: str, new_name: str, update_references: bool = True) -> OperationResult:
-        """
-        Rename a column and optionally update all references in measures/calculations
+        Qualified references (Table[Column]) are always rewritten. An unqualified [Column] is
+        rewritten only where it cannot be a measure or another table's column; the rest are
+        listed in ``details['unqualified_references_left']``. The edit is staged, not saved.
 
         Args:
             table_name: Name of the table containing the column
             old_name: Current column name
             new_name: New column name
-            update_references: Whether to update references in measures/calculations (default: True)
+            update_references: Whether to update references in DAX expressions (default: True)
 
         Returns:
             OperationResult with success status
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
+        return self._run(lambda j: self._rename_column(j, table_name, old_name, new_name, update_references),
+                         "rename column")
 
-        try:
-            table = self.model.Tables.Find(table_name)
-            if not table:
-                return OperationResult(False, f"Table '{table_name}' not found")
-
-            column = table.Columns.Find(old_name)
-            if not column:
-                return OperationResult(False, f"Column '{old_name}' not found in table '{table_name}'")
-
-            # Check if new name already exists
-            if table.Columns.Find(new_name):
-                return OperationResult(False, f"Column '{new_name}' already exists in table '{table_name}'")
-
-            updated_refs = {"measures": [], "calculated_columns": []}
-
-            # Update references in measures and calculated columns if requested
-            if update_references:
-                for t in self.model.Tables:
-                    # Update measures
-                    for measure in t.Measures:
-                        if measure.Expression:
-                            new_expr = self._update_expression_column_references(measure.Expression, table_name, old_name, new_name)
-                            if new_expr != measure.Expression:
-                                measure.Expression = new_expr
-                                updated_refs["measures"].append(f"{t.Name}[{measure.Name}]")
-
-                    # Update calculated columns
-                    for col in t.Columns:
-                        if hasattr(col, 'Expression') and col.Expression:
-                            new_expr = self._update_expression_column_references(col.Expression, table_name, old_name, new_name)
-                            if new_expr != col.Expression:
-                                col.Expression = new_expr
-                                updated_refs["calculated_columns"].append(f"{t.Name}[{col.Name}]")
-
-            column.Name = new_name
-            self._changes_pending = True
-
-            total_updated = len(updated_refs["measures"]) + len(updated_refs["calculated_columns"])
-            logger.info(f"Column renamed: '{table_name}'[{old_name}] -> [{new_name}], updated {total_updated} references")
-
-            return OperationResult(
-                True,
-                f"Column renamed: '{table_name}'[{old_name}] -> [{new_name}]. Updated {total_updated} model references.",
-                {
-                    "table_name": table_name,
-                    "old_name": old_name,
-                    "new_name": new_name,
-                    "updated_measures": updated_refs["measures"],
-                    "updated_calculated_columns": updated_refs["calculated_columns"]
-                }
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to rename column: {e}")
-            return OperationResult(False, f"Failed to rename column: {e}")
-
-    def batch_rename_columns(self, renames: List[Dict[str, str]], auto_save: bool = True, update_references: bool = True) -> OperationResult:
+    @_locked
+    def batch_rename_columns(self, renames: List[Dict[str, str]], auto_save: bool = True,
+                             update_references: bool = True) -> OperationResult:
         """
         Batch rename multiple columns with automatic reference updates
 
         Args:
             renames: List of {"table_name": "...", "old_name": "...", "new_name": "..."} dicts
-            auto_save: Whether to auto-save changes (default: True)
-            update_references: Whether to update references in measures/calculations (default: True)
+            auto_save: Save at the end (default: True). Ignored while a transaction is open.
+            update_references: Whether to update references in DAX expressions (default: True)
 
         Returns:
             OperationResult with details of each rename and updated references
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
-
-        results = []
-        success_count = 0
-        fail_count = 0
-        all_updated_measures = []
-        all_updated_columns = []
-
-        for rename in renames:
-            table_name = rename.get("table_name")
-            old_name = rename.get("old_name")
-            new_name = rename.get("new_name")
-
-            if not all([table_name, old_name, new_name]):
-                results.append({"table_name": table_name, "old_name": old_name, "new_name": new_name, "success": False, "error": "Missing required field"})
-                fail_count += 1
-                continue
-
-            result = self.rename_column(table_name, old_name, new_name, update_references=update_references)
-            results.append({
-                "table_name": table_name,
-                "old_name": old_name,
-                "new_name": new_name,
-                "success": result.success,
-                "error": result.message if not result.success else None,
-                "updated_measures": result.details.get("updated_measures", []) if result.details else [],
-                "updated_calculated_columns": result.details.get("updated_calculated_columns", []) if result.details else []
-            })
-
-            if result.success:
-                success_count += 1
-                if result.details:
-                    all_updated_measures.extend(result.details.get("updated_measures", []))
-                    all_updated_columns.extend(result.details.get("updated_calculated_columns", []))
-            else:
-                fail_count += 1
-
-        # Auto-save if requested
-        if auto_save and success_count > 0:
-            save_result = self.save_changes()
-            if not save_result.success:
-                return OperationResult(False, f"Renamed {success_count} columns but failed to save: {save_result.message}", {"results": results})
-
-        total_ref_updates = len(all_updated_measures) + len(all_updated_columns)
-        message = f"Renamed {success_count} column(s), {fail_count} failed. Updated {total_ref_updates} model references."
-
-        return OperationResult(
-            success_count > 0,
-            message,
-            {
-                "results": results,
-                "success_count": success_count,
-                "fail_count": fail_count,
-                "total_updated_measures": len(all_updated_measures),
-                "total_updated_calculated_columns": len(all_updated_columns),
-                "updated_measures": all_updated_measures,
-                "updated_calculated_columns": all_updated_columns
-            }
-        )
+        return self._batch(
+            renames, auto_save, "rename", "column", ("table_name", "old_name", "new_name"),
+            ("table_name", "old_name", "new_name"), "Missing required field",
+            lambda j, it: self._rename_column(j, it["table_name"], it["old_name"], it["new_name"],
+                                              update_references))
 
     # ==================== MEASURE OPERATIONS ====================
 
-    def _update_expression_measure_references(self, expression: str, old_measure: str, new_measure: str) -> str:
+    def _rename_measure(self, journal: _Journal, old_name: str, new_name: str, table_name: Optional[str],
+                        update_references: bool) -> OperationResult:
+        new_name = self._checked_name(new_name, "New measure name")
+        if table_name and not self._find_table(table_name):
+            return OperationResult(False, f"Table '{table_name}' not found")
+        home_table, measure = self._find_measure(old_name, table_name)
+        if not measure:
+            return OperationResult(False, f"Measure '{old_name}' not found")
+        home, current = home_table.Name, measure.Name
+        if current == new_name:
+            return OperationResult(False, f"Measure '{current}' already has that name")
+        # Measure names are unique across the whole model, and distinct from the columns of
+        # their own table.
+        other_table, other = self._find_measure(new_name)
+        if other is not None and not dt.names_equal(current, new_name):
+            return OperationResult(
+                False, f"Measure '{new_name}' already exists in table '{other_table.Name}'")
+        if home_table.Columns.Find(new_name) is not None:
+            return OperationResult(False, f"A column named '{new_name}' already exists in table '{home}'; "
+                                          "a measure cannot share its name")
+
+        updated = {key: [] for key in _DETAIL_KEYS}
+        ambiguous: List[str] = []
+        same_name_columns = [f"{t.Name}[{current}]" for t in self.model.Tables
+                             if t.Columns.Find(current) is not None]
+        if update_references:
+            def rewrite(slot: _Slot, text: str) -> Tuple[str, int]:
+                if slot.table and self._is_column(slot.table, current):
+                    # Row context of a table that has a column of this name: an unqualified
+                    # [name] there is that column far more often than the measure.
+                    new_text, count, skipped = _rename_measure_qualified_only(
+                        text, current, new_name, self._is_column, home)
+                    if skipped:
+                        ambiguous.append(slot.label)
+                    return new_text, count
+                return dt.rename_measure(text, current, new_name, is_column=self._is_column,
+                                         measure_table=home)
+
+            updated = self._rewrite(journal, rewrite)
+        journal.set(measure, "Name", new_name)
+
+        total_updated = sum(len(v) for v in updated.values())
+        logger.info(f"Measure renamed: '{current}' -> '{new_name}', updated {total_updated} references")
+        message = f"Measure renamed: '{current}' -> '{new_name}'. Updated {total_updated} references."
+        details = {"old_name": current, "new_name": new_name, "table_name": home, **updated}
+        if same_name_columns:
+            details["columns_with_same_name"] = same_name_columns
+        if ambiguous:
+            details["ambiguous_references"] = ambiguous
+            message += (f" {len(ambiguous)} expression(s) use an unqualified [{current}] in the row context "
+                        f"of a table with a column of that name; they were left as written; review them.")
+        return OperationResult(True, message, self._with_recalc_note(details))
+
+    @_locked
+    def rename_measure(self, old_name: str, new_name: str, table_name: Optional[str] = None,
+                       update_references: bool = True) -> OperationResult:
         """
-        Update measure references in a DAX expression
+        Rename a measure and optionally update all references in the model's DAX
 
-        Args:
-            expression: The DAX expression to update
-            old_measure: Old measure name
-            new_measure: New measure name
-
-        Returns:
-            Updated expression
-        """
-        import re
-
-        # Replace [OldMeasure] with [NewMeasure] (measures are referenced without table in DAX)
-        expression = re.sub(
-            rf"\[\s*{re.escape(old_measure)}\s*\]",
-            f"[{new_measure}]",
-            expression,
-            flags=re.IGNORECASE
-        )
-
-        return expression
-
-    def rename_measure(self, old_name: str, new_name: str, table_name: Optional[str] = None, update_references: bool = True) -> OperationResult:
-        """
-        Rename a measure and optionally update all references in other measures/calculations
+        [Measure] is rewritten everywhere it is the measure. Table[Measure] is rewritten only
+        when it can be the measure (its home table, which has no such column), so a same-named
+        column of another table is never touched. The edit is staged, not saved.
 
         Args:
             old_name: Current measure name
             new_name: New measure name
             table_name: Optional table name (if not provided, searches all tables)
-            update_references: Whether to update references in other measures (default: True)
+            update_references: Whether to update references in DAX expressions (default: True)
 
         Returns:
             OperationResult with success status
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
+        return self._run(lambda j: self._rename_measure(j, old_name, new_name, table_name, update_references),
+                         "rename measure")
 
-        try:
-            measure = None
-            found_table = None
+    def _update_measure(self, journal: _Journal, measure_name: str, new_expression: str,
+                        table_name: Optional[str]) -> OperationResult:
+        if not isinstance(new_expression, str) or not new_expression.strip():
+            return OperationResult(False, "A non-empty DAX expression is required")
+        if table_name and not self._find_table(table_name):
+            return OperationResult(False, f"Table '{table_name}' not found")
+        _, measure = self._find_measure(measure_name, table_name)
+        if not measure:
+            return OperationResult(False, f"Measure '{measure_name}' not found")
+        old_expression = measure.Expression
+        journal.set(measure, "Expression", new_expression)
+        logger.info(f"Measure '{measure_name}' expression updated")
+        return OperationResult(True, f"Measure '{measure_name}' expression updated",
+                               {"old_expression": old_expression})
 
-            if table_name:
-                table = self.model.Tables.Find(table_name)
-                if not table:
-                    return OperationResult(False, f"Table '{table_name}' not found")
-                measure = table.Measures.Find(old_name)
-                found_table = table
-            else:
-                # Search all tables for the measure
-                for table in self.model.Tables:
-                    measure = table.Measures.Find(old_name)
-                    if measure:
-                        found_table = table
-                        break
-
-            if not measure:
-                return OperationResult(False, f"Measure '{old_name}' not found")
-
-            # Check if new name already exists in the same table
-            if found_table.Measures.Find(new_name):
-                return OperationResult(False, f"Measure '{new_name}' already exists in table '{found_table.Name}'")
-
-            updated_refs = {"measures": [], "calculated_columns": []}
-
-            # Update references in other measures and calculated columns if requested
-            if update_references:
-                for t in self.model.Tables:
-                    # Update other measures
-                    for m in t.Measures:
-                        if m.Name != old_name and m.Expression:  # Don't update the measure being renamed
-                            new_expr = self._update_expression_measure_references(m.Expression, old_name, new_name)
-                            if new_expr != m.Expression:
-                                m.Expression = new_expr
-                                updated_refs["measures"].append(f"{t.Name}[{m.Name}]")
-
-                    # Update calculated columns
-                    for col in t.Columns:
-                        if hasattr(col, 'Expression') and col.Expression:
-                            new_expr = self._update_expression_measure_references(col.Expression, old_name, new_name)
-                            if new_expr != col.Expression:
-                                col.Expression = new_expr
-                                updated_refs["calculated_columns"].append(f"{t.Name}[{col.Name}]")
-
-            measure.Name = new_name
-            self._changes_pending = True
-
-            total_updated = len(updated_refs["measures"]) + len(updated_refs["calculated_columns"])
-            logger.info(f"Measure renamed: '{old_name}' -> '{new_name}', updated {total_updated} references")
-
-            return OperationResult(
-                True,
-                f"Measure renamed: '{old_name}' -> '{new_name}'. Updated {total_updated} references.",
-                {
-                    "old_name": old_name,
-                    "new_name": new_name,
-                    "table_name": found_table.Name,
-                    "updated_measures": updated_refs["measures"],
-                    "updated_calculated_columns": updated_refs["calculated_columns"]
-                }
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to rename measure: {e}")
-            return OperationResult(False, f"Failed to rename measure: {e}")
-
-    def update_measure_expression(self, measure_name: str, new_expression: str, table_name: Optional[str] = None) -> OperationResult:
+    @_locked
+    def update_measure_expression(self, measure_name: str, new_expression: str,
+                                  table_name: Optional[str] = None) -> OperationResult:
         """
-        Update a measure's DAX expression
+        Update a measure's DAX expression (staged, not saved)
 
         Args:
             measure_name: Name of the measure
@@ -829,165 +1074,91 @@ class PowerBITOMConnector:
         Returns:
             OperationResult with success status
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
+        return self._run(lambda j: self._update_measure(j, measure_name, new_expression, table_name),
+                         "update measure")
 
-        try:
-            measure = None
-
-            if table_name:
-                table = self.model.Tables.Find(table_name)
-                if not table:
-                    return OperationResult(False, f"Table '{table_name}' not found")
-                measure = table.Measures.Find(measure_name)
-            else:
-                for table in self.model.Tables:
-                    measure = table.Measures.Find(measure_name)
-                    if measure:
-                        break
-
-            if not measure:
-                return OperationResult(False, f"Measure '{measure_name}' not found")
-
-            old_expression = measure.Expression
-            measure.Expression = new_expression
-            self._changes_pending = True
-            logger.info(f"Measure '{measure_name}' expression updated")
-            return OperationResult(True, f"Measure '{measure_name}' expression updated", {"old_expression": old_expression})
-
-        except Exception as e:
-            logger.error(f"Failed to update measure: {e}")
-            return OperationResult(False, f"Failed to update measure: {e}")
-
-    def batch_rename_measures(self, renames: List[Dict[str, str]], auto_save: bool = True, update_references: bool = True) -> OperationResult:
+    @_locked
+    def batch_rename_measures(self, renames: List[Dict[str, str]], auto_save: bool = True,
+                              update_references: bool = True) -> OperationResult:
         """
         Batch rename multiple measures with automatic reference updates
 
         Args:
             renames: List of {"old_name": "...", "new_name": "...", "table_name": "..." (optional)} dicts
-            auto_save: Whether to auto-save changes (default: True)
-            update_references: Whether to update references in other measures (default: True)
+            auto_save: Save at the end (default: True). Ignored while a transaction is open.
+            update_references: Whether to update references in other expressions (default: True)
 
         Returns:
             OperationResult with details of each rename and updated references
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        return self._batch(
+            renames, auto_save, "rename", "measure", ("old_name", "new_name"),
+            ("old_name", "new_name", "table_name"), "Missing name",
+            lambda j, it: self._rename_measure(j, it["old_name"], it["new_name"], it.get("table_name"),
+                                               update_references))
 
-        results = []
-        success_count = 0
-        fail_count = 0
-        all_updated_measures = []
-        all_updated_columns = []
-
-        for rename in renames:
-            old_name = rename.get("old_name")
-            new_name = rename.get("new_name")
-            table_name = rename.get("table_name")
-
-            if not old_name or not new_name:
-                results.append({"old_name": old_name, "new_name": new_name, "success": False, "error": "Missing name"})
-                fail_count += 1
-                continue
-
-            result = self.rename_measure(old_name, new_name, table_name, update_references=update_references)
-            results.append({
-                "old_name": old_name,
-                "new_name": new_name,
-                "table_name": table_name,
-                "success": result.success,
-                "error": result.message if not result.success else None,
-                "updated_measures": result.details.get("updated_measures", []) if result.details else [],
-                "updated_calculated_columns": result.details.get("updated_calculated_columns", []) if result.details else []
-            })
-
-            if result.success:
-                success_count += 1
-                if result.details:
-                    all_updated_measures.extend(result.details.get("updated_measures", []))
-                    all_updated_columns.extend(result.details.get("updated_calculated_columns", []))
-            else:
-                fail_count += 1
-
-        # Auto-save if requested
-        if auto_save and success_count > 0:
-            save_result = self.save_changes()
-            if not save_result.success:
-                return OperationResult(False, f"Renamed {success_count} measures but failed to save: {save_result.message}", {"results": results})
-
-        total_ref_updates = len(all_updated_measures) + len(all_updated_columns)
-        message = f"Renamed {success_count} measure(s), {fail_count} failed. Updated {total_ref_updates} references."
-
-        return OperationResult(
-            success_count > 0,
-            message,
-            {
-                "results": results,
-                "success_count": success_count,
-                "fail_count": fail_count,
-                "total_updated_measures": len(all_updated_measures),
-                "total_updated_calculated_columns": len(all_updated_columns),
-                "updated_measures": all_updated_measures,
-                "updated_calculated_columns": all_updated_columns
-            }
-        )
-
+    @_locked
     def batch_update_measures(self, updates: List[Dict[str, str]], auto_save: bool = True) -> OperationResult:
         """
         Batch update multiple measure expressions
 
         Args:
-            updates: List of {"measure_name": "...", "expression": "...", "table_name": "..." (optional)} dicts
-            auto_save: Whether to auto-save changes
+            updates: List of {"measure_name": "...", "expression": "...",
+                     "table_name": "..." (optional)} dicts
+            auto_save: Save at the end (default: True). Ignored while a transaction is open.
 
         Returns:
             OperationResult with details of each update
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
-
-        results = []
-        success_count = 0
-        fail_count = 0
-
-        for update in updates:
-            measure_name = update.get("measure_name")
-            expression = update.get("expression")
-            table_name = update.get("table_name")
-
-            if not measure_name or not expression:
-                results.append({"measure_name": measure_name, "success": False, "error": "Missing required field"})
-                fail_count += 1
-                continue
-
-            result = self.update_measure_expression(measure_name, expression, table_name)
-            results.append({
-                "measure_name": measure_name,
-                "success": result.success,
-                "error": result.message if not result.success else None
-            })
-
-            if result.success:
-                success_count += 1
-            else:
-                fail_count += 1
-
-        # Auto-save if requested
-        if auto_save and success_count > 0:
-            save_result = self.save_changes()
-            if not save_result.success:
-                return OperationResult(False, f"Updated {success_count} measures but failed to save: {save_result.message}", {"results": results})
-
-        message = f"Updated {success_count} measure(s), {fail_count} failed"
-        return OperationResult(success_count > 0, message, {"results": results, "success_count": success_count, "fail_count": fail_count})
+        return self._batch(
+            updates, auto_save, "update", "measure", ("measure_name", "expression"), ("measure_name",),
+            "Missing required field",
+            lambda j, it: self._update_measure(j, it["measure_name"], it["expression"], it.get("table_name")),
+            references=False)
 
     # ==================== CREATE OPERATIONS ====================
 
+    def _new_measure(self, name: str, spec: Dict[str, Any]) -> Any:
+        measure = TOM.Measure()
+        measure.Name = name
+        measure.Expression = spec["expression"]
+        if spec.get("format_string"):
+            measure.FormatString = spec["format_string"]
+        if spec.get("description"):
+            measure.Description = spec["description"]
+        if spec.get("display_folder"):
+            measure.DisplayFolder = spec["display_folder"]
+        return measure
+
+    def _measure_problem(self, table: Any, name: str) -> Optional[str]:
+        """Why a measure called ``name`` cannot be added to ``table``, or None."""
+        owner, existing = self._find_measure(name)
+        if existing is not None:
+            return f"already exists in table '{owner.Name}'"
+        if table.Columns.Find(name) is not None:
+            return f"a column of '{table.Name}' already has this name"
+        return None
+
+    @staticmethod
+    def _engine_errors(measures: List[Any]) -> Dict[str, str]:
+        """Error messages the engine attached to saved measures (it accepts a measure whose DAX
+        does not resolve and marks it instead of rejecting the save)."""
+        errors = {}
+        for measure in measures:
+            text = _opt(measure, "ErrorMessage")
+            if isinstance(text, str) and text.strip():
+                errors[str(measure.Name)] = text.strip()
+        return errors
+
+    @_locked
     def create_measure(self, table_name: str, measure_name: str, expression: str,
                        format_string: Optional[str] = None, description: Optional[str] = None,
                        display_folder: Optional[str] = None) -> OperationResult:
         """
-        Create a new measure
+        Create a new measure (staged, not saved)
 
         Args:
             table_name: Table to add the measure to
@@ -1000,114 +1171,119 @@ class PowerBITOMConnector:
         Returns:
             OperationResult with success status
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
 
-        try:
-            table = self.model.Tables.Find(table_name)
+        def create(journal: _Journal) -> OperationResult:
+            name = self._checked_name(measure_name, "Measure name").strip()
+            if not isinstance(expression, str) or not expression.strip():
+                return OperationResult(False, "A non-empty DAX expression is required")
+            table = self._find_table(table_name)
             if not table:
                 return OperationResult(False, f"Table '{table_name}' not found")
+            problem = self._measure_problem(table, name)
+            if problem:
+                return OperationResult(False, f"Measure '{name}' cannot be created: {problem}")
+            journal.add(table.Measures, self._new_measure(name, {
+                "expression": expression, "format_string": format_string,
+                "description": description, "display_folder": display_folder}))
+            logger.info(f"Created measure: '{name}' in table '{table.Name}'")
+            return OperationResult(True, f"Created measure: '{name}' in table '{table.Name}'")
 
-            # Check if measure already exists
-            if table.Measures.Find(measure_name):
-                return OperationResult(False, f"Measure '{measure_name}' already exists in table '{table_name}'")
+        return self._run(create, "create measure")
 
-            # Create new measure
-            measure = TOM.Measure()
-            measure.Name = measure_name
-            measure.Expression = expression
-
-            if format_string:
-                measure.FormatString = format_string
-            if description:
-                measure.Description = description
-            if display_folder:
-                measure.DisplayFolder = display_folder
-
-            table.Measures.Add(measure)
-            self._changes_pending = True
-
-            logger.info(f"Created measure: '{measure_name}' in table '{table_name}'")
-            return OperationResult(True, f"Created measure: '{measure_name}' in table '{table_name}'")
-
-        except Exception as e:
-            logger.error(f"Failed to create measure: {e}")
-            return OperationResult(False, f"Failed to create measure: {e}")
-
+    @_locked
     def batch_create_measures(self, table_name: str, measures: List[Dict[str, Any]],
                               auto_save: bool = True) -> OperationResult:
         """
-        Create many measures on one table in a single pass (all-or-nothing).
+        Create many measures on one table: all of them, or none.
 
-        Pre-validates the whole batch (table exists, no duplicate names in the model or within
-        the batch) BEFORE adding anything, so a failure cannot leave a half-created suite. Honors
-        an open tom transaction via auto_save=False.
+        The whole batch is checked BEFORE anything is added: the table exists; every entry has a
+        name and an expression; no name repeats within the batch, belongs to an existing measure
+        anywhere in the model, or equals a column of the target table (the engine rejects all
+        three). If adding fails part-way, the measures already added by this call are removed
+        again. If the save is rejected, they are undone as well. Inside a transaction the batch
+        is staged and saved by commit_transaction(); ``auto_save`` is ignored there.
 
         Args:
             table_name: Table to add the measures to
             measures: [{name, expression, format_string?, description?, display_folder?}]
-            auto_save: Save to the model at the end (False inside a transaction)
+            auto_save: Save at the end (default: True)
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
         if not measures:
             return OperationResult(False, "No measures provided")
+        table = self._find_table(table_name)
+        if not table:
+            return OperationResult(False, f"Table '{table_name}' not found")
 
-        try:
-            table = self.model.Tables.Find(table_name)
-            if not table:
-                return OperationResult(False, f"Table '{table_name}' not found")
+        # Validate the whole batch up front.
+        problems: List[str] = []
+        specs: List[Tuple[str, Dict[str, Any]]] = []
+        seen = set()
+        for i, m in enumerate(measures):
+            if not isinstance(m, dict):
+                problems.append(f"#{i + 1}: not an object")
+                continue
+            name = m.get("name").strip() if isinstance(m.get("name"), str) else ""
+            expression = m.get("expression")
+            if not name or not isinstance(expression, str) or not expression.strip():
+                problems.append(f"#{i + 1}: needs both a name and an expression")
+                continue
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+                problems.append(f"#{i + 1}: the name contains a control character")
+                continue
+            if name.casefold() in seen:
+                problems.append(f"'{name}': duplicated within the batch")
+            seen.add(name.casefold())
+            problem = self._measure_problem(table, name)
+            if problem:
+                problems.append(f"'{name}': {problem}")
+            for option in ("format_string", "description", "display_folder"):
+                if m.get(option) is not None and not isinstance(m.get(option), str):
+                    problems.append(f"'{name}': {option} must be text")
+            specs.append((name, m))
+        if problems:
+            return OperationResult(
+                False, "Batch rejected; nothing was created:\n  - " + "\n  - ".join(problems))
 
-            # Validate the whole batch up front.
-            problems = []
-            seen = set()
-            for i, m in enumerate(measures):
-                name = (m.get("name") or "").strip()
-                if not name or not (m.get("expression") or "").strip():
-                    problems.append(f"#{i + 1}: needs both a name and an expression")
-                    continue
-                if name.lower() in seen:
-                    problems.append(f"'{name}': duplicated within the batch")
-                seen.add(name.lower())
-                for t in self.model.Tables:
-                    if t.Measures.Find(name):
-                        problems.append(f"'{name}': already exists in table '{t.Name}'")
-                        break
-            if problems:
-                return OperationResult(False, "Batch rejected; nothing was created:\n  - " + "\n  - ".join(problems))
+        added: List[Any] = []
 
-            created = []
-            for m in measures:
-                measure = TOM.Measure()
-                measure.Name = m["name"]
-                measure.Expression = m["expression"]
-                if m.get("format_string"):
-                    measure.FormatString = m["format_string"]
-                if m.get("description"):
-                    measure.Description = m["description"]
-                if m.get("display_folder"):
-                    measure.DisplayFolder = m["display_folder"]
-                table.Measures.Add(measure)
-                created.append(m["name"])
-            self._changes_pending = True
+        def create(journal: _Journal) -> OperationResult:
+            for name, spec in specs:
+                measure = self._new_measure(name, spec)
+                journal.add(table.Measures, measure)
+                added.append(measure)
+            return OperationResult(True, "staged")
 
-            if auto_save:
-                save = self.save_changes()
-                if not save.success:
-                    return OperationResult(False, f"Measures staged but save failed: {save.message}")
+        staged = self._run(create, "batch-create measures")
+        if not staged.success:
+            return OperationResult(False, f"{staged.message} Nothing was created.")
 
-            logger.info(f"Created {len(created)} measures in table '{table_name}'")
-            return OperationResult(True, f"Created {len(created)} measure(s) in '{table_name}': "
-                                          + ", ".join(created),
-                                   details={"created": created})
+        created = [name for name, _ in specs]
+        failed_save = self._autosave(auto_save)
+        if failed_save is not None:
+            return OperationResult(False, f"Batch not created: {failed_save.message}",
+                                   {"created": [], "saved": False})
+        saved = bool(auto_save) and not self._txn_open
+        details: Dict[str, Any] = {"created": created, "saved": saved, "pending": not saved}
+        if saved:
+            errors = self._engine_errors(added)
+            if errors:
+                details["engine_errors"] = errors
+        logger.info(f"Created {len(created)} measures in table '{table.Name}'")
+        return OperationResult(
+            True, f"Created {len(created)} measure(s) in '{table.Name}': " + ", ".join(created)
+                  + (self._pending_note() if not saved else ""),
+            details=details)
 
-        except Exception as e:
-            logger.error(f"Failed to batch-create measures: {e}")
-            return OperationResult(False, f"Failed to batch-create measures: {e}")
-
+    @_locked
     def delete_measure(self, measure_name: str, table_name: Optional[str] = None) -> OperationResult:
         """
-        Delete a measure
+        Delete a measure (staged, not saved)
 
         Args:
             measure_name: Name of the measure to delete
@@ -1116,54 +1292,41 @@ class PowerBITOMConnector:
         Returns:
             OperationResult with success status
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
 
-        try:
-            measure = None
-            found_table = None
-
-            if table_name:
-                table = self.model.Tables.Find(table_name)
-                if not table:
-                    return OperationResult(False, f"Table '{table_name}' not found")
-                measure = table.Measures.Find(measure_name)
-                found_table = table
-            else:
-                for table in self.model.Tables:
-                    measure = table.Measures.Find(measure_name)
-                    if measure:
-                        found_table = table
-                        break
-
+        def delete(journal: _Journal) -> OperationResult:
+            if table_name and not self._find_table(table_name):
+                return OperationResult(False, f"Table '{table_name}' not found")
+            found_table, measure = self._find_measure(measure_name, table_name)
             if not measure:
                 return OperationResult(False, f"Measure '{measure_name}' not found")
-
             found_table.Measures.Remove(measure)
             self._changes_pending = True
-
             logger.info(f"Deleted measure: '{measure_name}'")
             return OperationResult(True, f"Deleted measure: '{measure_name}'")
 
-        except Exception as e:
-            logger.error(f"Failed to delete measure: {e}")
-            return OperationResult(False, f"Failed to delete measure: {e}")
+        return self._run(delete, "delete measure")
 
     # ==================== RELATIONSHIPS ====================
 
+    @_locked
     def create_relationship(self, from_table: str, from_column: str, to_table: str, to_column: str,
                             cardinality: str = "many_to_one", cross_filter: str = "single",
                             is_active: bool = True) -> OperationResult:
-        """Create a relationship between two columns.
+        """Create a relationship between two columns (staged, not saved).
 
         cardinality: many_to_one | one_to_many | one_to_one | many_to_many
         cross_filter: single | both
         """
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
-        try:
-            ft = self.model.Tables.Find(from_table)
-            tt = self.model.Tables.Find(to_table)
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
+
+        def create(journal: _Journal) -> OperationResult:
+            ft = self._find_table(from_table)
+            tt = self._find_table(to_table)
             if not ft:
                 return OperationResult(False, f"From table '{from_table}' not found")
             if not tt:
@@ -1175,73 +1338,82 @@ class PowerBITOMConnector:
             if not tc:
                 return OperationResult(False, f"Column '{to_table}'[{to_column}] not found")
 
+            many = TOM.RelationshipEndCardinality.Many
+            one = TOM.RelationshipEndCardinality.One
+            ends = {
+                "many_to_one": (many, one), "*:1": (many, one), "m:1": (many, one),
+                "one_to_many": (one, many), "1:*": (one, many), "1:m": (one, many),
+                "one_to_one": (one, one), "1:1": (one, one),
+                "many_to_many": (many, many), "m:m": (many, many), "*:*": (many, many),
+            }
+            card = (cardinality or "many_to_one").lower()
+            if card not in ends:
+                return OperationResult(False, f"Unknown cardinality '{cardinality}'; use many_to_one, "
+                                              "one_to_many, one_to_one or many_to_many")
+            cf = (cross_filter or "single").lower()
+            if cf not in ("single", "one", "one_direction", "both", "bidirectional", "both_directions"):
+                return OperationResult(False, f"Unknown cross_filter '{cross_filter}'; use single or both")
+
             rel = TOM.SingleColumnRelationship()
             rel.FromColumn = fc
             rel.ToColumn = tc
-
-            card = (cardinality or "many_to_one").lower()
-            Many = TOM.RelationshipEndCardinality.Many
-            One = TOM.RelationshipEndCardinality.One
-            if card in ("one_to_many", "1:*", "1:m"):
-                rel.FromCardinality, rel.ToCardinality = One, Many
-            elif card in ("one_to_one", "1:1"):
-                rel.FromCardinality, rel.ToCardinality = One, One
-            elif card in ("many_to_many", "m:m", "*:*"):
-                rel.FromCardinality, rel.ToCardinality = Many, Many
-            else:  # many_to_one (default)
-                rel.FromCardinality, rel.ToCardinality = Many, One
-
-            cf = (cross_filter or "single").lower()
-            if cf in ("both", "bidirectional", "both_directions"):
-                rel.CrossFilteringBehavior = TOM.CrossFilteringBehavior.BothDirections
-            else:
-                rel.CrossFilteringBehavior = TOM.CrossFilteringBehavior.OneDirection
+            rel.FromCardinality, rel.ToCardinality = ends[card]
+            both = cf in ("both", "bidirectional", "both_directions")
+            rel.CrossFilteringBehavior = (TOM.CrossFilteringBehavior.BothDirections if both
+                                          else TOM.CrossFilteringBehavior.OneDirection)
             rel.IsActive = bool(is_active)
-
-            self.model.Relationships.Add(rel)
-            self._changes_pending = True
+            journal.add(self.model.Relationships, rel)
             logger.info(f"Created relationship {from_table}[{from_column}] -> {to_table}[{to_column}]")
             return OperationResult(
                 True,
                 f"Created relationship {from_table}[{from_column}] -> {to_table}[{to_column}] ({card}, {cf})",
             )
-        except Exception as e:
-            logger.error(f"Failed to create relationship: {e}")
-            return OperationResult(False, f"Failed to create relationship: {e}")
 
+        return self._run(create, "create relationship")
+
+    @_locked
     def delete_relationship(self, from_table: Optional[str] = None, from_column: Optional[str] = None,
                             to_table: Optional[str] = None, to_column: Optional[str] = None,
                             name: Optional[str] = None) -> OperationResult:
-        """Delete a relationship, identified by name or by from/to table[/column]."""
-        if not self._ensure_connected():
-            return OperationResult(False, "Not connected")
-        try:
-            target = None
+        """Delete a relationship, identified by name or by from/to table[/column] (staged, not
+        saved). Several matches are refused rather than deleting the first one found."""
+        blocked = self._begin_write()
+        if blocked:
+            return blocked
+
+        def delete(journal: _Journal) -> OperationResult:
+            if not name and not (from_table and to_table):
+                return OperationResult(
+                    False, "Identify the relationship by name, or by from_table and to_table")
+            matches = []
             for rel in self.model.Relationships:
-                if name and getattr(rel, "Name", None) == name:
-                    target = rel
-                    break
-                try:
-                    if (from_table and to_table
-                            and rel.FromTable.Name == from_table and rel.ToTable.Name == to_table
-                            and (not from_column or rel.FromColumn.Name == from_column)
-                            and (not to_column or rel.ToColumn.Name == to_column)):
-                        target = rel
-                        break
-                except Exception:
+                if name:
+                    if _opt(rel, "Name") == name:
+                        matches.append(rel)
                     continue
-            if not target:
+                # Only single-column relationships expose these members; others cannot match.
+                f_table, t_table = _opt(_opt(rel, "FromTable"), "Name"), _opt(_opt(rel, "ToTable"), "Name")
+                f_col, t_col = _opt(_opt(rel, "FromColumn"), "Name"), _opt(_opt(rel, "ToColumn"), "Name")
+                if (dt.names_equal(f_table, from_table) and dt.names_equal(t_table, to_table)
+                        and (not from_column or dt.names_equal(f_col, from_column))
+                        and (not to_column or dt.names_equal(t_col, to_column))):
+                    matches.append(rel)
+            if not matches:
                 return OperationResult(False, "Relationship not found")
-            self.model.Relationships.Remove(target)
+            if len(matches) > 1:
+                return OperationResult(
+                    False, f"{len(matches)} relationships match; add from_column / to_column "
+                           "(or the relationship name) to pick one")
+            self.model.Relationships.Remove(matches[0])
             self._changes_pending = True
             logger.info("Deleted relationship")
             return OperationResult(True, "Deleted relationship")
-        except Exception as e:
-            logger.error(f"Failed to delete relationship: {e}")
-            return OperationResult(False, f"Failed to delete relationship: {e}")
+
+        return self._run(delete, "delete relationship")
 
     # ==================== UTILITY METHODS ====================
 
+    @_locked
     def get_model_summary(self) -> Dict[str, Any]:
         """Get a summary of the model"""
         if not self._ensure_connected():
@@ -1270,9 +1442,11 @@ class PowerBITOMConnector:
                 "total_columns": total_columns,
                 "total_measures": total_measures,
                 "tables": tables,
-                "changes_pending": self._changes_pending
+                "changes_pending": self._has_local_changes(),
+                "in_transaction": self._txn_open,
             }
 
         except Exception as e:
-            logger.error(f"Failed to get model summary: {e}")
-            return {"error": str(e)}
+            error = clean_error(e)
+            logger.error(f"Failed to get model summary: {error}")
+            return {"error": error}

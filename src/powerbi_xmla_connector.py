@@ -1,52 +1,44 @@
 """
-Power BI XMLA Connector using pyadomd
-Provides dynamic table discovery through XMLA endpoints
+Power BI XMLA Connector
+Provides dynamic table discovery and DAX queries through the Power BI XMLA endpoint.
 Requires: Windows + ADOMD.NET client libraries
+
+The connection string carries the service principal's secret, so two rules hold throughout:
+
+* every caller-supplied part (workspace, dataset, effective user) is quoted by
+  ``connection_strings.build``; none of them can add or override a connection property;
+* every provider error is cleaned and redacted before it is logged or raised, on every path
+  (connect, discovery and queries alike).
+
+Like the Desktop connector, no connection is kept open between calls.
 """
 import logging
-import os
-import sys
 from typing import Any, Dict, List, Optional
-from pathlib import Path
+
+import adomd_loader
+import dax_tokens
+from adomd_loader import NOT_FOUND_HELP
+from adomd_query import QueryError, QueryRows, clean_error, run_query
+from connection_strings import ConnectionStringError, build as _build_pairs
 
 logger = logging.getLogger(__name__)
 
-# Add ADOMD.NET DLL path before importing pyadomd (shared, robust discovery:
-# env var + Power BI Desktop + SSMS + SQL SDK + Update Cache + NuGet)
-from adomd_loader import ensure_adomd_on_path, NOT_FOUND_HELP
+# Load ADOMD.NET (shared, runtime-aware discovery with fall-through; see adomd_loader)
+_adomd = adomd_loader.load_adomd()
+_adomd_available = _adomd.available
+AdomdConnection = _adomd.value.connection if _adomd.available else None
+AdomdCommand = _adomd.value.command if _adomd.available else None
+AdomdSchemaGuid = _adomd.value.schema_guid if _adomd.available else None
 
+XMLA_ENDPOINT = "powerbi://api.powerbi.com/v1.0/myorg/"
 
-def _add_adomd_to_path() -> bool:
-    """Find ADOMD.NET and add its directory to sys.path / PATH."""
-    found = ensure_adomd_on_path()
-    if found:
-        logger.info(f"Found ADOMD.NET DLL at: {found}")
-        return True
-    logger.error(NOT_FOUND_HELP)
-    return False
-
-
-# Configure ADOMD path
-_adomd_available = _add_adomd_to_path()
-
-# Now import pyadomd and .NET assemblies
-if _adomd_available:
-    try:
-        from pyadomd import Pyadomd
-        import clr
-        clr.AddReference("Microsoft.AnalysisServices.AdomdClient")
-        from Microsoft.AnalysisServices.AdomdClient import AdomdConnection, AdomdSchemaGuid
-        logger.info("Successfully loaded ADOMD.NET assemblies")
-    except Exception as e:
-        logger.error(f"Failed to load ADOMD.NET: {e}")
-        _adomd_available = False
-else:
-    Pyadomd = None
-    AdomdSchemaGuid = None
+# Cloud models can be far larger than anything a caller can use; this bounds memory when a
+# caller does not pass its own limit. The result says when the limit cut it short.
+DEFAULT_MAX_ROWS = 100_000
 
 
 class PowerBIXmlaConnector:
-    """Power BI connector using XMLA endpoint with pyadomd"""
+    """Power BI connector using XMLA endpoint (ADOMD.NET)"""
 
     def __init__(self, tenant_id: str, client_id: str, client_secret: str):
         """Initialize connector with Azure AD credentials"""
@@ -54,10 +46,62 @@ class PowerBIXmlaConnector:
         self.client_id = client_id
         self.client_secret = client_secret
         self.connection_string = None
-        self.connection = None
+        self.connection = None  # kept for compatibility; no connection is held open
         self.workspace_name = None
         self.dataset_name = None
         self.effective_user: Optional[str] = None  # For RLS impersonation
+        self.last_error: Optional[str] = None
+        self.last_query_truncated: bool = False
+
+    # ==================== CONNECTION ====================
+
+    def _secrets(self) -> List[str]:
+        return [self.client_secret] if self.client_secret else []
+
+    def _safe(self, error: Any) -> str:
+        """Provider error text that is safe to log or raise."""
+        return clean_error(error, self._secrets())
+
+    def _build_connection_string(self, workspace_name: str, dataset_name: str,
+                                 effective_user: Optional[str] = None) -> str:
+        """Service-principal connection string with every value quoted.
+
+        Raises connection_strings.ConnectionStringError for an empty name or one that contains
+        control characters.
+        """
+        if workspace_name is None or not str(workspace_name).strip():
+            raise ConnectionStringError("workspace_name must not be empty")
+        pairs = [
+            ("Data Source", XMLA_ENDPOINT + str(workspace_name).strip()),
+            ("Initial Catalog", dataset_name),
+            ("User ID", f"app:{self.client_id}@{self.tenant_id}"),
+            ("Password", self.client_secret),
+        ]
+        if effective_user is not None and str(effective_user).strip():
+            # EffectiveUserName makes the engine apply that user's RLS roles.
+            pairs.append(("EffectiveUserName", str(effective_user).strip()))
+        return "Provider=MSOLAP;" + _build_pairs(pairs) + ";"
+
+    def _open(self, connection_string: Optional[str] = None) -> Any:
+        """Open a connection; the caller closes it in a ``finally`` block. A connection that
+        fails to open is closed here, since the caller never receives it."""
+        connection = AdomdConnection(connection_string or self.connection_string)
+        try:
+            connection.Open()
+        except Exception:
+            self._close(connection)
+            raise
+        return connection
+
+    @staticmethod
+    def _close(connection: Any) -> None:
+        if connection is None:
+            return
+        try:
+            connection.Close()
+        except Exception as e:
+            # Cleanup only: must not replace the result or the error of the call itself.
+            logger.debug(f"closing connection failed: {clean_error(e)}")
 
     def connect(self, workspace_name: str, dataset_name: str, effective_user: Optional[str] = None) -> bool:
         """
@@ -70,75 +114,70 @@ class PowerBIXmlaConnector:
                            When specified, queries are filtered by that user's RLS roles.
 
         Returns:
-            True if connection successful
+            True if connection successful. On failure the previous connection settings (if
+            any) stay in force and ``last_error`` holds a redacted reason.
         """
-        if not _adomd_available or Pyadomd is None:
+        self.last_error = None
+        if not _adomd_available or AdomdConnection is None:
+            self.last_error = _adomd.describe() if _adomd.searched else NOT_FOUND_HELP
             logger.error("ADOMD.NET libraries not available - cannot connect via XMLA")
-            logger.error("Install SQL Server Management Studio or ADOMD.NET client libraries")
             return False
 
         try:
-            self.workspace_name = workspace_name
-            self.dataset_name = dataset_name
-            self.effective_user = effective_user
-
-            # Build XMLA endpoint URL
-            # Format: powerbi://api.powerbi.com/v1.0/myorg/WorkspaceName
-            xmla_endpoint = f"powerbi://api.powerbi.com/v1.0/myorg/{workspace_name}"
-
-            # Build connection string with Service Principal authentication
-            self.connection_string = (
-                f"Provider=MSOLAP;"
-                f"Data Source={xmla_endpoint};"
-                f"Initial Catalog={dataset_name};"
-                f"User ID=app:{self.client_id}@{self.tenant_id};"
-                f"Password={self.client_secret};"
-            )
-
-            # Add EffectiveUserName for RLS impersonation if specified
-            if effective_user:
-                self.connection_string += f"EffectiveUserName={effective_user};"
-                logger.info(f"RLS enabled: Impersonating user '{effective_user}'")
-
-            logger.info(f"Connecting to XMLA endpoint: {xmla_endpoint}")
-            logger.info(f"Dataset: {dataset_name}")
-
-            # Test connection
-            try:
-                with Pyadomd(self.connection_string) as conn:
-                    # Check connection state
-                    state = conn.conn.State
-                    logger.info(f"Connection state: {state}")
-
-                    # ConnectionState.Open can be 1 (int) or "Open" (string) depending on the library version
-                    if state == 1 or str(state) == "Open" or str(state) == "1":
-                        logger.info("Successfully connected to Power BI via XMLA")
-                        return True
-                    else:
-                        logger.error(f"Connection state is not Open (State={state})")
-                        return False
-
-            except Exception as conn_error:
-                logger.error(f"Pyadomd connection error: {str(conn_error)}")
-
-                # Check for common error messages
-                error_msg = str(conn_error).lower()
-                if "login" in error_msg or "auth" in error_msg:
-                    logger.error("Authentication failed - check Service Principal credentials")
-                elif "catalog" in error_msg or "database" in error_msg:
-                    logger.error("Dataset (catalog) not found - check dataset name")
-                elif "workspace" in error_msg or "server" in error_msg:
-                    logger.error("Workspace not found - check workspace name")
-
-                import traceback
-                logger.debug(traceback.format_exc())
-                return False
-
-        except Exception as e:
-            logger.error(f"XMLA connection failed: {str(e)}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            connection_string = self._build_connection_string(workspace_name, dataset_name, effective_user)
+        except ConnectionStringError as e:
+            self.last_error = str(e)
+            logger.error(f"XMLA connection refused: {self.last_error}")
             return False
+
+        connection = None
+        try:
+            logger.info(f"Connecting via XMLA: workspace '{workspace_name}', dataset '{dataset_name}'")
+            connection = self._open(connection_string)
+            state = connection.State
+            # ConnectionState.Open can be 1 (int) or "Open" (string) depending on the library version
+            if not (state == 1 or str(state) in ("Open", "1")):
+                raise QueryError(f"Connection state is not Open (State={state})")
+        except Exception as e:
+            self.last_error = self._safe(e)
+            logger.error(f"XMLA connection failed: {self.last_error}")
+            lowered = self.last_error.lower()
+            if "login" in lowered or "auth" in lowered:
+                logger.error("Authentication failed - check Service Principal credentials")
+            elif "catalog" in lowered or "database" in lowered:
+                logger.error("Dataset (catalog) not found - check dataset name")
+            elif "workspace" in lowered or "server" in lowered:
+                logger.error("Workspace not found - check workspace name")
+            return False
+        finally:
+            self._close(connection)
+
+        user = str(effective_user).strip() if effective_user is not None else ""
+        self.workspace_name = workspace_name
+        self.dataset_name = dataset_name
+        self.effective_user = user or None
+        self.connection_string = connection_string
+        if self.effective_user:
+            logger.info(f"RLS enabled: Impersonating user '{self.effective_user}'")
+        logger.info("Successfully connected to Power BI via XMLA")
+        return True
+
+    def _require_connection(self) -> None:
+        if not self.connection_string:
+            raise QueryError("Not connected - call connect() first")
+
+    # ==================== SCHEMA DISCOVERY ====================
+
+    @staticmethod
+    def _cell(row: Any, column_names: List[str], name: str, default: Any = None) -> Any:
+        """A schema-rowset cell, or ``default`` when this rowset has no such column or the cell
+        is NULL. Rowset columns differ between engine versions, so absence is normal."""
+        if name not in column_names:
+            return default
+        value = row[name]
+        if value is None or type(value).__name__ == "DBNull":
+            return default
+        return value
 
     def discover_tables(self) -> List[Dict[str, Any]]:
         """
@@ -146,84 +185,42 @@ class PowerBIXmlaConnector:
 
         Returns:
             List of tables with their metadata
+
+        Raises:
+            QueryError if not connected or the schema cannot be read.
         """
+        self._require_connection()
+        logger.info("Discovering tables via XMLA...")
+        tables = []
+        connection = None
         try:
-            if not self.connection_string:
-                logger.error("Not connected - call connect() first")
-                return []
-
-            logger.info("Discovering tables via XMLA...")
-
-            tables = []
-
-            with Pyadomd(self.connection_string) as pyadomd_conn:
-                # Get the underlying ADOMD connection
-                adomd_connection = pyadomd_conn.conn
-
-                # Get schema dataset for tables
-                tables_dataset = adomd_connection.GetSchemaDataSet(
-                    AdomdSchemaGuid.Tables,
-                    None
-                )
-
-                # Get the table containing schema information
-                schema_table = tables_dataset.Tables[0]
-
-                logger.info(f"Found {schema_table.Rows.Count} total tables in schema")
-
-                # Get column names once
-                column_names = [str(col.ColumnName) for col in schema_table.Columns]
-
-                # Iterate through rows
-                for row in schema_table.Rows:
-                    table_name = str(row["TABLE_NAME"])
-
-                    # Check for hidden status
-                    is_hidden = False
-                    if "TABLE_HIDDEN" in column_names:
-                        try:
-                            is_hidden = bool(row["TABLE_HIDDEN"])
-                        except:
-                            is_hidden = False
-
-                    # Get description
-                    description = ""
-                    if "DESCRIPTION" in column_names:
-                        try:
-                            desc_value = row["DESCRIPTION"]
-                            description = str(desc_value) if desc_value else ""
-                        except:
-                            description = ""
-
-                    # Get table type
-                    table_type = "TABLE"
-                    if "TABLE_TYPE" in column_names:
-                        try:
-                            table_type = str(row["TABLE_TYPE"])
-                        except:
-                            table_type = "TABLE"
-
-                    # Filter out system and hidden tables
-                    system_prefixes = ("$", "DateTableTemplate_", "LocalDateTable_",
-                                      "DBSCHEMA_", "MDSCHEMA_", "TMSCHEMA_",
-                                      "DMSCHEMA_", "DISCOVER_")
-
-                    if not table_name.startswith(system_prefixes) and not is_hidden:
-                        tables.append({
-                            "name": table_name,
-                            "description": description or "No description available",
-                            "type": table_type
-                        })
-                        logger.info(f"  - {table_name}")
-
-            logger.info(f"Discovered {len(tables)} visible tables")
-            return tables
-
+            connection = self._open()
+            schema_table = connection.GetSchemaDataSet(AdomdSchemaGuid.Tables, None).Tables[0]
+            column_names = [str(col.ColumnName) for col in schema_table.Columns]
+            # Filter out system and hidden tables
+            system_prefixes = ("$", "DateTableTemplate_", "LocalDateTable_",
+                               "DBSCHEMA_", "MDSCHEMA_", "TMSCHEMA_",
+                               "DMSCHEMA_", "DISCOVER_")
+            for row in schema_table.Rows:
+                table_name = str(row["TABLE_NAME"])
+                is_hidden = bool(self._cell(row, column_names, "TABLE_HIDDEN", False))
+                if table_name.startswith(system_prefixes) or is_hidden:
+                    continue
+                description = self._cell(row, column_names, "DESCRIPTION", "")
+                tables.append({
+                    "name": table_name,
+                    "description": str(description) if description else "No description available",
+                    "type": str(self._cell(row, column_names, "TABLE_TYPE", "TABLE")),
+                })
         except Exception as e:
-            logger.error(f"Table discovery failed: {str(e)}")
-            import traceback
-            logger.debug(traceback.format_exc())
-            return []
+            message = self._safe(e)
+            logger.error(f"Table discovery failed: {message}")
+            raise QueryError(f"Table discovery failed: {message}") from None
+        finally:
+            self._close(connection)
+
+        logger.info(f"Discovered {len(tables)} visible tables")
+        return tables
 
     def get_table_schema(self, table_name: str) -> Dict[str, Any]:
         """
@@ -234,78 +231,37 @@ class PowerBIXmlaConnector:
 
         Returns:
             Dictionary with table metadata and columns
+
+        Raises:
+            QueryError if not connected or the schema cannot be read.
         """
+        self._require_connection()
+        logger.info(f"Getting schema for table: {table_name}")
+        columns = []
+        connection = None
         try:
-            if not self.connection_string:
-                logger.error("Not connected - call connect() first")
-                return {"table_name": table_name, "columns": []}
-
-            logger.info(f"Getting schema for table: {table_name}")
-
-            columns = []
-
-            with Pyadomd(self.connection_string) as pyadomd_conn:
-                adomd_connection = pyadomd_conn.conn
-
-                # Get schema dataset for columns
-                restrictions = [None, None, table_name, None]
-
-                columns_dataset = adomd_connection.GetSchemaDataSet(
-                    AdomdSchemaGuid.Columns,
-                    restrictions
-                )
-
-                schema_table = columns_dataset.Tables[0]
-
-                logger.info(f"Found {schema_table.Rows.Count} columns in table '{table_name}'")
-
-                # Get column names once
-                column_names = [str(col.ColumnName) for col in schema_table.Columns]
-
-                for row in schema_table.Rows:
-                    column_name = str(row["COLUMN_NAME"])
-
-                    # Get data type
-                    data_type = "Unknown"
-                    if "DATA_TYPE" in column_names:
-                        try:
-                            data_type = str(row["DATA_TYPE"])
-                        except:
-                            data_type = "Unknown"
-
-                    # Check if hidden
-                    is_hidden = False
-                    if "COLUMN_HIDDEN" in column_names:
-                        try:
-                            is_hidden = bool(row["COLUMN_HIDDEN"])
-                        except:
-                            is_hidden = False
-
-                    # Get description
-                    description = ""
-                    if "DESCRIPTION" in column_names:
-                        try:
-                            desc_value = row["DESCRIPTION"]
-                            description = str(desc_value) if desc_value else ""
-                        except:
-                            description = ""
-
-                    # Only include visible columns
-                    if not is_hidden:
-                        columns.append({
-                            "name": column_name,
-                            "type": self._map_data_type(data_type),
-                            "description": description or ""
-                        })
-
-            return {
-                "table_name": table_name,
-                "columns": columns
-            }
-
+            connection = self._open()
+            # Restrictions are matched as values by the provider (catalog, schema, table, column).
+            restrictions = [None, None, table_name, None]
+            schema_table = connection.GetSchemaDataSet(AdomdSchemaGuid.Columns, restrictions).Tables[0]
+            column_names = [str(col.ColumnName) for col in schema_table.Columns]
+            for row in schema_table.Rows:
+                if bool(self._cell(row, column_names, "COLUMN_HIDDEN", False)):
+                    continue  # only visible columns
+                description = self._cell(row, column_names, "DESCRIPTION", "")
+                columns.append({
+                    "name": str(row["COLUMN_NAME"]),
+                    "type": self._map_data_type(str(self._cell(row, column_names, "DATA_TYPE", "Unknown"))),
+                    "description": str(description) if description else "",
+                })
         except Exception as e:
-            logger.error(f"Failed to get schema for table '{table_name}': {str(e)}")
-            return {"table_name": table_name, "columns": []}
+            message = self._safe(e)
+            logger.error(f"Failed to get schema for table '{table_name}': {message}")
+            raise QueryError(f"Failed to get schema for table '{table_name}': {message}") from None
+        finally:
+            self._close(connection)
+
+        return {"table_name": table_name, "columns": columns}
 
     def _map_data_type(self, adomd_type: str) -> str:
         """Map ADOMD data types to readable names"""
@@ -323,55 +279,39 @@ class PowerBIXmlaConnector:
         }
         return type_mapping.get(str(adomd_type), f"Type_{adomd_type}")
 
-    def execute_dax(self, dax_query: str) -> List[Dict[str, Any]]:
+    # ==================== QUERIES ====================
+
+    def execute_dax(self, dax_query: str, max_rows: Optional[int] = DEFAULT_MAX_ROWS,
+                    allow_dmv: bool = False, timeout: Optional[float] = None) -> QueryRows:
         """
         Execute a DAX query via XMLA
 
         Args:
-            dax_query: DAX query string
+            dax_query: DAX query string. Must be a query (EVALUATE / DEFINE ... EVALUATE);
+                       TMSL, XMLA and MDX are refused.
+            max_rows: Stop reading after this many rows (None reads everything). Rows beyond
+                      the limit are never materialised.
+            allow_dmv: Also accept ``SELECT ... FROM $SYSTEM.<rowset>``.
+            timeout: Command timeout in seconds (default POWERBI_MCP_QUERY_TIMEOUT or 120).
 
         Returns:
-            Query results as list of dictionaries
+            ``QueryRows``: a list of row dicts with ``.truncated`` set when max_rows cut it short.
+
+        Raises:
+            dax_tokens.NonQueryStatementError for non-query text; QueryError otherwise.
         """
-        try:
-            if not self.connection_string:
-                logger.error("Not connected - call connect() first")
-                return []
+        dax_tokens.ensure_query(dax_query, allow_dmv=allow_dmv)
+        self._require_connection()
+        # The query text can carry literals worth protecting, so only its size is logged.
+        logger.info(f"Executing DAX query via XMLA ({len(dax_query)} chars)")
+        rows = run_query(AdomdConnection, AdomdCommand, self.connection_string, dax_query,
+                         max_rows=max_rows, timeout=timeout, allow_dmv=allow_dmv,
+                         secrets=self._secrets())
+        self.last_query_truncated = rows.truncated
+        logger.info(f"Query returned {len(rows)} rows" + (" (truncated)" if rows.truncated else ""))
+        return rows
 
-            logger.info(f"Executing DAX query: {dax_query[:100]}...")
-
-            rows = []
-
-            with Pyadomd(self.connection_string) as pyadomd_conn:
-                # Execute query
-                cursor = pyadomd_conn.cursor()
-                cursor.execute(dax_query)
-
-                # Get column names
-                columns = [desc[0] for desc in cursor.description]
-
-                # Fetch all rows
-                for row in cursor.fetchall():
-                    row_dict = {}
-                    for i, value in enumerate(row):
-                        row_dict[columns[i]] = value
-                    rows.append(row_dict)
-
-                logger.info(f"Query returned {len(rows)} rows")
-
-            return rows
-
-        except Exception as e:
-            # The connection string embeds the service-principal secret; a provider error can
-            # echo it. Strip it before logging or re-raising so it never reaches a caller/model.
-            # Also drop the .NET stack trace ADOMD appends - only the message line is useful.
-            safe = str(e).split("\n   at ")[0].strip()
-            if getattr(self, "client_secret", None) and len(self.client_secret) >= 6:
-                safe = safe.replace(self.client_secret, "***")
-            logger.error(f"DAX query execution failed: {safe}")
-            raise Exception(f"DAX query failed: {safe}")
-
-    def get_sample_data(self, table_name: str, num_rows: int = 5) -> List[Dict[str, Any]]:
+    def get_sample_data(self, table_name: str, num_rows: int = 5) -> QueryRows:
         """
         Get sample data from a table
 
@@ -381,17 +321,15 @@ class PowerBIXmlaConnector:
 
         Returns:
             List of row dictionaries
-        """
-        try:
-            # Always single-quote and escape inner quotes so a name like O'Brien cannot break
-            # out of the table reference (DAX escapes a single quote by doubling it).
-            quoted_name = "'" + str(table_name).replace("'", "''") + "'"
-            dax_query = f"EVALUATE TOPN({int(num_rows)}, {quoted_name})"
-            return self.execute_dax(dax_query)
 
-        except Exception as e:
-            logger.error(f"Failed to get sample data from '{table_name}': {str(e)}")
-            return []
+        Raises:
+            QueryError if the query fails.
+        """
+        # Always quoted, with inner quotes doubled, so a name like O'Brien stays one table name.
+        quoted_name = dax_tokens.quote_table(str(table_name), force=True)
+        return self.execute_dax(f"EVALUATE TOPN({int(num_rows)}, {quoted_name})", max_rows=int(num_rows))
+
+    # ==================== RLS ====================
 
     def set_effective_user(self, user_email: Optional[str]) -> bool:
         """
@@ -401,10 +339,11 @@ class PowerBIXmlaConnector:
             user_email: User email to impersonate, or None to clear
 
         Returns:
-            True if successful
+            True if successful. On failure the previous effective user stays in force.
         """
         if not self.workspace_name or not self.dataset_name:
-            logger.error("Not connected - cannot set effective user")
+            self.last_error = "Not connected - cannot set effective user"
+            logger.error(self.last_error)
             return False
 
         return self.connect(
@@ -428,7 +367,7 @@ class PowerBIXmlaConnector:
         }
 
     def close(self):
-        """Close the connection"""
+        """Forget the connection settings (there is no open handle to release)."""
         self.connection = None
         self.connection_string = None
         self.effective_user = None

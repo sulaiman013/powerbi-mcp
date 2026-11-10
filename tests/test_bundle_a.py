@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 
+os.environ.setdefault("POWERBI_MCP_AUDIT_DIR", __import__("tempfile").mkdtemp(prefix="pbi-mcp-audit-"))  # keep logs/ clean
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import server  # noqa: E402
 
@@ -65,6 +66,23 @@ class FakeTOM:
 
     def discard_changes(self):
         self.discarded += 1
+        return FakeResult(True, "discarded")
+
+    # Transactions are owned by the connector: these mirror PowerBITOMConnector's contract.
+    in_transaction = False
+
+    def begin_transaction(self):
+        self.in_transaction = True
+        return FakeResult(True, "transaction started")
+
+    def commit_transaction(self):
+        self.in_transaction = False
+        self.saved += 1
+        return FakeResult(True, "saved")
+
+    def rollback_transaction(self):
+        self.in_transaction = False
+        self.discarded = getattr(self, "discarded", 0) + 1
         return FakeResult(True, "discarded")
 
     def batch_update_measures(self, updates, auto_save=True):
