@@ -10,6 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+os.environ.setdefault("POWERBI_MCP_AUDIT_DIR", __import__("tempfile").mkdtemp(prefix="pbi-mcp-audit-"))  # keep logs/ clean
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import server  # noqa: E402
 from powerbi_pbip_connector import PowerBIPBIPConnector, PBIPProject  # noqa: E402

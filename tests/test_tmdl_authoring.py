@@ -231,18 +231,147 @@ def test_rename_integration_with_wave5_constructs():
         content3 = path.read_text(encoding="utf-8")
         check("sourceColumn: [Year] survives measure rename", "sourceColumn: [Year]" in content3)
 
-        # scoped rollback: a failing rename must NOT roll files back past unrelated changes
+        # a refused rename, and undoing a rename, must not disturb changes made in between
         c.add_measures("Sales", [{"name": "Keep Me", "expression": "1"}])
         sales_path = Path(c._find_table_file("Sales"))
-        orig_fail = c._rename_column_in_visual_files
-        c.current_project.is_pbir_enhanced = True
-        c._rename_column_in_visual_files = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-        res3 = c.rename_column_in_files("Sales", "Region", "Zone")
-        c._rename_column_in_visual_files = orig_fail
-        check("failed rename reports rollback", res3.success is False)
+        res3 = c.rename_column_in_files("Sales", "Region", "Amount")      # collides with a column
+        check("colliding rename is refused", res3.success is False and "already has" in res3.message, res3.message)
         after = sales_path.read_text(encoding="utf-8")
-        check("rollback did NOT eat unrelated added measure", "'Keep Me'" in after or "measure 'Keep Me'" in after, after[-300:])
-        check("rollback restored the column name", "column Region" in after)
+        check("refusal did NOT eat the unrelated added measure", "measure 'Keep Me' = 1" in after, after[-300:])
+        check("refusal left the column name", "column Region" in after)
+        res4 = c.rename_column_in_files("Sales", "Region", "Zone")
+        check("valid rename succeeds", res4.success, res4.message)
+        check("undo restores the column", c.rollback_changes() and "column Region" in sales_path.read_text(encoding="utf-8"))
+        check("undo keeps the measure added before the rename",
+              "measure 'Keep Me' = 1" in sales_path.read_text(encoding="utf-8"))
+
+
+UPSERT_TABLE = (
+    "table Sales\n"
+    "\tlineageTag: 11111111-1111-1111-1111-111111111111\n\n"
+    "\tcolumn Amount\n\t\tdataType: double\n\t\tsourceColumn: Amount\n\n"
+    "\t/// Old description that is\n"
+    "\t/// two lines long.\n"
+    "\tmeasure 'Total Sales' =\n"
+    "\t\t\tVAR _x = SUM(Sales[Amount])\n"
+    "\t\t\tRETURN\n"
+    "\t\t\t    _x\n"
+    "\t\tlineageTag: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+    "\t\tformatString: #,0\n\n"
+    "\t\tannotation PBI_FormatHint = {\"isGeneralNumber\":true}\n\n"
+    "\tmeasure Other = 1\n"
+    "\t\tlineageTag: 99999999-0000-0000-0000-000000000000\n\n"
+    "\tpartition Sales = m\n\t\tmode: import\n\t\tsource =\n\t\t\t\tlet\n\t\t\t\t    Source = 1\n\t\t\t\tin\n\t\t\t\t    Source\n"
+)
+UPSERT_OTHER = "table Dim\n\tcolumn Key\n\t\tdataType: int64\n\t\tsourceColumn: Key\n\n\tmeasure Elsewhere = 1\n"
+
+
+def _upsert_project(tmp, crlf=False):
+    root = Path(tmp)
+    (root / "proj.pbip").write_text("{}", encoding="utf-8")
+    tables = root / "proj.SemanticModel" / "definition" / "tables"
+    tables.mkdir(parents=True)
+    nl = "\r\n" if crlf else "\n"
+    (tables / "Sales.tmdl").write_bytes(UPSERT_TABLE.replace("\n", nl).encode("utf-8"))
+    (tables / "Dim.tmdl").write_bytes(UPSERT_OTHER.replace("\n", nl).encode("utf-8"))
+    c = PowerBIPBIPConnector(auto_backup=False)
+    c.current_project = PowerBIPBIPConnector._parse_pbip_project(root / "proj.pbip")
+    return c, tables / "Sales.tmdl"
+
+
+def test_upsert_measures():
+    print("\n== add_measures(mode='upsert'): replace in place, deterministic, idempotent ==")
+    batch = [
+        {"name": "Total Sales", "expression": "SUM(Sales[Amount]) * 1", "format_string": "0.00",
+         "description": "New description."},
+        {"name": "Margin", "expression": "VAR _a = [Total Sales]\nRETURN\n    _a * 0.2", "display_folder": "Ratios"},
+        {"name": "Tiny", "expression": "1"},
+    ]
+    for crlf in (False, True):
+        tag = "CRLF" if crlf else "LF"
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = _upsert_project(tmp, crlf)
+            res = c.add_measures("Sales", batch, mode="upsert")
+            check(f"{tag}: upsert succeeds", res.get("success") is True, str(res))
+            check(f"{tag}: reports what was replaced and what was added",
+                  res.get("updated") == ["Total Sales"] and res.get("created") == ["Margin", "Tiny"], str(res))
+            raw = path.read_bytes()
+            first = raw
+            check(f"{tag}: file keeps its line endings",
+                  (raw.count(b"\r\n") == raw.count(b"\n")) if crlf else (b"\r" not in raw))
+            text = raw.decode("utf-8").replace("\r\n", "\n")
+            check(f"{tag}: old description, multi-line expression, format and annotation are gone",
+                  "Old description" not in text and "two lines long" not in text and "VAR _x" not in text
+                  and "PBI_FormatHint" not in text and "formatString: #,0\n" not in text, text)
+            check(f"{tag}: new definition sits where the old one was (before 'Other')",
+                  "\t/// New description.\n\tmeasure 'Total Sales' = SUM(Sales[Amount]) * 1\n\t\tformatString: 0.00\n"
+                  "\t\tlineageTag: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n\n\tmeasure Other = 1\n" in text, text)
+            check(f"{tag}: the replaced measure keeps its lineageTag",
+                  text.count("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == 1)
+            check(f"{tag}: untouched neighbours are intact",
+                  "\tmeasure Other = 1\n\t\tlineageTag: 99999999-0000-0000-0000-000000000000\n" in text
+                  and "\tcolumn Amount\n\t\tdataType: double\n" in text and "\t\t\t\t    Source = 1\n" in text)
+            margin = text[text.index("\tmeasure Margin ="):]
+            new_tag = re.search(r"lineageTag: ([0-9a-f-]{36})", margin).group(1)
+            check(f"{tag}: a new measure gets a lineageTag and its multi-line body",
+                  "\tmeasure Margin =\n\t\t\tVAR _a = [Total Sales]\n\t\t\tRETURN\n\t\t\t    _a * 0.2\n"
+                  "\t\tdisplayFolder: Ratios\n\t\tlineageTag: " + new_tag in text, margin[:200])
+
+            res2 = c.add_measures("Sales", batch, mode="upsert")
+            check(f"{tag}: second identical upsert succeeds, all as updates",
+                  res2.get("success") is True and res2.get("created") == []
+                  and res2.get("updated") == ["Total Sales", "Margin", "Tiny"], str(res2))
+            check(f"{tag}: and leaves the file byte-identical", path.read_bytes() == first)
+            index = c._model_field_index()
+            check(f"{tag}: the file still parses with every object", {"Amount", "Total Sales", "Other", "Margin", "Tiny"}
+                  <= set(index.get("Sales", {})), str(set(index.get("Sales", {}))))
+            check(f"{tag}: validation finds nothing", c.validate_tmdl_syntax() == [],
+                  str([e.message for e in c.validate_tmdl_syntax()]))
+
+        with tempfile.TemporaryDirectory() as tmp:           # same build on a fresh copy
+            c, path = _upsert_project(tmp, crlf)
+            c.add_measures("Sales", batch, mode="upsert")
+            check(f"{tag}: a rebuild from scratch produces the same bytes (deterministic tags)", path.read_bytes() == first)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        c, path = _upsert_project(tmp)
+        before = path.read_bytes()
+        bad = c.add_measures("Sales", [{"name": "Tiny", "expression": "1"}, {"name": "Elsewhere", "expression": "2"}],
+                             mode="upsert")
+        check("a measure of that name in another table is a collision", bad.get("success") is False
+              and "'Elsewhere': already exists in 'Dim'" in bad["message"], str(bad))
+        bad2 = c.add_measures("Sales", [{"name": "Amount", "expression": "1"}], mode="upsert")
+        check("a column of that name is a collision", bad2.get("success") is False and "'Amount'" in bad2["message"])
+        check("a rejected batch writes nothing", path.read_bytes() == before)
+        bad3 = c.add_measures("Sales", [{"name": "Other", "expression": "2"}])
+        check("mode='add' still refuses an existing measure", bad3.get("success") is False
+              and "already exists" in bad3["message"] and path.read_bytes() == before, str(bad3))
+        check("unknown mode is refused", c.add_measures("Sales", [{"name": "Z", "expression": "1"}], mode="merge")
+              .get("success") is False)
+        res = c.add_measures("Sales", [{"name": "total sales", "expression": "0"}], mode="upsert")
+        text = path.read_text(encoding="utf-8")
+        check("names match case-insensitively; the definition's spelling wins",
+              res.get("updated") == ["total sales"] and "\tmeasure 'total sales' = 0\n" in text
+              and "measure 'Total Sales'" not in text, text[:400])
+
+
+def test_line_break_guards():
+    print("\n== single-line TMDL fields cannot smuggle in new lines ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _build_project(tmp)
+        path = Path(c._find_table_file("Sales"))
+        before = path.read_bytes()
+        bad = c.add_hierarchy("Sales", "Geo\n\tmeasure Injected = 1", ["Region"])
+        check("hierarchy name with a line break refused", bad.get("success") is False and path.read_bytes() == before, str(bad))
+        bad = c.add_calculation_group("CG", [{"name": "A", "expression": "SELECTEDMEASURE()"}],
+                                      column_name="Col\n\tcolumn Evil")
+        check("calculation group column name with a line break refused", bad.get("success") is False, str(bad))
+        check("and no table file was created", not (path.parent / "CG.tmdl").exists())
+        res = c.add_measures("Sales", [{"name": "CR", "expression": "1\r\tmeasure Injected2 = 2"}])
+        text = path.read_text(encoding="utf-8")
+        check("a bare carriage return in an expression becomes an expression line, not a new object",
+              res.get("success") is True and "\tmeasure CR =\n\t\t\t1\n\t\t\t\tmeasure Injected2 = 2\n" in text
+              and "Injected2" not in c._model_field_index().get("Sales", {}), text[-200:])
 
 
 def test_structural_tabs_only():
@@ -269,6 +398,8 @@ if __name__ == "__main__":
     test_hierarchy()
     test_filename_safety_and_quoted_date_column()
     test_rename_integration_with_wave5_constructs()
+    test_upsert_measures()
+    test_line_break_guards()
     test_structural_tabs_only()
     print("\n" + "=" * 70)
     if _failures:

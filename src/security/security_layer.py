@@ -1,42 +1,61 @@
 """
-Unified Security Layer
-Integrates PII detection, audit logging, and access policies
+Unified security layer: access policies, PII masking and audit logging behind one object.
+
+This layer is defence in depth for an AI client that may already query the model. It checks
+query text and result column names against name-based rules and masks values that look like
+personal data. It cannot see the model's data or schema, so it is not a security boundary:
+row-level and object-level security in the model are. See access_policy.py for the details
+of what a policy can and cannot guarantee.
+
+Failing closed: when a policy file was configured and cannot be used (missing, unparseable,
+or with a single invalid rule) the layer is LOCKED. pre_query_check refuses every query with
+a reason naming the file and the problem, process_results nulls every value, and get_status
+reports it. With no file configured at all the layer is permissive and get_status says that
+no policies are loaded.
 """
 import logging
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from .pii_detector import PIIDetector, MaskingStrategy
-from .audit_logger import AuditLogger, get_audit_logger
 from .access_policy import AccessPolicyEngine, PolicyAction, PolicyCheckResult
+from .audit_logger import AuditLogger, configure_audit_logger, get_audit_logger
+from .config import (
+    AuditSettings,
+    PIISettings,
+    PolicyConfigError,
+    parse_audit_settings,
+    parse_pii_settings,
+    read_policy_file,
+)
+from .pii_detector import PIIDetector
+from .redaction import redact_secrets
+from .transforms import resolve_hash_key
 
 logger = logging.getLogger(__name__)
+
+AUDIT_DIR_ENV = "POWERBI_MCP_AUDIT_DIR"
+_INSTALL_ROOT = Path(__file__).parent.parent.parent
 
 
 class SecurityLayer:
     """
     Unified security layer for Power BI MCP Server
 
-    Provides:
-    - Pre-query policy checks
-    - Post-query PII detection and masking
-    - Comprehensive audit logging
-
     Usage:
         security = SecurityLayer(config_path="config/policies.yaml")
 
-        # Before executing query
-        check = security.pre_query_check(query, tables=['Sales'])
+        check = security.pre_query_check(query, measure_definitions=measures)
         if not check.allowed:
             return error(check.reason)
 
-        # After getting results
-        safe_results, report = security.process_results(
-            results,
-            query=query,
-            table='Sales'
-        )
+        safe_rows, report = security.process_results(
+            rows, query=query, measure_definitions=measures, tool="execute_dax")
+
+    ``process_results`` repeats the policy decision for the query it is given, so a caller that
+    skips ``pre_query_check`` still gets nulled rows for a query that is not allowed. Always
+    pass the query: without it only result column names can be checked.
     """
 
     def __init__(
@@ -44,101 +63,136 @@ class SecurityLayer:
         config_path: Optional[str] = None,
         enable_pii_detection: bool = True,
         enable_audit: bool = True,
-        enable_policies: bool = True
+        enable_policies: bool = True,
+        audit_logger: Optional[AuditLogger] = None,
     ):
         """
-        Initialize the security layer
-
         Args:
-            config_path: Path to policies.yaml
+            config_path: Path to policies.yaml. None means "no policy file": permissive.
+                A path that does not exist, or a file with any error, locks the layer.
             enable_pii_detection: Enable PII detection
             enable_audit: Enable audit logging
-            enable_policies: Enable policy enforcement
+            enable_policies: Enable policy enforcement. When False a broken policy file is
+                reported in the status but does not lock the layer.
+            audit_logger: Use this logger instead of the one the configuration describes
         """
         self.enable_pii_detection = enable_pii_detection
         self.enable_audit = enable_audit
         self.enable_policies = enable_policies
+        self.config_path: Optional[str] = str(config_path) if config_path else None
+        self.config_error: Optional[str] = None
+        self.audit_all_queries = True
 
-        # Initialize components
+        self.policy_engine = AccessPolicyEngine() if enable_policies else None
+        # A hash key too short to use is a configuration error like any other: the engine
+        # locks on it, and the status reports it even when policies are switched off.
+        self.config_error = resolve_hash_key()[2]
+
+        pii_settings = PIISettings()
+        audit_settings = AuditSettings()
+        if self.config_path:
+            loaded = self._load_config(self.config_path)
+            if loaded is not None:
+                pii_settings, audit_settings = loaded
+
         self.pii_detector = PIIDetector(
-            default_strategy=MaskingStrategy.PARTIAL
-        ) if enable_pii_detection else None
+            default_strategy=pii_settings.default_strategy,
+            enabled_types=pii_settings.enabled_types,
+            type_strategies=pii_settings.type_strategies,
+            max_scan_chars=pii_settings.max_scan_chars,
+        ) if self.enable_pii_detection else None
 
-        self.audit_logger = get_audit_logger() if enable_audit else None
+        self.audit_logger: Optional[AuditLogger] = None
+        if enable_audit:
+            self.audit_logger = audit_logger or self._make_audit_logger(audit_settings)
 
-        self.policy_engine = AccessPolicyEngine(
-            config_path=config_path
-        ) if enable_policies else None
+        logger.info(
+            "Security layer initialized (PII: %s, Audit: %s, Policies: %s%s)",
+            self.enable_pii_detection, enable_audit, enable_policies,
+            ", LOCKED: " + self.config_error if self.locked else "")
 
-        # Load config if provided
-        if config_path:
-            self._load_config(config_path)
+    # ------------------------------------------------------------------ configuration
 
-        logger.info(f"Security layer initialized (PII: {enable_pii_detection}, Audit: {enable_audit}, Policies: {enable_policies})")
+    @property
+    def locked(self) -> bool:
+        """True when queries are refused because the configuration cannot be trusted."""
+        return bool(self.config_error) and self.enable_policies
 
-    def _load_config(self, config_path: str):
-        """Load configuration from YAML file"""
-        import yaml
-
-        path = Path(config_path)
-        if not path.exists():
-            logger.warning(f"Security config not found: {config_path}")
-            return
-
+    def _load_config(self, config_path: str) -> Optional[Tuple[PIISettings, AuditSettings]]:
+        """Read and validate the whole file. On any problem the layer is locked and None is
+        returned, so the defaults (every PII type, default audit log) stay in force."""
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
+            config = read_policy_file(config_path)
+            # A scratch engine validates the policy sections even when enforcement is off, so
+            # the status can still say the file is broken.
+            engine = self.policy_engine if self.policy_engine is not None else AccessPolicyEngine()
+            engine.load_from_dict(config, source=config_path)
+            global_section = config.get("global") or {}
+            pii_settings = parse_pii_settings(config.get("pii"), global_section.get("pii_default_action"))
+            audit_settings = parse_audit_settings(config.get("audit"))
+        except PolicyConfigError as e:
+            self.config_error = f"policy file {config_path}: {e}"
+            if self.policy_engine is not None:
+                self.policy_engine.lock(self.config_error)
+            else:
+                logger.error("Security configuration is invalid (policies are disabled, so queries "
+                             "are not refused): %s", self.config_error)
+            return None
+        if not engine.global_policy.enable_pii_detection:
+            self.enable_pii_detection = False
+        self.audit_all_queries = engine.global_policy.audit_all_queries
+        logger.info("Loaded security config from: %s", config_path)
+        return pii_settings, audit_settings
 
-            # Configure PII detector
-            if self.pii_detector and 'pii' in config:
-                pii_config = config['pii']
-                strategies = pii_config.get('strategies', {})
-                # Map string strategies to MaskingStrategy enum
-                strategy_map = {
-                    'partial': MaskingStrategy.PARTIAL,
-                    'full': MaskingStrategy.FULL,
-                    'hash': MaskingStrategy.HASH,
-                    'redact': MaskingStrategy.REDACT,
-                }
-                default_strategy = strategy_map.get(
-                    pii_config.get('default_strategy', 'partial'),
-                    MaskingStrategy.PARTIAL
-                )
-                self.pii_detector.default_strategy = default_strategy
+    @staticmethod
+    def _make_audit_logger(settings: AuditSettings) -> AuditLogger:
+        # POWERBI_MCP_AUDIT_DIR overrides where the log goes without editing the policy file:
+        # for a read-only install folder, a container volume, or a test run.
+        override = os.environ.get(AUDIT_DIR_ENV, "").strip()
+        if not settings.present and not override:
+            return get_audit_logger()
+        log_dir = None
+        if override:
+            log_dir = override
+        elif settings.log_dir:
+            path = Path(settings.log_dir)
+            # A relative folder is relative to the server's install folder, not to whatever
+            # directory the MCP client happened to start the process in.
+            log_dir = str(path if path.is_absolute() else _INSTALL_ROOT / path)
+        return configure_audit_logger(
+            log_dir=log_dir,
+            log_file=settings.log_file,
+            max_file_size_mb=settings.max_file_size_mb,
+            backup_count=settings.backup_count,
+            store_query_text=settings.store_query_text,
+            required=settings.required,
+        )
 
-            # Configure audit logger
-            if self.audit_logger and 'audit' in config:
-                audit_config = config['audit']
-                # Audit logger was already initialized, but we can update settings
-                self.audit_logger.include_query_text = audit_config.get('include_query_text', True)
-                self.audit_logger.redact_sensitive = audit_config.get('redact_sensitive', True)
-
-            logger.info(f"Loaded security config from: {config_path}")
-
-        except Exception as e:
-            logger.error(f"Failed to load security config: {e}")
+    # ------------------------------------------------------------------ query path
 
     def pre_query_check(
         self,
         query: str,
         tables: Optional[List[str]] = None,
-        columns: Optional[List[str]] = None
+        columns: Optional[List[str]] = None,
+        measure_definitions: Optional[Mapping[str, str]] = None,
     ) -> PolicyCheckResult:
         """
-        Check if a query is allowed before execution
+        Check if a query is allowed before execution.
 
         Args:
             query: The DAX query
-            tables: Tables being accessed
-            columns: Columns being accessed
+            tables, columns: Only used when ``query`` is empty (see AccessPolicyEngine.check_query)
+            measure_definitions: Measure name -> DAX of the connected model, so measures the
+                query references are checked through their definitions
 
         Returns:
-            PolicyCheckResult with decision
+            PolicyCheckResult with the decision, the reason and the row cap
         """
         if not self.enable_policies or not self.policy_engine:
             return PolicyCheckResult(allowed=True, action=PolicyAction.ALLOW)
 
-        return self.policy_engine.check_query(query, tables, columns)
+        return self.policy_engine.check_query(query, tables, columns, measure_definitions)
 
     def process_results(
         self,
@@ -150,86 +204,166 @@ class SecurityLayer:
         table_name: Optional[str] = None,
         duration_ms: Optional[float] = None,
         success: bool = True,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        measure_definitions: Optional[Mapping[str, str]] = None,
+        tool: Optional[str] = None,
+        enforce_row_limit: bool = True,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Process query results through security layer
+        Filter query results through the access policy and PII masking, and audit the query.
 
         Args:
-            results: Raw query results
-            query: The executed query
+            results: Raw rows (a scalar result is passed as one row)
+            query: The executed query. Needed for everything beyond name matching.
             source: "desktop" or "cloud"
             model_name: Name of the model
             port: Port (for desktop)
-            table_name: Primary table queried
+            table_name: Table to assume for result keys that carry none
             duration_ms: Query duration
-            success: Whether query succeeded
-            error_message: Error if failed
+            success: Whether the query succeeded
+            error_message: Error if it failed
+            measure_definitions: Measure name -> DAX of the connected model
+            tool: Name of the MCP tool that ran the query (recorded in the audit log)
+            enforce_row_limit: Cut the rows to the policy's row cap. Leave on for data
+                queries; turn off only for the server's own metadata queries.
 
         Returns:
-            Tuple of (processed_results, security_report)
+            (processed_results, security_report). ``security_report['query_denied']`` is True
+            when the policy refuses the query; every value is then None.
         """
         start_time = time.time()
-        processed_results = results
-        security_report = {
+        rows = results if isinstance(results, list) else list(results or [])
+        returned_by_engine = len(rows)
+        security_report: Dict[str, Any] = {
             'pii_detected': False,
             'pii_count': 0,
             'pii_types': [],
             'policy_applied': False,
+            'query_denied': False,
+            'denied_reason': None,
+            'locked': self.locked,
             'columns_masked': [],
-            'columns_blocked': []
+            'columns_blocked': [],
+            'columns_transformed': [],
+            'derived_action': PolicyAction.ALLOW.value,
+            'rows_truncated': False,
+            'max_rows': None,
         }
+        check: Optional[PolicyCheckResult] = None
+        transformed: List[str] = []
 
-        # Apply access policies
-        if self.enable_policies and self.policy_engine and results:
-            processed_results, policy_report = self.policy_engine.apply_to_results(
-                processed_results,
-                table_name=table_name
-            )
+        if self.enable_policies and self.policy_engine:
+            engine = self.policy_engine
+            decision = engine._decide(query, measure_definitions=measure_definitions) if (
+                query or engine.config_error) else None
+            check = decision.result if decision else None
+            if check is not None and check.allowed and check.max_rows:
+                security_report['max_rows'] = check.max_rows
+                if enforce_row_limit and len(rows) > check.max_rows:
+                    rows = rows[:check.max_rows]
+                    security_report['rows_truncated'] = True
+            rows, policy_report = engine._apply(rows, decision, table_name)
             security_report['policy_applied'] = policy_report.get('applied', False)
             security_report['columns_blocked'] = policy_report.get('blocked_columns', [])
+            security_report['columns_masked'] = list(policy_report.get('masked_columns', []))
+            transformed = policy_report.get('transformed_columns', [])
+            security_report['columns_transformed'] = list(transformed)
+            security_report['derived_action'] = policy_report.get(
+                'derived_action', PolicyAction.ALLOW.value)
+            if check is not None and not check.allowed:
+                security_report['query_denied'] = True
+                security_report['denied_reason'] = check.reason
 
-        # Apply PII detection and masking
-        if self.enable_pii_detection and self.pii_detector and processed_results:
-            processed_results, pii_summary = self.pii_detector.process_results(processed_results)
+        pii_columns: List[str] = []
+        if self.pii_detector and rows and not security_report['query_denied']:
+            rows, pii_summary = self.pii_detector.process_results(rows, skip_columns=transformed)
             security_report['pii_detected'] = pii_summary['total_detections'] > 0
             security_report['pii_count'] = pii_summary['total_detections']
             security_report['pii_types'] = pii_summary['types_detected']
-            security_report['columns_masked'].extend(
-                [d.get('column', '') for d in pii_summary.get('detections', [])]
-            )
+            pii_columns = pii_summary['columns_affected']
+            security_report['columns_masked'].extend(c for c in pii_columns
+                                                     if c not in security_report['columns_masked'])
 
-        processing_time = (time.time() - start_time) * 1000
-
-        # Log to audit
         if self.enable_audit and self.audit_logger:
-            self.audit_logger.log_query(
+            self._audit_query(query, source, model_name, port, returned_by_engine, duration_ms, success,
+                              error_message, security_report, check, pii_columns, tool)
+
+        security_report['processing_time_ms'] = (time.time() - start_time) * 1000
+        return rows, security_report
+
+    def safe_error_text(
+        self,
+        message: Any,
+        query: str = "",
+        measure_definitions: Optional[Mapping[str, str]] = None,
+        extra_secrets: Optional[List[str]] = None,
+    ) -> str:
+        """An engine error message that is safe to return to the model.
+
+        An error can carry data: ERROR(CONCATENATEX(T, T[col], ",")) puts column values in
+        the message, and conversion errors quote the value that failed. So:
+          * if the query is refused by policy, or reads any protected column, the engine's
+            text is withheld and a fixed sentence is returned;
+          * otherwise secrets are redacted and PII found in the text is masked.
+        """
+        text = redact_secrets(message, extra_secrets)
+        if self.enable_policies and self.policy_engine and (query or self.policy_engine.config_error):
+            check = self.policy_engine.check_query(query, measure_definitions=measure_definitions)
+            if not check.allowed:
+                return f"Query blocked by security policy: {check.reason}"
+            if check.derived_action != PolicyAction.ALLOW:
+                return ("The query failed. The engine's error text is withheld because the query reads "
+                        "protected column(s) and an error message can quote their values.")
+        if self.pii_detector:
+            text = str(self.pii_detector.process_value(text, None)[0])
+        return text
+
+    def _audit_query(self, query, source, model_name, port, row_count, duration_ms, success,
+                     error_message, report, check, pii_columns, tool) -> None:
+        audit = self.audit_logger
+        notable = (not success or report['pii_detected'] or report['query_denied']
+                   or bool(report['columns_transformed']))
+        if report['query_denied']:
+            audit.log_policy_violation(policy_name="query_policy", violation_type=report['denied_reason'],
+                                       query=query, tool=tool)
+        if self.audit_all_queries or notable:
+            policy = None
+            if report['policy_applied'] or report['query_denied']:
+                policy = {
+                    'denied': report['query_denied'],
+                    'reason': report['denied_reason'],
+                    'blocked_columns': report['columns_blocked'],
+                    'transformed_columns': report['columns_transformed'],
+                    'derived_action': report['derived_action'],
+                    'rows_truncated': report['rows_truncated'],
+                }
+            audit.log_query(
                 query=query,
                 source=source,
                 model_name=model_name,
                 port=port,
-                result_count=len(results) if results else 0,
+                result_count=row_count,
                 duration_ms=duration_ms,
                 success=success,
                 error_message=error_message,
-                pii_detected=security_report['pii_detected'],
-                pii_types=security_report['pii_types'],
-                pii_count=security_report['pii_count'],
-                policy_applied=table_name if security_report['policy_applied'] else None
+                tables_accessed=check.tables[:100] if check else None,
+                columns_accessed=check.columns[:200] if check else None,
+                pii_detected=report['pii_detected'],
+                pii_types=report['pii_types'],
+                pii_count=report['pii_count'],
+                policy_applied=policy,
+                tool=tool,
+            )
+        if report['pii_detected']:
+            audit.log_pii_detection(
+                pii_types=report['pii_types'],
+                count=report['pii_count'],
+                columns_affected=pii_columns,
+                action_taken='masked',
+                tool=tool,
             )
 
-            # Log PII detection event separately if detected
-            if security_report['pii_detected']:
-                self.audit_logger.log_pii_detection(
-                    pii_types=security_report['pii_types'],
-                    count=security_report['pii_count'],
-                    columns_affected=list(set(security_report['columns_masked'])),
-                    action_taken='masked'
-                )
-
-        security_report['processing_time_ms'] = processing_time
-
-        return processed_results, security_report
+    # ------------------------------------------------------------------ audit helpers
 
     def log_connection(
         self,
@@ -238,7 +372,8 @@ class SecurityLayer:
         port: Optional[int] = None,
         workspace: Optional[str] = None,
         success: bool = True,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        tool: Optional[str] = None,
     ):
         """Log a connection event"""
         if self.enable_audit and self.audit_logger:
@@ -248,7 +383,8 @@ class SecurityLayer:
                 port=port,
                 workspace=workspace,
                 success=success,
-                error_message=error_message
+                error_message=error_message,
+                tool=tool,
             )
 
     def log_policy_violation(
@@ -257,7 +393,8 @@ class SecurityLayer:
         violation_type: str,
         table: Optional[str] = None,
         column: Optional[str] = None,
-        query: Optional[str] = None
+        query: Optional[str] = None,
+        tool: Optional[str] = None,
     ):
         """Log a policy violation"""
         if self.enable_audit and self.audit_logger:
@@ -267,7 +404,8 @@ class SecurityLayer:
                 table=table,
                 column=column,
                 action_taken='blocked',
-                query=query
+                query=query,
+                tool=tool,
             )
 
     def verify_audit_integrity(self) -> Dict[str, Any]:
@@ -276,38 +414,65 @@ class SecurityLayer:
             return {"valid": True, "checked": 0, "message": "Audit logging is disabled."}
         return self.audit_logger.verify_chain()
 
+    # ------------------------------------------------------------------ status
+
     def get_status(self) -> Dict[str, Any]:
-        """Get current security layer status"""
-        status = {
+        """Current state of the layer, including whether it is locked and why, whether any
+        policies are loaded, and whether the audit log has failed to record anything."""
+        engine = self.policy_engine
+        if self.config_error:
+            policy_message = ("LOCKED: " if self.locked else "Configuration error (policies disabled): ") \
+                + self.config_error
+        elif not self.enable_policies:
+            policy_message = "Access policies are disabled."
+        elif engine is not None and engine.policies_loaded:
+            policy_message = f"Policies loaded from {self.config_path}."
+        else:
+            policy_message = "No policy file is configured: no column or table policies are loaded."
+        detector = self.pii_detector
+        return {
             'enabled': {
                 'pii_detection': self.enable_pii_detection,
                 'audit_logging': self.enable_audit,
                 'access_policies': self.enable_policies
             },
+            'locked': self.locked,
+            'config_error': self.config_error,
+            'config_path': self.config_path,
             'pii_detector': {
-                'strategy': self.pii_detector.default_strategy.value if self.pii_detector else None,
-                'enabled_types': [t.value for t in self.pii_detector.enabled_types] if self.pii_detector else []
+                'strategy': detector.default_strategy.value if detector else None,
+                'enabled_types': [t.value for t in detector.enabled_types] if detector else [],
+                'type_strategies': {t.value: s.value for t, s in detector.type_strategies.items()}
+                if detector else {},
+                'max_scan_chars': detector.max_scan_chars if detector else None,
             },
             'audit': self.audit_logger.get_session_summary() if self.audit_logger else None,
             'policies': {
-                'table_count': len(self.policy_engine.table_policies) if self.policy_engine else 0,
-                'global_enabled': self.policy_engine.global_policy.enabled if self.policy_engine else False
+                'loaded': bool(engine and engine.policies_loaded),
+                'source': engine.config_source if engine else None,
+                'table_count': len(engine.table_policies) if engine else 0,
+                'global_enabled': engine.global_policy.enabled if engine else False,
+                'hash_key_persistent': engine.hash_key_persistent if engine else False,
+                'message': policy_message,
             }
         }
-        return status
 
     def get_policy_summary(self) -> Dict[str, Any]:
         """Get summary of active policies"""
         if not self.policy_engine:
-            return {'enabled': False}
+            return {'enabled': False, 'locked': False, 'loaded': False, 'config_error': self.config_error}
 
+        engine = self.policy_engine
         return {
-            'enabled': self.policy_engine.global_policy.enabled,
-            'max_rows': self.policy_engine.global_policy.max_rows_per_query,
-            'pii_detection': self.policy_engine.global_policy.enable_pii_detection,
-            'pii_action': self.policy_engine.global_policy.pii_default_action.value,
-            'tables_with_policies': list(self.policy_engine.table_policies.keys()),
-            'blocked_patterns_count': len(self.policy_engine.global_policy.blocked_patterns)
+            'enabled': engine.global_policy.enabled,
+            'locked': self.locked,
+            'loaded': engine.policies_loaded,
+            'config_error': self.config_error,
+            'max_rows': engine.global_policy.max_rows_per_query,
+            'pii_detection': self.enable_pii_detection,
+            'pii_action': engine.global_policy.pii_default_action.value,
+            'tables_with_policies': list(engine.table_policies.keys()),
+            'blocked_patterns_count': len(engine.global_policy.blocked_patterns)
         }
 
 
@@ -319,8 +484,8 @@ def get_security_layer() -> SecurityLayer:
     """Get or create the global security layer"""
     global _security_layer
     if _security_layer is None:
-        # Look for config in default location
-        config_path = Path(__file__).parent.parent.parent / "config" / "policies.yaml"
+        # The bundled default file is the only one allowed to be absent.
+        config_path = _INSTALL_ROOT / "config" / "policies.yaml"
         _security_layer = SecurityLayer(
             config_path=str(config_path) if config_path.exists() else None
         )

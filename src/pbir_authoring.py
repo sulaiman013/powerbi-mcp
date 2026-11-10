@@ -46,12 +46,30 @@ VISUAL_ROLES: Dict[str, List[str]] = {
 AGGREGATING_ROLES = {"y", "values", "value", "indicator", "goal", "trendlinevalues",
                      "targetvalue", "minvalue", "maxvalue", "size", "tooltips", "x"}
 
-# Power BI QueryAggregateFunction integer enum (semanticQuery schema) and the matching
-# queryRef function name Power BI writes, e.g. Sum(Sales.Amount) / CountNonNull(Sales.Id).
+# Visuals whose "Values" well lists a column as it is: a slicer filters on the column's own
+# values and a table shows them row by row, so wrapping the column in an aggregation would
+# turn "Region" into "Count of Region". The role name alone cannot tell these apart from a
+# card or a chart, where the same role name does summarize.
+NON_AGGREGATING_VISUALS = {"slicer", "advancedslicervisual", "listslicer", "textslicer", "tableex"}
+
+
+def aggregates(visual_type: Optional[str], role: str) -> bool:
+    """True when a plain column dropped on ``role`` of a ``visual_type`` visual is summarized.
+    Decided by the visual type and the role together: slicers and tables never summarize, and
+    grouping wells (Category, Series, Legend, Rows, Columns, ...) never do on any visual."""
+    if (visual_type or "").lower() in NON_AGGREGATING_VISUALS:
+        return False
+    return str(role).lower() in AGGREGATING_ROLES
+
+
+# Power BI QueryAggregateFunction integer enum (semanticQuery schema) and the function name
+# used in the queryRef, e.g. Sum(Sales.Amount) / CountNonNull(Sales.Id). The name only has to
+# be unique per function within a visual: two aggregations of one column must not share a
+# queryRef, or one of them is lost.
 AGG_SUM, AGG_AVERAGE, AGG_DISTINCT_COUNT, AGG_MIN = 0, 1, 2, 3
 AGG_MAX, AGG_COUNT_NONNULL, AGG_MEDIAN, AGG_STDDEV, AGG_VARIANCE = 4, 5, 6, 7, 8
 AGG_QUERYREF_NAMES = {
-    0: "Sum", 1: "Average", 2: "CountNonNull", 3: "Min", 4: "Max",
+    0: "Sum", 1: "Average", 2: "Count", 3: "Min", 4: "Max",
     5: "CountNonNull", 6: "Median", 7: "StandardDeviation", 8: "Var",
 }
 
@@ -114,8 +132,15 @@ def split_table_field(ref: str):
     contain dots only if the table is single-quoted; we split on the first unquoted dot."""
     s = ref.strip()
     if s.startswith("'"):
-        end = s.find("'", 1)
-        if end != -1:
+        end = 1
+        while end < len(s):                # '' inside the quotes is an escaped apostrophe
+            if s[end] == "'":
+                if s[end + 1:end + 2] == "'":
+                    end += 2
+                    continue
+                break
+            end += 1
+        if end < len(s):
             table = s[1:end].replace("''", "'")
             rest = s[end + 1:].lstrip(".")
             return table, rest
@@ -137,14 +162,16 @@ def _projection_for(ref, kind: str, active: bool) -> Dict[str, Any]:
     return emit_projection(table, prop, kind, None, active)
 
 
-def build_query_state(fields_by_role: Dict[str, Any], kinds: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def build_query_state(fields_by_role: Dict[str, Any],
+                      kinds: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Build query.queryState from {role: 'Table.Field' | [fields] | [dicts]}.
 
     The first projection in each role is marked active. kinds optionally overrides Column/Measure
     per role (default Column, but value-ish roles default to Measure).
     """
     kinds = kinds or {}
-    measure_roles = {"y", "values", "indicator", "goal", "trendlinevalues", "targetvalue", "minvalue", "maxvalue"}
+    measure_roles = {"y", "values", "indicator", "goal", "trendlinevalues", "targetvalue", "minvalue",
+                     "maxvalue"}
     state: Dict[str, Any] = {}
     for role, val in fields_by_role.items():
         items = val if isinstance(val, list) else [val]

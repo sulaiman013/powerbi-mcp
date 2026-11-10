@@ -1,5 +1,16 @@
 # Power BI MCP Server - Data Access Policies
-# This file defines security policies for data access, PII detection, and auditing
+#
+# Column and table rules, PII masking and audit settings for the security layer.
+#
+# What this is: defence in depth for an AI client that is already allowed to query the model.
+# The rules are matched against query text and result column NAMES; the layer cannot see the
+# model's data or schema. The real security boundary is in the model: row-level security (RLS)
+# for rows and object-level security (OLS) for tables and columns. Protect anything that must
+# never be read with OLS first, and add a rule here as a second line.
+#
+# The file is validated strictly. An unknown key, an unknown action or a malformed pattern
+# anywhere LOCKS the layer: every query is refused, with a message naming the problem, until
+# the file is fixed. A typo must not be able to switch protection off silently.
 
 # =============================================================================
 # GLOBAL SETTINGS
@@ -8,35 +19,35 @@ global:
   # Master switch - set to false to disable all policy enforcement
   enabled: true
 
-  # Default action for columns/tables not explicitly defined
-  # Options: allow, mask, block, redact, hash
+  # Action for columns no rule matches.
+  # Options: allow, mask, hash, redact, numeric_mask, aggregate_only, block
   default_action: allow
 
-  # Maximum rows returned per query (prevents bulk data extraction)
+  # Maximum rows returned per query (limits bulk extraction)
   max_rows_per_query: 1000
 
-  # Automatically detect and mask PII patterns in results
+  # Detect and mask PII in results (see the PII section)
   enable_pii_detection: true
 
-  # Default action when PII is detected
-  # Options: allow, mask, block, redact, hash
-  pii_default_action: mask
-
-  # Log all queries to audit log
+  # Log every query to the audit log. With false, only failures, refusals and queries that
+  # touched protected or personal data are logged.
   audit_all_queries: true
 
-  # Blocked query patterns (regex) - queries matching these are rejected
+  # Queries matching any of these regular expressions (case-insensitive) are refused.
   blocked_patterns:
-    # Block attempts to query all columns
-    # - "SELECT\\s+\\*\\s+FROM"
-    # Block system table queries (uncomment if needed)
     # - "\\$SYSTEM\\."
 
 # =============================================================================
-# PII DETECTION SETTINGS
+# PII DETECTION
 # =============================================================================
+# A column whose NAME says it holds personal data (Email, Home Phone, SSN Number) has every
+# value masked, numbers included. Text in other columns is masked only where a value has a
+# shape that can be validated: an e-mail address, a card number that passes the Luhn check, an
+# SSN written with separators, a phone number written as one, an IP address. Plain dates and
+# bare runs of digits are not treated as PII.
 pii:
-  # Which PII types to detect
+  # Types to detect. Available: ssn, credit_card, email, phone, ip_address, date_of_birth,
+  # passport, drivers_license, bank_account, name
   enabled_types:
     - ssn
     - credit_card
@@ -44,121 +55,165 @@ pii:
     - phone
     - ip_address
 
-  # Masking strategy for each type
+  # Strategy for types not listed under "strategies": partial, full, hash, redact, none
+  default_strategy: partial
+
+  # Strategy per type
   strategies:
     ssn: partial          # ***-**-1234
     credit_card: partial  # ****-****-****-1234
     email: partial        # j***@e****.com
     phone: partial        # (***) ***-1234
     ip_address: partial   # 192.168.***.***
-    name: partial         # J*** S****
+
+  # Text longer than this is scanned up to the limit and the rest is withheld.
+  max_scan_chars: 50000
 
 # =============================================================================
-# TABLE-SPECIFIC POLICIES
+# TABLE AND COLUMN POLICIES
 # =============================================================================
+# Column rule:
+#   name    what to match. Names are compared as words, ignoring case, spaces, underscores and
+#           camelCase, so "card_number" also covers "Card Number" and "CardNumber".
+#   match   glob (default): "name" is the whole column name; * and ? are wildcards.
+#           word: the words of "name" may appear anywhere in the column name as whole words,
+#                 so "ssn" covers "SSN", "SSN Number" and "CustomerSSN" but not "ClassName".
+#   action  allow | mask | hash | redact | numeric_mask | aggregate_only | block
+#             block           queries that reference the column are refused
+#             redact          the value is replaced with [REDACTED]
+#             hash            a keyed hash: equal values stay equal (stable across restarts
+#                             only when POWERBI_MCP_HASH_KEY is set)
+#             mask            only the tail of the value is shown
+#             numeric_mask    numbers are multiplied by a secret per-session factor
+#             aggregate_only  usable only as SUM(col), AVERAGE(col), COUNT(col), ...
+#   mask_strategy   for mask: partial (default) or full
+#   reason  shown when a query is refused
+#
+# When several rules match a column the most restrictive one wins. Anything a query computes
+# from a protected column (an alias, an expression, a measure) is treated like that column.
+#
+# Table rule: default_action (for its columns no rule matches; block also forbids using the
+# table on its own), max_rows (row cap for queries that touch it) and require_filter (such
+# queries must use FILTER, CALCULATETABLE, CALCULATE or TOPN).
 tables:
-  # Example: Customer table with sensitive data
-  # - name: Customers
-  #   description: "Customer master data with PII"
-  #   sensitivity: high
-  #   default_action: allow
-  #   max_rows: 100  # Limit results from this table
-  #   require_filter: true  # Require a filter clause
-  #   columns:
-  #     - name: SSN
-  #       action: block
-  #       reason: "Social Security Numbers are never exposed"
-  #       sensitivity: critical
-  #     - name: Email
-  #       action: mask
-  #       mask_strategy: partial
-  #       reason: "Email addresses are masked for privacy"
-  #     - name: CreditCardNumber
-  #       action: block
-  #       reason: "Credit card data is blocked"
-  #     - name: Phone
-  #       action: mask
-  #       mask_strategy: partial
-  #     - name: CustomerName
-  #       action: allow
-
-  # Example: Employee table
+  # Example: a table with its own rules
   # - name: Employees
   #   description: "Employee data"
-  #   sensitivity: high
-  #   default_action: allow
+  #   max_rows: 100
+  #   require_filter: true
   #   columns:
   #     - name: Salary
-  #       action: block
-  #       reason: "Salary data is confidential"
-  #     - name: SSN
-  #       action: block
-  #     - name: BankAccount
-  #       action: block
+  #       action: aggregate_only
+  #       reason: "Salaries may only be read as totals and averages"
+  #     - name: Home Address
+  #       action: redact
 
-  # Wildcard table - applies to ALL tables
+  # Applies to every table
   - name: "*"
-    description: "Default policies for all tables"
+    description: "Baseline rules for all tables"
     default_action: allow
     columns:
-      # Block these columns everywhere
+      # ---- national identifiers: never exposed
       - name: ssn
+        match: word
         action: block
         reason: "Social Security Numbers are never exposed"
         sensitivity: critical
-      - name: social_security_number
+      - name: social security
+        match: word
         action: block
         reason: "Social Security Numbers are never exposed"
         sensitivity: critical
-      - name: password
+
+      # ---- credentials: never exposed
+      - name: "*password*"
         action: block
         reason: "Password fields are never exposed"
         sensitivity: critical
-      - name: password_hash
+      - name: passwd
+        match: word
         action: block
-        reason: "Password hashes are never exposed"
+        reason: "Password fields are never exposed"
         sensitivity: critical
-      - name: api_key
+      - name: pwd
+        match: word
+        action: block
+        reason: "Password fields are never exposed"
+        sensitivity: critical
+      - name: secret
+        match: word
+        action: block
+        reason: "Secret fields are never exposed"
+        sensitivity: critical
+      - name: api key
+        match: word
         action: block
         reason: "API keys are never exposed"
         sensitivity: critical
-      - name: secret
+      - name: "*apikey*"
         action: block
-        reason: "Secret fields are never exposed"
+        reason: "API keys are never exposed"
         sensitivity: critical
       - name: token
         action: block
         reason: "Token fields are never exposed"
         sensitivity: critical
-      - name: credit_card_number
+      - name: access token
+        match: word
+        action: block
+        reason: "Token fields are never exposed"
+        sensitivity: critical
+      - name: refresh token
+        match: word
+        action: block
+        reason: "Token fields are never exposed"
+        sensitivity: critical
+      - name: auth token
+        match: word
+        action: block
+        reason: "Token fields are never exposed"
+        sensitivity: critical
+      - name: api token
+        match: word
+        action: block
+        reason: "Token fields are never exposed"
+        sensitivity: critical
+
+      # ---- payment cards: last four digits only
+      - name: card number
+        match: word
         action: mask
-        mask_strategy: partial
         reason: "Credit card numbers are masked"
         sensitivity: critical
-      - name: card_number
+      - name: credit card
+        match: word
         action: mask
-        mask_strategy: partial
         reason: "Credit card numbers are masked"
         sensitivity: critical
 
 # =============================================================================
-# AUDIT SETTINGS
+# AUDIT LOG
 # =============================================================================
+# Set POWERBI_MCP_AUDIT_KEY to sign the log and its checkpoint with HMAC-SHA256. Without a
+# key the chain only detects accidental damage.
 audit:
-  # Log directory (relative to project root or absolute path)
+  # Folder for the log; a relative path is relative to the server's install folder
   log_dir: "./logs"
 
   # Log file name
   log_file: "audit.log"
 
-  # Maximum log file size in MB before rotation
+  # Size in MB at which the file is rotated
   max_file_size_mb: 10
 
-  # Number of backup files to keep
+  # Rotated files to keep
   backup_count: 5
 
-  # Include full query text in logs (set to false for extra privacy)
-  include_query_text: true
+  # How much of each query is stored:
+  #   redacted     secrets removed; string literals, long numbers and comments replaced
+  #   full         secrets removed, otherwise as sent
+  #   fingerprint  no text, only a fingerprint and the length
+  store_query_text: redacted
 
-  # Redact potentially sensitive values in logs
-  redact_sensitive: true
+  # true: refuse to return results when the audit entry cannot be written
+  required: false
