@@ -1013,9 +1013,10 @@ def test_prune():
             report["publicCustomVisuals"],
             [i["name"] for i in report["resourcePackages"][0]["items"]]],
            [{}, ["RegisteredResources"], [], []])
-        check("their files are gone", not os.path.exists(os.path.join(root, "CustomVisuals"))
-              and os.listdir(os.path.join(root, "StaticResources", "RegisteredResources")) == ["ground.png",
-                                                                                               "logo.png"])
+        check("the custom visual's files are gone", not os.path.exists(os.path.join(root, "CustomVisuals")))
+        eq("and the theme file, leaving the images",
+           sorted(os.listdir(os.path.join(root, "StaticResources", "RegisteredResources"))),
+           ["ground.png", "logo.png"])
         meta = load(os.path.join(d, "pages", "pages.json"))
         eq("pages.json follows", [meta["pageOrder"], meta["activePageName"]], [["Overview", "detail"],
                                                                                "Overview"])
@@ -1056,7 +1057,7 @@ def test_prune():
         os.makedirs(os.path.dirname(elsewhere))
         result = rs.apply_report_spec(root, small_spec(), manifest_path=elsewhere)
         eq("the manifest can be kept elsewhere", [result["success"], os.path.isfile(elsewhere),
-                                                  os.listdir(base)],
+                                                  sorted(os.listdir(base))],
            [True, True, ["Demo.Report", "state"]])
         lost = rs.apply_report_spec(root, small_spec())
         has("without its manifest the spec's own pages look foreign", lost["errors"],

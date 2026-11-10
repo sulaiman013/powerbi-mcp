@@ -3,9 +3,10 @@
 # These are minimum floors. For a reproducible production deploy, generate a pinned, hashed
 # lock file from this file (e.g. `pip-compile --generate-hashes`) and install from that instead.
 
-# MCP SDK. >=1.9.0 is required for tool outputSchema + structuredContent (and ToolAnnotations);
-# the server is developed and tested against 1.27.0.
-mcp>=1.9.0
+# MCP SDK. >=1.10.0 is required for tool outputSchema + structuredContent (1.9 lacks them);
+# <2 because mcp 2.0 replaced the low-level Server API this server is built on (the server
+# refuses to start on 2.x with a message saying so).
+mcp>=1.10.0,<2
 
 # Power BI Service: service-principal sign-in and REST
 msal>=1.24.0
