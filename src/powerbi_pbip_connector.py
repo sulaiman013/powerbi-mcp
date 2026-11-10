@@ -155,7 +155,12 @@ def _read_json_file(path: Path) -> Optional[Any]:
 
 
 def _same_path(a: Path, b: Path) -> bool:
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    """True when both paths name the same folder, however each is spelled: a Windows short
+    name (C:\\Users\\RUNNER~1), a junction, a symlink or a mapped drive is the same place."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:                                    # one of them does not exist: compare text
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def _merge_paths(found: List[Path], declared: List[Path]) -> List[Path]:
@@ -232,7 +237,10 @@ class PowerBIPBIPConnector:
             if isinstance(ref, dict):
                 by_path = ref.get("byPath")
                 if isinstance(by_path, dict) and isinstance(by_path.get("path"), str):
-                    target = (report_folder / by_path["path"]).resolve()
+                    # ".." is folded in the text of the path (as Windows and Desktop do), never
+                    # with resolve(): that respells a short name, junction or mapped drive, and
+                    # the model would then look like it lives outside its own project.
+                    target = Path(os.path.normpath(report_folder / by_path["path"]))
                     if target.is_dir():
                         return target, False
                 elif ref.get("byConnection") is not None:

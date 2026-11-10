@@ -42,7 +42,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("powerbi-mcp")
 
-__version__ = "3.8.0"
+__version__ = "3.8.1"
+
+# The mcp SDK line this server is written for. 2.0 replaced the low-level Server's handler
+# decorators and renamed every model field, so it needs a port, not a version bump.
+SUPPORTED_SDK = "mcp>=1.10,<2"
+
+
+def unsupported_sdk(version: Optional[str]) -> Optional[str]:
+    """Why this server cannot run on mcp SDK ``version``, or None when it can. An unreadable
+    version is let through: the import above already worked, so let the server try."""
+    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    if not match:
+        return None
+    major, minor = int(match.group(1)), int(match.group(2))
+    if (major, minor) >= (1, 10) and major < 2:
+        return None
+    return (f"The installed mcp SDK is {version.strip()}, but this server supports {SUPPORTED_SDK}. "
+            f'Install a supported version: python -m pip install "{SUPPORTED_SDK}" '
+            "(or reinstall from requirements.txt).")
+
+
+def installed_sdk_version() -> Optional[str]:
+    try:
+        from importlib.metadata import version
+        return version("mcp")
+    except Exception:  # noqa: BLE001 - a missing or odd distribution record is not a reason to stop
+        return None
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -151,6 +177,9 @@ class PowerBIMCPServer:
     """Power BI MCP Server supporting Cloud and Desktop connectivity"""
 
     def __init__(self):
+        problem = unsupported_sdk(installed_sdk_version())
+        if problem:
+            raise RuntimeError(problem)                  # say so, instead of an AttributeError later
         self.server = Server("powerbi-mcp")
 
         # Cloud credentials (optional for Desktop-only usage)
