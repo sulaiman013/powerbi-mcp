@@ -156,6 +156,121 @@ def test_aggregation_and_native_ref():
         check("measure queryRef is Table.Field", m["queryRef"] == "Sales.Total Sales", m["queryRef"])
 
 
+def test_aggregation_depends_on_visual_type():
+    print("\n== aggregation is decided by visual type AND role (slicers, tables, grouping wells never) ==")
+    check("card Values summarize", pbir_authoring.aggregates("card", "Values") is True)
+    check("chart Y summarizes", pbir_authoring.aggregates("clusteredColumnChart", "Y") is True)
+    check("slicer Values never summarize", pbir_authoring.aggregates("slicer", "Values") is False)
+    check("table Values never summarize", pbir_authoring.aggregates("tableEx", "Values") is False)
+    check("grouping wells never summarize on any visual",
+          not any(pbir_authoring.aggregates(vt, role) for vt in ("barChart", "pivotTable", "card", None)
+                  for role in ("Category", "Series", "Legend", "Rows", "Columns")))
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _build_project(tmp)
+        c.add_page("T", set_active=True)
+        for vt in ("slicer", "tableEx"):
+            vis = c.add_visual("T", vt, fields_by_role={"Values": ["Sales.Region", "Sales.Amount"]})
+            check(f"{vt}: created", vis.get("success") is True, str(vis))
+            projs = json.loads(Path(vis["path"]).read_text(encoding="utf-8"))["visual"]["query"]["queryState"]["Values"]["projections"]
+            check(f"{vt}: text and numeric columns stay plain columns",
+                  [list(p["field"])[0] for p in projs] == ["Column", "Column"]
+                  and [p["queryRef"] for p in projs] == ["Sales.Region", "Sales.Amount"], str(projs))
+        card = c.add_visual("T", "card", fields_by_role={"Values": "Sales.Amount"})
+        cj = json.loads(Path(card["path"]).read_text(encoding="utf-8"))
+        check("card: the same role name still aggregates", "Aggregation" in _projection(cj, "Values")["field"])
+        # bind_fields takes the decision from the type of the visual it edits
+        slicer = c.add_visual("T", "slicer")
+        c.bind_fields("T", slicer["visual_name"], {"Values": "Sales.Region"})
+        sj = json.loads(Path(slicer["path"]).read_text(encoding="utf-8"))
+        check("bind_fields on a slicer keeps the column plain", "Column" in _projection(sj, "Values")["field"],
+              str(_projection(sj, "Values")))
+        c.bind_fields("T", card["visual_name"], {"Values": "Sales.Region"}, mode="replace")
+        cj = json.loads(Path(card["path"]).read_text(encoding="utf-8"))
+        check("bind_fields on a card aggregates", _projection(cj, "Values")["queryRef"] == "CountNonNull(Sales.Region)",
+              str(_projection(cj, "Values")))
+    a = pbir_authoring.emit_projection("Sales", "Id", aggregation=pbir_authoring.AGG_DISTINCT_COUNT)
+    b = pbir_authoring.emit_projection("Sales", "Id", aggregation=pbir_authoring.AGG_COUNT_NONNULL)
+    check("distinct count and count of one column get different queryRefs", a["queryRef"] != b["queryRef"],
+          f"{a['queryRef']} / {b['queryRef']}")
+    check("split_table_field understands an escaped apostrophe",
+          pbir_authoring.split_table_field("'O''Brien Sales'.Net Amount") == ("O'Brien Sales", "Net Amount"),
+          str(pbir_authoring.split_table_field("'O''Brien Sales'.Net Amount")))
+
+
+def test_authoring_guards():
+    print("\n== authoring never writes outside the project or over a file it cannot read ==")
+    with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as elsewhere:
+        c = _build_project(tmp)
+        outside = Path(elsewhere) / "page"
+        outside.mkdir()
+        (outside / "page.json").write_text(json.dumps({"name": "x", "displayName": "X"}), encoding="utf-8")
+        for ref in (str(outside), "..\\..\\..\\" + outside.name, "../pageA/../pageA"):
+            res = c.add_visual(ref, "card", fields_by_role={"Values": "Sales.Total Sales"})
+            check(f"page reference {ref[-18:]!r} is not followed as a path", res.get("success") is False, str(res))
+        check("nothing was created outside the project", [x.name for x in outside.iterdir()] == ["page.json"])
+        vis = c.add_visual("pageA", "card", fields_by_role={"Values": "Sales.Total Sales"})
+        check("the page's folder name still works", vis.get("success") is True, str(vis))
+        bad = c.bind_fields("pageA", "..\\" + vis["visual_name"], {"Values": "Sales.Total Sales"})
+        check("visual name with a path separator refused", bad.get("success") is False, str(bad))
+        check("unknown bind mode refused", c.bind_fields("pageA", vis["visual_name"], {"Values": "Sales.Amount"},
+                                                         mode="merge").get("success") is False)
+
+        vpath = Path(vis["path"])
+        data = json.loads(vpath.read_text(encoding="utf-8"))
+        data["visual"]["title"] = "Caf" + chr(0xE9)
+        vpath.write_bytes(json.dumps(data, indent=2, ensure_ascii=False).replace("\n", "\r\n").encode("utf-8"))
+        c.bind_fields("pageA", vis["visual_name"], {"Values": "Sales.Amount"})
+        raw = vpath.read_bytes()
+        check("bind_fields keeps CRLF line endings", raw.count(b"\r\n") == raw.count(b"\n") and b"\r\n" in raw)
+        check("bind_fields keeps non-ASCII text readable", ("Caf" + chr(0xE9)).encode("utf-8") in raw)
+
+        pages_json = c._pages_folder() / "pages.json"
+        pages_json.write_text('{"pageOrder": ["pageA", "pageB"], "activePageName": "pageA",}', encoding="utf-8")
+        before = sorted(p.name for p in c._pages_folder().iterdir())
+        res = c.add_page("Broken")
+        check("add_page refuses when pages.json cannot be parsed", res.get("success") is False
+              and "pages.json" in res["message"], str(res))
+        check("and neither rewrites it nor leaves a page folder behind",
+              pages_json.read_text(encoding="utf-8").endswith('"pageA",}')
+              and sorted(p.name for p in c._pages_folder().iterdir()) == before)
+
+
+def test_validator_knows_hierarchies_and_other_report_files():
+    print("\n== validate_report_bindings: hierarchies count, page filters and bookmarks are checked ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _build_project(tmp)
+        c.add_hierarchy("Sales", "Geo", ["Region"])
+        c.add_page("H", set_active=True)
+        level = {"HierarchyLevel": {"Expression": {"Hierarchy": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                                 "Hierarchy": "Geo"}}, "Level": "Region"}}
+        c.add_visual("H", "slicer", fields_by_role={"Values": [
+            {"table": "Sales", "field": "Region"}]}, skip_validation=True)
+        page_dir = c._find_page_folder("H")
+        vdir = page_dir / "visuals" / "hier"
+        vdir.mkdir(parents=True)
+        (vdir / "visual.json").write_text(json.dumps({"name": "hier", "visual": {"visualType": "slicer", "query": {
+            "queryState": {"Values": {"projections": [{"field": level, "queryRef": "Sales.Geo.Region"}]}}}}}),
+            encoding="utf-8")
+        check("a hierarchy level reference is not reported missing", c.validate_report_bindings() == [],
+              str([e.message for e in c.validate_report_bindings()]))
+        page = json.loads((page_dir / "page.json").read_text(encoding="utf-8"))
+        page["filterConfig"] = {"filters": [{"name": "f", "field": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Deleted Column"}}}]}
+        (page_dir / "page.json").write_text(json.dumps(page), encoding="utf-8")
+        bm = c._pages_folder().parent / "bookmarks"
+        bm.mkdir()
+        (bm / "b.bookmark.json").write_text(json.dumps({"name": "b", "explorationState": {"filters": {"byExpr": [
+            {"expression": {"Column": {"Expression": {"SourceRef": {"Entity": "Gone Table"}}, "Property": "X"}}}]}}}),
+            encoding="utf-8")
+        errs = c.validate_report_bindings()
+        check("a page-level filter on a missing column is found",
+              any(e.error_type == "MISSING_FIELD" and "Deleted Column" in e.message and e.file_path.endswith("page.json")
+                  for e in errs), str([e.message for e in errs]))
+        check("a bookmark that names a missing table is found",
+              any(e.error_type == "MISSING_TABLE" and "Gone Table" in e.message for e in errs),
+              str([e.message for e in errs]))
+
+
 def test_emit_projection_aggregation_unit():
     print("\n== emit_projection aggregation shape + queryRef (pure module) ==")
     cases = {
@@ -185,6 +300,9 @@ if __name__ == "__main__":
     test_catalog_and_authoring()
     test_report_validator()
     test_aggregation_and_native_ref()
+    test_aggregation_depends_on_visual_type()
+    test_authoring_guards()
+    test_validator_knows_hierarchies_and_other_report_files()
     test_emit_projection_aggregation_unit()
     print("\n" + "=" * 70)
     if _failures:

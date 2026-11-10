@@ -1,4 +1,4 @@
-# Power BI MCP Server V2 Dependencies
+# Power BI MCP Server dependencies (full install: live connectivity on Windows)
 #
 # These are minimum floors. For a reproducible production deploy, generate a pinned, hashed
 # lock file from this file (e.g. `pip-compile --generate-hashes`) and install from that instead.
@@ -7,17 +7,17 @@
 # the server is developed and tested against 1.27.0.
 mcp>=1.9.0
 
-# Power BI Cloud connectivity
+# Power BI Service: service-principal sign-in and REST
 msal>=1.24.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 
-# Power BI Desktop connectivity
-psutil>=5.9.0
+# Power BI Desktop instance discovery. 6.0+ for Process.net_connections().
+psutil>=6.0.0
 
-# XMLA connectivity (requires ADOMD.NET on Windows)
+# Analysis Services (Desktop, XMLA) and live model writes (TOM). pythonnet hosts the ADOMD.NET
+# and AMO/TOM assemblies, which must be installed separately on Windows (see README).
 pythonnet>=3.0.0
-pyadomd>=0.1.0
 
-# Security features
+# Access policies (config/policies.yaml)
 pyyaml>=6.0.0

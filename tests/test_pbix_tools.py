@@ -99,6 +99,62 @@ def test_zip_slip_protection():
             raised = True
         check("path traversal rejected", raised)
         check("nothing escaped the dest", not os.path.exists(os.path.join(tmp, "escape.txt")))
+        check("nothing at all was extracted (members before the bad one included)",
+              not os.path.exists(os.path.join(tmp, "out")) or os.listdir(os.path.join(tmp, "out")) == [])
+        dest = os.path.join(tmp, "dest")
+        for name in ("..\\x.txt", "a/../../x.txt", "/abs.txt", "\\\\server\\share\\x.txt", "C:\\Windows\\x.txt",
+                     "D:rel.txt", "."):
+            try:
+                target = pbix_tools._safe_target(dest, name)
+                # A drive-style name is an ordinary file name where drives do not exist.
+                inside = os.path.commonpath([os.path.abspath(dest), target]) == os.path.abspath(dest)
+                check(f"member {name!r} cannot leave the destination", inside and target != os.path.abspath(dest), target)
+            except ValueError:
+                check(f"member {name!r} cannot leave the destination", True)
+        ok = pbix_tools._safe_target(dest, "Report/Layout")
+        check("an ordinary member resolves inside the destination", ok == os.path.join(os.path.abspath(dest), "Report", "Layout"))
+        root = os.path.abspath(os.sep)
+        check("a drive or filesystem root is a valid destination",
+              pbix_tools._safe_target(root, "Report/Layout") == os.path.join(root, "Report", "Layout"))
+
+
+def test_streaming_and_size_cap():
+    print("\n== members are streamed to disk and the unpacked size is capped ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "big.pbix")
+        model = bytes(range(256)) * 12000                      # ~3 MB: several copy chunks
+        _make_pbix(p, {"Version": b"1.28", "DataModel": model,
+                       "Report/Layout": json.dumps(LAYOUT).encode("utf-16-le")})
+        dest = os.path.join(tmp, "out")
+        res = pbix_tools.extract(p, dest)
+        check("large member extracted intact", Path(dest, "DataModel").read_bytes() == model)
+        check("total bytes reported", res["total_bytes"] == len(model) + 4 + len(json.dumps(LAYOUT).encode("utf-16-le")),
+              str(res["total_bytes"]))
+
+        small = os.path.join(tmp, "small")
+        raised = None
+        try:
+            pbix_tools.extract(p, small, max_bytes=1_000_000)
+        except ValueError as e:
+            raised = str(e)
+        check("an archive over the cap is refused", raised is not None and "limit" in raised, str(raised))
+        check("and nothing was written for it", not os.path.exists(small))
+        check("no cap when max_bytes is None", pbix_tools.extract(p, os.path.join(tmp, "nocap"), max_bytes=None)["file_count"] == 3)
+        check("the default cap allows real files but is finite", 1024 ** 3 <= pbix_tools.DEFAULT_MAX_EXTRACT_BYTES < 64 * 1024 ** 3)
+
+        # A layout far larger than any real one is not loaded into memory to count pages.
+        real_limit = pbix_tools.MAX_JSON_MEMBER_BYTES
+        pbix_tools.MAX_JSON_MEMBER_BYTES = 10
+        try:
+            info = pbix_tools.inspect(p)
+            check("inspect still lists an archive whose layout is over the JSON limit",
+                  info["has_layout"] is True and info["page_count"] is None, str(info["page_count"]))
+            res = pbix_tools.extract(p, os.path.join(tmp, "nolayout"))
+            check("extract keeps the files and just skips decoding such a layout",
+                  res["file_count"] == 3 and res["layout_decoded"] is False
+                  and not os.path.exists(os.path.join(tmp, "nolayout", "Report", "Layout.json")), str(res))
+        finally:
+            pbix_tools.MAX_JSON_MEMBER_BYTES = real_limit
 
 
 if __name__ == "__main__":
@@ -109,6 +165,7 @@ if __name__ == "__main__":
     test_read_layout()
     test_extract()
     test_zip_slip_protection()
+    test_streaming_and_size_cap()
     print("\n" + "=" * 70)
     if _failures:
         print(f"  {len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")

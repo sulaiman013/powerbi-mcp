@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue?style=flat-square" alt="MCP compatible"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-green?style=flat-square" alt="Python 3.10+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-82-purple?style=flat-square" alt="82 tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-90-purple?style=flat-square" alt="90 tools"></a>
   <a href="#"><img src="https://img.shields.io/badge/Live-Windows-lightgrey?style=flat-square" alt="Windows for live connectivity"></a>
   <a href="#"><img src="https://img.shields.io/badge/Offline-cross--platform-success?style=flat-square" alt="Offline cross-platform"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT license"></a>
@@ -29,10 +29,11 @@ Power BI MCP Server connects an AI assistant (Claude, GitHub Copilot, any MCP cl
 Power BI content through one consistent interface. It talks to a local Power BI Desktop model
 (queries AND live writes), a published Power BI Service dataset, Power BI Project (PBIP) files
 on disk, and the running Power BI Desktop app itself (through Microsoft's Desktop Bridge, for
-hot-reload and screenshots), and wraps every operation in a security and governance layer.
+hot-reload and screenshots). Every tool call passes one request boundary: a read-only gate, a
+query-only guard, access policies and PII masking on query results, and secret redaction.
 
-It exposes **82 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-25 assert-based test suites.
+It exposes **90 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
+50 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
@@ -42,12 +43,14 @@ It exposes **82 tools** plus MCP **resources**, **prompts**, and **completion**,
 | **Bulk DAX creation** | Measure-suite generator (time intelligence, ratios, ranks) written offline or live |
 | **Data modelling** | Date-dimension generator, calculation groups, hierarchies, offline TMDL authoring |
 | **Warehouse audit** | Star-schema classification + findings, referential-integrity orphan scan |
-| **Report authoring (preview)** | Add pages, visuals, and field bindings to PBIR reports from the agent |
+| **Report as code** | Build a whole designed report from one declarative spec: theme, pages, visuals, navigation, pop-ups, synced slicers |
+| **Custom reporting techniques** | HTML and SVG measures, DAX-as-transport payload measures, a JavaScript app inside a measure, Deneb and custom visuals |
+| **Self-contained publishing** | Embed data in the model, stage a report for an in-place publish that keeps its links |
 | **Desktop Bridge (preview)** | Hot-reload the open report and screenshot pages in the RUNNING Desktop |
 | **DAX safety loop** | Validate before committing; impact analysis; atomic transactions |
 | **Model quality** | Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage analysis |
 | **Diagnostics and ops** | Refresh-failure triage, unused-object detection, RLS test matrix |
-| **Governance** | Enforced PII and column policies, tamper-evident audit, read-only mode |
+| **Governance** | Column and table policies that fail closed, PII masking, a hash-chained audit log, read-only mode |
 | **Fleet (admin)** | Cross-workspace lineage, fleet refresh monitor, usage analytics |
 | **Modern MCP** | Tool annotations, structured output, resources, prompts, completion |
 
@@ -91,11 +94,25 @@ limit which rows a user can see).
   that depends on an object and every report visual that uses it.
   > "If I delete the 'Old Revenue' measure, what depends on it?"
 - **Manage relationships** between tables (cardinality and filter direction).
-- **Build report pages and visuals (preview).** On a saved PBIP project it can add a page, drop
-  a chart, card, table, or slicer on it, and bind fields by role. It checks each field exists in
-  the model first, picks measure vs aggregated-column automatically, and writes Power-BI-faithful
-  PBIR files (right down to the `nativeQueryRef` and `Sum(...)` query refs Desktop itself writes).
-  > "On the PBIP project, add an 'Overview' page with a bar chart of Sales by Region."
+- **Build a whole report from a spec.** Describe the report once (theme, pages, charts, text,
+  navigation buttons, synced slicers, pop-ups that open and close with bookmarks, a masthead
+  repeated on every page) and it writes the PBIR files. Applying the same spec again changes
+  nothing; changing one element rewrites one file; anything wrong (a field that does not exist,
+  a button pointing at a missing page) stops the whole apply before a single file is written.
+  > "Build a three-page report from this spec, with a filters pop-up on every page."
+- **Go beyond native visuals.** Generate measures that return styled HTML (KPI cards, headline
+  sentences with live numbers, ranked bar lists) or inline SVG, pack fact rows into a text
+  measure for a JavaScript app that filters in the browser with no query per click, and assemble
+  that app from CSS and JavaScript modules into measures, minified and size-checked.
+  > "Pack the incidents fact at row grain and build the app measures from this folder of modules."
+- **Audit the report like a model.** Structure (broken JSON, unregistered custom visuals, visuals
+  off the page), design (overlaps, crowded pages, missing alt text and titles, navigation that
+  points nowhere) and governance notes (uncertified and script-capable visuals).
+  > "Audit the report design and list what would not survive a tenant that blocks uncertified visuals."
+- **Publish without a gateway.** Embed small static data in the model so the service can refresh
+  it with no local files, and stage the report bound to the published model so importing it
+  replaces the old version in place and every existing link keeps working.
+  > "Make the model self-contained and stage the report for publishing over 'Sales Overview'."
 - **Close the loop with the running Desktop (preview).** Through Microsoft's Power BI Desktop
   Bridge (June 2026+), the agent can see which file is open and whether it has unsaved changes,
   hot-reload the report from disk after offline edits (no close/reopen), and capture PNG
@@ -154,7 +171,7 @@ limit which rows a user can see).
   credentials, gateway down, throttling, out of memory, timeout, bad source query) and tells
   you the fix.
 - **Govern access and stay compliant.** Mask PII before the AI sees it, block/mask/hash/redact
-  specific columns, keep a tamper-evident audit log, and flip on read-only mode so an agent can
+  specific columns, keep a hash-chained audit log, and flip on read-only mode so an agent can
   look but not touch.
 - **See across the whole tenant (admins).** Inventory every workspace, find datasets with no
   security or no sensitivity label, trace which reports use a dataset, monitor refresh health,
@@ -182,19 +199,19 @@ chat-with-data and a local modeling one for authoring semantic models. This proj
 
 - **Report-aware safe renames.** The official local modeling MCP edits the model only and
   cannot touch the report layer. This server renames tables, columns, and measures across
-  both the model (TMDL) and the report (PBIR visuals, cultures, diagram, hierarchies, sort
-  wiring), so visuals do not break.
-- **Offline authoring of models AND reports.** Bulk measures, date dimensions, calculation
-  groups, hierarchies, report pages and visuals are written straight into PBIP files, no
-  Power BI required, in the exact shapes Desktop itself serializes (verified against
-  Microsoft's own TMDL engine and PBIR schemas).
+  both the model (TMDL, DAX, Power Query references) and the report (visuals, filters,
+  bookmarks, Deneb specs, cultures, diagram, hierarchies, sort wiring), so visuals do not break.
+- **Report as code.** A declarative spec builds designed reports idempotently: the method behind
+  script-built showcase reports, available as one tool, with the validation a script lacks.
+- **Offline authoring of models.** Bulk measures (idempotent upsert), date dimensions,
+  calculation groups and hierarchies are written straight into PBIP files, no Power BI required.
 - **The full edit-and-verify loop.** Offline authoring + the Desktop Bridge (hot-reload the
   running Desktop, no close/reopen) + one call that chains a bridge instance into live DAX/TOM.
 - **Warehouse-grade auditing.** Star-schema classification with findings and a score, a
   referential-integrity orphan scan, a DAX anti-pattern linter, and custom BPA rule governance.
-- **A real governance and security layer.** Enforced column policies (block, mask, hash,
-  redact, numeric-mask), PII detection, a tamper-evident (optionally HMAC-keyed) audit log,
-  and a read-only lockdown mode.
+- **A governance and security layer.** Column and table policies (block, mask, hash, redact,
+  numeric-mask) that follow aliases and measures and fail closed on a broken policy file, PII
+  masking, a hash-chained (HMAC-keyed if you set a key) audit log, and a read-only lockdown mode.
 - **Diagnostics and fleet ops.** Refresh-failure classification, unused-object cleanup, impact
   analysis, an RLS test matrix, and tenant-wide lineage and usage analytics.
 - **Offline, PBIP-first workflows.** The whole PBIP, analysis, and security subset runs
@@ -282,8 +299,8 @@ docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
 
 ## Tools
 
-82 tools across the categories below. The full reference, with parameters and read / write /
-destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
+90 tools across the categories below. The full reference, with read / write / destructive
+markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Category | Count | Highlights |
 |----------|:-----:|------------|
@@ -294,9 +311,10 @@ destructive markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | Model writes (TOM) | 7 | `create_measure`, `delete_measure`, `batch_update_measures`, deprecated batch renames |
 | DAX safety and transactions | 5 | `validate_dax`, `scan_measure_dependencies`, begin/commit/rollback transaction |
 | Relationships | 2 | `create_relationship`, `delete_relationship` |
-| PBIP safe editing | 5 | load project, get info, rename tables/columns/measures (model + report) |
+| PBIP safe editing | 6 | load project, get info, rename tables/columns/measures (model + report), `pbip_undo` |
 | PBIP diagnostics | 4 | fix broken visuals, fix DAX quoting, scan broken refs, validate |
 | Report authoring (PBIR, preview) | 4 | `pbir_add_page`, `pbir_add_visual`, `pbir_bind_fields`, `pbir_validate_report` |
+| Report as code | 7 | `pbir_apply_spec`, `audit_report_design`, `generate_payload_measure`, `build_js_app_measure`, `generate_html_measure`, `pbip_embed_data`, `pbip_stage_publish` |
 | Model quality and performance | 4 | `run_bpa`, `audit_ai_readiness`, `analyze_model_storage`, `analyze_query_performance` |
 | DAX quality | 2 | `dax_lint` (performance anti-patterns), `dax_suggest_rewrite` |
 | Authoring helpers | 2 | `generate_svg_measure` (sparkline/bullet/progress/pill), `audit_naming` |
@@ -336,8 +354,13 @@ User: "Load PBIP project from C:/Projects/SalesReport"
 User: "Rename table Salesforce_Data to Sales Force Data"
 ```
 
-The rename cascade is transactional (it rolls every file back on failure) and writes atomically
-(temp file plus `os.replace`), preserving encoding and line endings.
+A rename is planned in memory over the whole project and written in one transaction: every file
+changes or none does. Nothing is written when the old name does not exist, the new name collides
+with another object, or the result would leave a broken reference. Files keep their encoding and
+line endings, and files the rename does not touch stay byte-identical. DAX is rewritten through a
+tokenizer, so a name inside a string, a comment or another name is never touched; text that only
+mentions the old name (a title, a label) is listed for you to review. `pbip_undo` restores the
+previous state.
 
 > **Always** use the `pbip_rename_*` tools for renames, not the deprecated TOM `batch_rename_*`
 > tools. Close Power BI Desktop before PBIP edits, or keep it open and hot-reload afterwards
@@ -368,18 +391,31 @@ and `bridge_status` reports the matching Analysis Services port so the same wind
 
 ## Security and governance
 
-- **PII detection and masking** before results reach the AI (SSN, credit card, email, phone, IP).
-- **Enforced column and table policies** from `config/policies.yaml`: `block`, `mask`, `hash`,
-  `redact`, and `numeric_mask` (session-randomized scaling that hides values but preserves ratios).
-- **Audit logging** with a tamper-evident hash chain; verify it with `verify_audit_integrity`.
-  Set `POWERBI_MCP_AUDIT_KEY` to switch the chain to HMAC-SHA256 (cryptographically strong against
-  an attacker who edits the log); without a key it is a plain SHA-256 chain that still catches
-  accidental edits and naive tampering.
-- **Read-only / lockdown mode:** set `POWERBI_MCP_READONLY=true` to refuse every write tool
-  (model/report mutations **and** file-writing tools like snapshots, dictionaries, and PBIX
-  extraction) while reads and diagnostics keep working. Ideal for shared or autonomous agent use.
-- Connection-string secrets and PII are redacted from logs, error messages, the audit log, and
-  every tool response (redaction is applied at the response boundary, not just per-handler).
+- **Query-only execution.** The tools that run your DAX accept DAX queries and nothing else.
+  TMSL, XMLA and MDX commands are refused before they reach the engine.
+- **Column and table policies** from `config/policies.yaml`: `block`, `mask`, `hash`, `redact`,
+  `numeric_mask`, plus `max_rows`, `require_filter` and `aggregate_only` per table. They apply to
+  every tool that runs DAX, follow aliases (`SELECTCOLUMNS(T, "x", T[ssn])`) and measures that
+  wrap a protected column, and refuse `TOCSV` / `TOJSON` over a protected table.
+- **Fail closed.** If the policy file is missing, unparseable or contains an invalid rule,
+  queries are refused and `security_status` says why. Nothing runs with silently empty policies.
+- **PII masking** on query results (SSN, credit card, email, phone, IP), with value validation
+  so dates, descriptions and order numbers are left alone.
+- **Audit log** with sequence numbers and a hash chain that continues across rotated files;
+  verify it with `verify_audit_integrity`. Set `POWERBI_MCP_AUDIT_KEY` for an HMAC-SHA256 chain.
+  Without a key the chain only catches accidental edits: someone who can rewrite the log can
+  recompute it.
+- **Read-only / lockdown mode:** set `POWERBI_MCP_READONLY=true` (or `1`) to refuse every tool
+  that changes a model, a report or a file, while reads and diagnostics keep working. A value
+  that cannot be read as a boolean turns lockdown on.
+- **Secret redaction** on every tool response (text and structured content), every resource and
+  the logs: connection strings, client secrets, bearer tokens, SAS signatures.
+
+**What this layer is not.** Policies work on query text and result names, so they are defence
+in depth, not a security boundary. A calculated column that copies protected data is judged by
+its own name, a filter on a masked column can still confirm a guess, and metadata tools list
+column names regardless of policy. Row-level and object-level security in the semantic model is
+the boundary; use this layer on top of it.
 
 ```yaml
 # config/policies.yaml (excerpt)
@@ -399,9 +435,15 @@ tables:
 | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` | Azure AD service principal (cloud, REST, admin) |
 | `ADOMD_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.AdomdClient.dll`, if auto-discovery misses it |
 | `TOM_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.Tabular.dll` for live writes (`ADOMD_DLL_PATH` is also searched) |
-| `POWERBI_MCP_READONLY` | `true` refuses all write tools (lockdown mode) |
-| `POWERBI_MCP_AUDIT_KEY` | Secret key that switches the audit hash chain to HMAC-SHA256 (stronger tamper-resistance) |
-| `ENABLE_PII_DETECTION`, `ENABLE_AUDIT`, `ENABLE_POLICIES` | Toggle security subsystems (default true) |
+| `POWERBI_MCP_READONLY` | Refuse all write tools (lockdown mode). Accepts 1/true/yes/on |
+| `POWERBI_MCP_QUERY_TIMEOUT` | Seconds before a DAX query is cancelled (default 120) |
+| `POWERBI_MCP_POLICY_FILE` | Your own policy file; missing or invalid means queries are refused |
+| `POWERBI_MCP_AUDIT_KEY` | Secret key that switches the audit hash chain to HMAC-SHA256 |
+| `POWERBI_MCP_HASH_KEY` | Secret key for the `hash` column policy (default: a per-session key) |
+| `POWERBI_MCP_AUDIT_DIR` | Folder for the audit log (default `logs/`) |
+| `POWERBI_MCP_PBIP_BACKUPS` | `false` stops the automatic project backup before a rename or repair |
+| `ENABLE_PII_DETECTION`, `ENABLE_AUDIT`, `ENABLE_POLICIES` | Toggle security subsystems (default on) |
+| `PYTHONNET_RUNTIME` | `coreclr` when only the .NET (Core) builds of ADOMD/TOM are installed |
 | `LOG_LEVEL` | `DEBUG` enables redacted argument logging |
 
 ---
@@ -410,8 +452,9 @@ tables:
 
 | Doc | Contents |
 |-----|----------|
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 82 tools, resources, prompts, env vars |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, security layer, registry pattern, verification methodology, file map |
+| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 90 tools, resources, prompts, env vars |
+| [docs/REPORT_SPEC.md](docs/REPORT_SPEC.md) | The declarative report spec behind `pbir_apply_spec`, with an example |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, request boundary, security layer, verification methodology, file map |
 | [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
 | [CHANGELOG.md](CHANGELOG.md) | Everything that changed, by milestone |
 | [AGENTS.md](AGENTS.md) | Agent playbook: golden rules, workflows, DAX patterns |
@@ -420,27 +463,30 @@ tables:
 
 ## Testing and verification
 
-The 25 suites in `tests/` are assert-based scripts that run without Power BI (pure logic is
-tested directly; live connectors are mocked).
+The 50 suites in `tests/` are assert-based scripts that run without Power BI (pure logic is
+tested directly; the server and the live connectors are driven through fakes). CI runs them on
+Windows and Linux.
 
 ```bash
 python run_tests.py
 ```
 
-Verification goes four layers deep, using the strongest check available per surface:
+What backs each claim:
 
-1. **Assert suites** for all pure logic (emitters, linters, auditors, security, parsers).
-2. **Adversarial doc-verification**: API contracts (PBIR schemas, TMDL shapes, REST/INFO
-   surfaces, the Desktop Bridge protocol) fact-checked against Microsoft Learn and real
-   exports before implementation.
-3. **Engine-level validation**: generated TMDL parses under Microsoft's own `TmdlSerializer`,
-   the code path Power BI Desktop runs when opening a PBIP.
-4. **Live testing** against a running Power BI Desktop: ADOMD queries, validated TOM batch
-   writes with rollback, the star-schema audit on a real model, and the Desktop Bridge
-   (discovery, manifest, state, hot-reload).
+1. **Assert suites** for all pure logic (tokenizer, renames, the report spec, generators,
+   linters, auditors, security, parsers), plus the request boundary through the real MCP handler.
+2. **Runs against real projects**: the rename engine, the report spec and the report audit were
+   run on copies of real, complex reports (HTML Content, Deneb, custom visuals, bookmarks) and
+   checked byte for byte.
+3. **Doc-verification**: API contracts (PBIR and TMDL shapes, REST/INFO surfaces, the Desktop
+   Bridge protocol) checked against Microsoft Learn and real exports.
+4. **Engine and live checks (2026-07)**: generated TMDL parsed under Microsoft's
+   `TmdlSerializer`; ADOMD queries, TOM batch writes and the Desktop Bridge exercised against a
+   running Power BI Desktop. These predate the 3.8.0 rewrite and have not been repeated on it.
 
-Cloud XMLA/REST/admin paths are doc-verified and mock-tested; their end-to-end verification
-needs a real tenant. Details in [docs/TESTING.md](docs/TESTING.md).
+Not verified by execution: generated DAX and M are not evaluated by an engine in the suites,
+generated reports are not opened in Desktop by them, and the cloud paths have not been run
+against a tenant. Details in [docs/TESTING.md](docs/TESTING.md).
 
 ---
 
@@ -449,30 +495,28 @@ needs a real tenant. Details in [docs/TESTING.md](docs/TESTING.md).
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server: 82 tools + resources/prompts/completion
-│   ├── powerbi_desktop_connector.py # Desktop (ADOMD) + RLS + VertiPaq DMVs
-│   ├── powerbi_xmla_connector.py    # Cloud XMLA
-│   ├── powerbi_rest_connector.py    # REST: discovery, refresh, admin Scanner/Activity
-│   ├── powerbi_tom_connector.py     # TOM writes: measures, relationships, transactions
-│   ├── powerbi_pbip_connector.py    # PBIP/TMDL/PBIR offline editing (transactional)
-│   ├── pbir_authoring.py            # PBIR emitters: pages, visuals, field projections
-│   ├── adomd_loader.py             # Shared ADOMD.NET discovery (Desktop + XMLA)
-│   ├── model_analysis.py            # BPA, AI-readiness, data dictionary, diff, DAX tests
-│   ├── dax_lint.py                  # DAX anti-pattern linter + rewrite hints (tokenizer)
-│   ├── svg_measures.py             # SVG micro-visual DAX measure generators
-│   ├── naming_audit.py             # Naming-convention audit -> rename plan
-│   ├── pbix_tools.py               # PBIX (.pbix ZIP) inspect/extract + layout decode
-│   ├── bpa_authoring.py            # Custom BPA rule validation + rule-source audit
-│   ├── dax_generator.py            # Bulk measure-suite generation (time intel, ratios, ranks)
-│   ├── star_schema.py              # Star-schema classification + warehouse audit
-│   ├── tmdl_authoring.py           # TMDL emitters: measures, date table, calc groups, hierarchies
-│   ├── desktop_bridge.py           # Power BI Desktop Bridge client (JSON-RPC over named pipe)
-│   ├── refresh_diagnostics.py       # Refresh error classification
-│   ├── governance.py                # Scanner summary + activity aggregation
-│   └── security/                    # security_layer, access_policy, pii_detector, audit_logger
+│   ├── server.py                    # MCP server: 90 tools, request boundary, handlers
+│   ├── dax_tokens.py                # Shared DAX tokenizer + reference rewriting
+│   ├── safe_io.py                   # Faithful atomic writes + multi-file transaction
+│   ├── powerbi_*_connector.py       # Desktop (ADOMD), XMLA, REST, TOM, PBIP
+│   ├── adomd_loader.py, adomd_query.py, connection_strings.py   # live connectivity plumbing
+│   ├── desktop_bridge.py            # Power BI Desktop Bridge client (JSON-RPC over named pipe)
+│   ├── pbip_rename.py, pbip_report.py, pbip_json.py, pbip_mquery.py, tmdl_scan.py
+│   │                                # the rename engine and its parsers
+│   ├── report_spec.py, pbir_builders.py, pbir_packages.py       # report as code
+│   ├── report_audit.py              # report-layer audit
+│   ├── payload_measures.py, js_app_measure.py, html_measures.py, svg_measures.py
+│   │                                # measures that draw: payloads, JS apps, HTML, SVG
+│   ├── model_embed.py, publish_stage.py                         # self-contained publishing
+│   ├── pbir_authoring.py, tmdl_authoring.py                     # single-visual and TMDL emitters
+│   ├── model_analysis.py, dax_lint.py, dax_functions.py, dax_generator.py
+│   ├── star_schema.py, naming_audit.py, bpa_authoring.py, pbix_tools.py
+│   ├── refresh_diagnostics.py, governance.py
+│   └── security/                    # policies, query analysis, PII, audit, redaction
 ├── config/policies.yaml
-├── tests/                           # Assert-based suites
-├── docs/                            # TOOLS, ARCHITECTURE, TESTING
+├── tests/                           # 50 assert-based suites
+├── docs/                            # TOOLS, REPORT_SPEC, ARCHITECTURE, TESTING
+├── .github/workflows/tests.yml      # CI: the suites on Windows and Linux
 ├── run_tests.py
 ├── pbip_diagnostic_tool.py            # Standalone PBIP diagnostic utility
 ├── AGENTS.md, CLAUDE.md
@@ -490,8 +534,12 @@ powerbi-mcp/
 |------------|-------|
 | Live connectivity is Windows only | ADOMD.NET, TOM, and the Desktop Bridge named pipe require Windows. The offline subset runs cross-platform via Docker. |
 | TOM renames break visuals | Use the PBIP tools for safe renames (they update the report layer too). |
-| `bridge_screenshot` depends on a Desktop preview fix | On current Desktop builds `report.snapshot.capture` can return an internal error for any input (a Desktop-side preview defect; verified independent of this client). Status, manifest, and hot-reload work. |
-| Cloud paths are doc-verified, not live-verified | XMLA/REST/admin tools are mock-tested and fact-checked against Microsoft Learn; they have not yet been exercised against a production tenant. |
+| `bridge_screenshot` depends on a Desktop preview fix | On some Desktop builds `report.snapshot.capture` returns an internal error for any input (a Desktop-side preview defect). Status, manifest, and hot-reload work. |
+| Cloud paths are doc-verified, not live-verified | XMLA/REST/admin tools are tested with fakes and fact-checked against Microsoft Learn; they have not yet been exercised against a production tenant. |
+| The 3.8.0 rewrite has not been re-run live | The connectors and the rename engine were rewritten and tested through fakes and on copies of real projects; the earlier live Desktop verification has not been repeated on the new code. |
+| Generated DAX, M and reports are not engine-tested | Measure generators, embedded partitions and the report spec are tested for shape and fidelity, not evaluated by Power BI in the suites. Validate with `validate_dax` and look with `bridge_screenshot`. |
+| HTML Content, Deneb and custom visuals are not certified | Reports that use them will not render in a tenant that only allows certified visuals; `audit_report_design` lists them. A script-driven visual also cannot cross-filter other visuals. |
+| Access policies are defence in depth | They work on query text and result names. Use row-level and object-level security in the model as the boundary. |
 | Cloud enhanced refresh needs Premium | XMLA and enhanced refresh need PPU / Premium / Fabric capacity. Basic refresh and history work on Pro. |
 | Fleet governance is admin-gated | Scanner and Activity tools need Fabric admin, or a service principal allowed to use read-only admin APIs. |
 | Deep server timings | `analyze_query_performance` gives duration and hints; use DAX Studio for storage-vs-formula-engine timings (a trace-based loop is on the roadmap). |
@@ -506,7 +554,7 @@ powerbi-mcp/
 - DAX validate-before-commit loop, atomic transactions, dependency and impact analysis.
 - Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage and query analysis.
 - Transactional, atomic, encoding-faithful PBIP renames (model + report + hierarchies + sort wiring).
-- Enforced column policies, PII masking, numeric masking, HMAC-capable tamper-evident audit,
+- Enforced column policies, PII masking, numeric masking, a hash-chained audit (HMAC with a key),
   read-only mode, response-boundary secret redaction.
 - Documentation export, model snapshot and diff, pre-deploy gate, DAX regression runner.
 - Refresh doctor, unused-object detection, RLS test matrix.
@@ -522,14 +570,21 @@ powerbi-mcp/
   engine-verified against Microsoft's TmdlSerializer and a live Desktop.
 - Star-schema audit and referential-integrity orphan scanning.
 - Power BI Desktop Bridge integration: status, manifest, hot-reload, screenshots.
+- Report as code: a declarative report spec, report audit, payload / HTML / JavaScript-app
+  measures, data embedding, publish staging.
+- A rebuilt rename engine (tokenizer and parsers instead of regexes), connector-owned
+  transactions, fail-closed policies, a CI pipeline.
 
 ### Planned
 
 - Trace-based DAX optimization loop (formula-engine vs storage-engine timings) and an
   EVALUATEANDLOG debugger.
 - Refresh trigger/monitor/cancel (Enhanced Refresh API + Desktop TMSL).
-- PyPI packaging, CI pipeline, and tagged releases.
-- Live validation of the cloud XMLA/REST/admin paths against a production tenant.
+- PyPI packaging and tagged releases.
+- Live validation of the cloud XMLA/REST/admin paths against a production tenant, and a live
+  re-run of the Desktop paths on the rewritten connectors.
+- Evaluate generated DAX and open generated reports in Desktop as part of the test run.
+- Report spec: drillthrough, report and page filters, visual interactions, mobile layout.
 - Best Practice Analyzer auto-fix; field parameters, object-level security, translations.
 - Remote HTTP transport with Microsoft Entra OAuth (today, use the official remote Power BI MCP
   server for cloud auth).
@@ -540,10 +595,12 @@ powerbi-mcp/
 
 1. Fork the repository.
 2. Create a feature branch.
-3. Keep the tool registry in sync (a tool lives in `handle_list_tools`, `_build_tool_dispatch`,
-   and `_build_tool_annotations` in `src/server.py`; a parity check enforces this).
-4. Run `python run_tests.py` and keep all suites green.
-5. Open a pull request.
+3. Keep the tool registry in sync (a tool lives in `build_tools`, `_build_tool_dispatch`,
+   and `_build_tool_annotations` in `src/server.py`; a parity check enforces this) and add it to
+   `docs/TOOLS.md` (a docs parity check enforces that too).
+4. Read and rewrite DAX through `src/dax_tokens.py` and write files through `src/safe_io.py`.
+5. Run `python run_tests.py` and keep all suites green.
+6. Open a pull request.
 
 Formatting conventions are in `pyproject.toml` and `.editorconfig`.
 
