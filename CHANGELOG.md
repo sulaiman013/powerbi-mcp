@@ -3,6 +3,33 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.8.1] - 2026-11-11 — Supported SDK range, backups through another path
+
+Found by the first run of the suites on GitHub's Windows and Linux runners.
+
+### Fixed
+- **The server could not start on a fresh install.** `pip` now resolves `mcp` to 2.x. That
+  release replaced the low-level `Server` API and renamed the model fields this server reads,
+  so start-up ended in an `AttributeError`. Earlier releases had the same unbounded requirement
+  and fail the same way. The requirement is now `mcp>=1.10.0,<2`, and on any other version the
+  server stops at start-up with a message that names the version it found and the command that
+  fixes it. Running on mcp 2.x needs a port of the server; that is not done.
+- **The documented minimum was wrong.** `mcp>=1.9.0` was declared as enough, but 1.9 has no
+  `Tool.outputSchema` and no `structuredContent`. The minimum is 1.10.0. The suites were run on
+  1.10.0, 1.27.0 and 1.30.0.
+- **A backup could silently leave out the semantic model.** When a project was opened through a
+  path that resolves to a different spelling (a Windows short name such as `C:\Users\RUNNER~1`,
+  a junction, a symlink or a mapped drive), the model folder looked as if it lay outside the
+  project, and `POWERBI_MCP_PBIP_BACKUPS` copied only the report and the `.pbip`. The model
+  folder is now located without respelling the path, and the file system decides whether two
+  paths are the same folder.
+
+### Tests
+- Two checks in the report-spec suite compared an unsorted directory listing and failed on
+  Linux. They now sort.
+- New checks: the SDK guard, the requirement files declaring the range the guard enforces, and
+  a project opened through a junction or symlink.
+
 ## [3.8.0] - 2026-11-10 — Correctness overhaul and report as code
 
 A full audit of the code (every module read, the headline defects reproduced on copies of real
