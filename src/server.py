@@ -29,8 +29,10 @@ from mcp.types import (
 from mcp.server.models import InitializationOptions
 from urllib.parse import unquote
 
-# Load environment variables
-load_dotenv()
+# Load settings from a .env file beside the server, unless told not to. The test runner sets
+# POWERBI_MCP_SKIP_DOTENV so a developer's local settings cannot change a test result.
+if os.getenv("POWERBI_MCP_SKIP_DOTENV", "").strip().lower() not in ("1", "true", "yes", "on"):
+    load_dotenv()
 
 # Configure logging
 logging.basicConfig(

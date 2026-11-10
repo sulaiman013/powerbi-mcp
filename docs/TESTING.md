@@ -20,8 +20,11 @@ suite that reports a failed check but still exits 0 cannot count as green. CI
 (`.github/workflows/tests.yml`) runs the same command on Windows and Linux for Python 3.10,
 3.12 and 3.13 with only the cross-platform dependencies installed.
 
-Suites that build a server write their audit entries to a temporary folder
-(`POWERBI_MCP_AUDIT_DIR`), never to the repository's `logs/`.
+The runner starts each suite in a clean environment: this server's own settings
+(`POWERBI_MCP_*`, `ENABLE_*`, the cloud credentials, the DLL paths) are removed and `.env`
+loading is switched off, so a result does not depend on whose machine ran it. Suites that
+build a server write their audit entries to a temporary folder, never to the repository's
+`logs/`. A suite started directly (`python tests/test_x.py`) sees your shell's environment.
 
 ## What each suite covers
 

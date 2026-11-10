@@ -274,6 +274,7 @@ refuse only their write option (`generate_measure_suite`, `build_js_app_measure`
 | `ADOMD_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.AdomdClient.dll` if auto-discovery misses it |
 | `TOM_DLL_PATH` | Folder (or full path) of `Microsoft.AnalysisServices.Tabular.dll` for live writes (`ADOMD_DLL_PATH` is also searched) |
 | `PYTHONNET_RUNTIME` | `coreclr` when only the .NET (Core) builds of ADOMD/TOM are installed |
+| `POWERBI_MCP_SKIP_DOTENV` | `1` stops the server reading a `.env` file. Set by the test runner so local settings cannot change a test result |
 | `LOG_LEVEL` | `DEBUG` enables (redacted) argument logging |
 
 ## Verification status
