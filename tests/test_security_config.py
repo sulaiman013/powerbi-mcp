@@ -22,6 +22,12 @@ from security.pii_detector import MaskingStrategy, PIIType  # noqa: E402
 
 logging.disable(logging.CRITICAL)  # every "locked" case logs an error by design
 
+# The checks below assert where the audit log goes when only the policy file says so. A
+# developer who has these set in their shell must not get a false failure, so start clean; the
+# tests that exercise the override set the variable themselves.
+for _var in ("POWERBI_MCP_AUDIT_DIR", "POWERBI_MCP_AUDIT_KEY", "POWERBI_MCP_HASH_KEY", "POWERBI_MCP_POLICY_FILE"):
+    os.environ.pop(_var, None)
+
 CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "policies.yaml")
 VALID = """
 global:

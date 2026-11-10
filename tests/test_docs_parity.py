@@ -106,9 +106,11 @@ def test_environment_variables():
             source = f.read()
         used |= set(re.findall(r"""["']((?:POWERBI_MCP|ENABLE)_[A-Z_]+|ADOMD_DLL_PATH|TOM_DLL_PATH)["']""", source))
     tools_doc, env_example = read("docs", "TOOLS.md"), read(".env.example")
+    not_for_env_file = {"POWERBI_MCP_SKIP_DOTENV"}   # it decides whether the .env file is read at all
     for var in sorted(used):
         check(f"{var} is in docs/TOOLS.md", f"`{var}`" in tools_doc)
-        check(f"{var} is in .env.example", var in env_example)
+        if var not in not_for_env_file:
+            check(f"{var} is in .env.example", var in env_example)
 
 
 def test_version_and_changelog():

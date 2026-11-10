@@ -24,6 +24,23 @@ ROOT = pathlib.Path(__file__).parent
 FAIL_LINE = re.compile(r"^\s*\[FAIL\]", re.MULTILINE)
 
 
+# Settings of this server that a developer may have exported in their shell or put in a .env
+# file. Any of them changes behaviour the suites assert on (an audit key makes the chain keyed,
+# lockdown refuses writes, credentials make the cloud tools "configured"), so the suites run
+# without them: a result must not depend on whose machine ran it.
+SERVER_SETTINGS = re.compile(
+    r"^(POWERBI_MCP_.*|ENABLE_(PII_DETECTION|AUDIT|POLICIES)|TENANT_ID|CLIENT_ID|CLIENT_SECRET|"
+    r"ADOMD_DLL_PATH|TOM_DLL_PATH|PYTHONNET_RUNTIME|LOG_LEVEL)$")
+
+
+def clean_environment():
+    """The environment the suites run in: the caller's, minus this server's own settings, and
+    with .env loading switched off."""
+    env = {k: v for k, v in os.environ.items() if not SERVER_SETTINGS.match(k)}
+    env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8", POWERBI_MCP_SKIP_DOTENV="1")
+    return env
+
+
 def discover(filters):
     tests = sorted((ROOT / "tests").glob("test_*.py"))
     if filters:
@@ -36,7 +53,7 @@ def main(argv) -> int:
     if not tests:
         print("No test suites matched.")
         return 1
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+    env = clean_environment()
     failed = []
     started = time.time()
     for t in tests:
