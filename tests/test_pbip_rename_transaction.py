@@ -7,6 +7,7 @@ No Power BI required. Run: python tests/test_pbip_rename_transaction.py
 """
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -274,6 +275,53 @@ def test_backups():
               and not (p.root / ".pbip-backups").exists())
 
 
+def second_spelling(folder: Path, link: Path):
+    """``link`` as another path to ``folder`` (a symlink, or a junction where Windows will not
+    let this user make symlinks), or None when the file system offers neither."""
+    try:
+        os.symlink(folder, link, target_is_directory=True)
+        return link
+    except (OSError, NotImplementedError):
+        pass
+    if os.name == "nt":
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(folder)], capture_output=True)
+        if made.returncode == 0 and link.is_dir():
+            return link
+    return None
+
+
+def test_project_reached_by_another_path():
+    print("\n== a project opened through a junction, symlink or short name is still one project ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        real = Path(tmp) / "real" / "Documents"
+        real.mkdir(parents=True)
+        build(str(real), load=False)
+        via = second_spelling(real, Path(tmp) / "via")
+        if via is None:
+            check("this file system can make a symlink or a junction", False)
+            return
+        try:
+            c = PowerBIPBIPConnector(auto_backup=True)
+            check("the project loads through the other path", c.load_project(str(via / "Retail.pbip")))
+            info = c.get_project_info()
+            check("the model folder is reported under the path the caller used",
+                  Path(info["semantic_model_folder"]) == via / "Retail.SemanticModel", info["semantic_model_folder"])
+            r = c.rename_measure_in_files("Revenue", "Revenue A")
+            check("a rename through it succeeds", r.success, r.message)
+            backup = Path(r.backup_created or "missing")
+            check("its backup holds the model as well as the report",
+                  backup.is_dir() and sorted(x.name for x in backup.iterdir())
+                  == ["Retail.Report", "Retail.SemanticModel", "Retail.pbip"],
+                  str(sorted(x.name for x in backup.iterdir())) if backup.is_dir() else str(backup))
+            check("the rename reached the real files",
+                  "measure 'Revenue A' = " in fx.read(real / "Retail.SemanticModel/definition/tables/_Measures.tmdl"))
+        finally:
+            if via.is_symlink():
+                via.unlink()
+            else:
+                os.rmdir(via)                           # a junction: remove the link, not its target
+
+
 def test_project_discovery():
     print("\n== the .pbip decides which report and model are loaded ==")
     with tempfile.TemporaryDirectory() as tmp:
@@ -328,7 +376,8 @@ if __name__ == "__main__":
     print("  PBIP RENAME: TRANSACTION AND REPORTING TESTS")
     print("=" * 70)
     for fn in (test_refusals, test_batch_is_one_transaction, test_failures_change_nothing,
-               test_existing_problems_do_not_block, test_undo, test_backups, test_project_discovery):
+               test_existing_problems_do_not_block, test_undo, test_backups,
+               test_project_reached_by_another_path, test_project_discovery):
         fn()
     print("\n" + "=" * 70)
     if _failures:

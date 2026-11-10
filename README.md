@@ -257,6 +257,8 @@ cd powerbi-mcp
 
 # Full install (Windows, for live connectivity)
 pip install -r requirements.txt
+# Both files require the mcp SDK 1.x (>=1.10,<2). The server does not run on mcp 2.x yet
+# and says so at start-up.
 
 # Or: offline / cross-platform subset only
 pip install -r requirements-core.txt

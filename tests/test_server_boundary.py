@@ -556,12 +556,43 @@ def test_identity():
     check("version is a semantic version string", server.__version__.count(".") == 2)
 
 
+def test_sdk_version_guard():
+    print("\n== the mcp SDK version is checked at start-up ==")
+    check("the SDK line this server is written for is accepted, and so is an unreadable version",
+          all(server.unsupported_sdk(v) is None for v in ("1.10.0", "1.27.0", "1.30.0", "1.10", None, "", "weird")))
+    for bad in ("2.0.0", "2.3.0", "1.9.4", "0.9.1", "10.0.0"):
+        msg = server.unsupported_sdk(bad) or ""
+        check(f"mcp {bad} is refused, with the fix", bad in msg and "pip install" in msg
+              and server.SUPPORTED_SDK in msg, msg)
+    check("the SDK this suite runs on is a supported one",
+          server.unsupported_sdk(server.installed_sdk_version()) is None, str(server.installed_sdk_version()))
+
+    real = server.installed_sdk_version
+    server.installed_sdk_version = lambda: "2.3.0"
+    try:
+        try:
+            server.PowerBIMCPServer()
+            check("the server says so instead of failing somewhere inside", False, "it started")
+        except RuntimeError as e:
+            check("the server says so instead of failing somewhere inside",
+                  "2.3.0" in str(e) and server.SUPPORTED_SDK in str(e), str(e))
+    finally:
+        server.installed_sdk_version = real
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("requirements.txt", "requirements-core.txt"):
+        with open(os.path.join(root, name), encoding="utf-8") as f:
+            lines = [ln.split("#")[0].strip().replace(" ", "") for ln in f]
+        declared = [ln for ln in lines if ln.startswith("mcp")]
+        check(f"{name} asks for the same range", declared == ["mcp>=1.10.0,<2"], str(declared))
+
+
 if __name__ == "__main__":
     for fn in (test_env_flag, test_statement_guard, test_guarded_path_enforces_policy,
                test_policy_sees_through_measures_and_aliases, test_locked_policy_file_refuses_queries,
                test_boundary_structured_and_redaction, test_validation_probes, test_batch_validation,
                test_lineage_scan, test_fleet_monitor_reports_unknowns, test_rls_harness_restores_role,
-               test_unused_objects_and_cache, test_transactions, test_identity):
+               test_unused_objects_and_cache, test_transactions, test_identity, test_sdk_version_guard):
         fn()
     print()
     if _failures:

@@ -7,7 +7,9 @@
 # fine without them; the live-connection tools simply report that they are unavailable.
 # For full connectivity install requirements.txt on Windows instead.
 
-mcp>=1.9.0  # outputSchema/structuredContent + ToolAnnotations; tested on 1.27.0
+# mcp 1.x only: 2.0 replaced the low-level Server API this server is built on.
+# >=1.10.0 for tool outputSchema + structuredContent.
+mcp>=1.10.0,<2
 pyyaml>=6.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
