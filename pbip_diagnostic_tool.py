@@ -1,246 +1,163 @@
 """
-PBIP Diagnostic and Utility Tool
+PBIP diagnostic utility (read-only).
 
-This script helps you:
-1. Find PBIP files on your system
-2. Analyze PBIP structure
-3. Identify DAX quoting issues
-4. Preview changes before applying fixes
-5. Test the connector with real PBIP files
+    python pbip_diagnostic_tool.py <path to .pbip or project folder>
+        Analyze one project: structure, TMDL validation, report bindings, and a PREVIEW of
+        what the DAX quoting fix would change. Nothing is written.
+
+    python pbip_diagnostic_tool.py
+        List the .pbip files found in the usual document folders.
+
+To apply the quoting fix, call PowerBIPBIPConnector.fix_all_dax_quoting() yourself (or use the
+pbip_fix_dax_quoting tool); this script never modifies a project.
 """
 import os
 import sys
-import json
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
-from powerbi_pbip_connector import PowerBIPBIPConnector, quote_tmdl_name, needs_tmdl_quoting
+from powerbi_pbip_connector import BACKUP_FOLDER, PowerBIPBIPConnector  # noqa: E402
 
 
-def find_pbip_files(start_path: str = None, max_depth: int = 3) -> List[Path]:
-    """Find all .pbip files on the system or in a specific directory"""
-    if not start_path:
-        # Common Power BI document locations
-        common_paths = [
+def find_pbip_files(start_path: Optional[str] = None, max_depth: int = 3) -> List[Path]:
+    """Find .pbip files under ``start_path`` (or the usual document folders), looking at most
+    ``max_depth`` folders deep and skipping backups made by this server."""
+    if start_path:
+        roots = [Path(start_path)]
+    else:
+        roots = [
             Path.home() / "Documents",
             Path.home() / "OneDrive" / "Documents",
-            Path(f"{os.environ.get('APPDATA', '')}\\Microsoft\\Power BI"),
             Path("C:\\Users\\Public\\Documents"),
         ]
-        pbip_files = []
-        for path in common_paths:
-            if path.exists():
-                pbip_files.extend(list(path.rglob("*.pbip")))
-        return pbip_files
-    else:
-        start = Path(start_path)
-        if start.exists():
-            return list(start.rglob("*.pbip"))
-        return []
+    found: List[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        base_depth = len(root.parts)
+        for folder, dirs, files in os.walk(root):
+            depth = len(Path(folder).parts) - base_depth
+            keep = [d for d in dirs if d != BACKUP_FOLDER and not d.startswith(".")]
+            dirs[:] = [] if depth >= max_depth else keep
+            found.extend(Path(folder) / f for f in files if f.lower().endswith(".pbip"))
+    return sorted(found)
 
 
 def analyze_pbip_structure(pbip_path: str) -> Dict[str, Any]:
-    """Analyze a PBIP file structure and report findings"""
-    try:
-        connector = PowerBIPBIPConnector(auto_backup=False)
-        if not connector.load_project(pbip_path):
-            return {"error": f"Failed to load PBIP: {pbip_path}"}
-
-        info = connector.get_project_info()
-
-        # Get validation errors
-        errors = connector.validate_tmdl_syntax()
-
-        # Categorize errors
-        error_summary = {
+    """Load a project and report its structure and validation findings. Read-only."""
+    connector = PowerBIPBIPConnector(auto_backup=False)
+    if not connector.load_project(pbip_path):
+        return {"error": f"Failed to load PBIP: {connector.last_error or pbip_path}", "pbip_path": pbip_path}
+    errors = connector.validate_tmdl_syntax()
+    bindings = connector.validate_report_bindings()
+    by_type: Dict[str, int] = {}
+    for e in errors:
+        by_type[e.error_type] = by_type.get(e.error_type, 0) + 1
+    return {
+        "pbip_path": pbip_path,
+        "project_info": connector.get_project_info(),
+        "error_summary": {
             "total_errors": len(errors),
-            "unquoted_names": len([e for e in errors if e.error_type == "UNQUOTED_NAME"]),
-            "unquoted_references": len([e for e in errors if e.error_type == "UNQUOTED_REFERENCE"]),
-            "unquoted_dax": len([e for e in errors if e.error_type == "UNQUOTED_TABLE_IN_DAX"]),
-            "file_errors": len([e for e in errors if e.error_type == "FILE_ERROR"]),
-        }
-
-        return {
-            "pbip_path": pbip_path,
-            "project_info": info,
-            "error_summary": error_summary,
-            "detailed_errors": [
-                {
-                    "file": e.file_path,
-                    "line": e.line_number,
-                    "type": e.error_type,
-                    "message": e.message,
-                    "context": e.context[:100] + "..." if len(e.context) > 100 else e.context,
-                }
-                for e in errors[:10]  # Show first 10 errors
-            ],
-            "total_detailed": len(errors),
-        }
-
-    except Exception as e:
-        return {"error": str(e), "pbip_path": pbip_path}
+            "by_type": by_type,
+            "unquoted_names": by_type.get("UNQUOTED_NAME", 0),
+            "unquoted_references": by_type.get("UNQUOTED_REFERENCE", 0),
+            "unquoted_dax": by_type.get("UNQUOTED_TABLE_IN_DAX", 0),
+            "file_errors": by_type.get("FILE_ERROR", 0),
+            "report_binding_errors": len(bindings),
+        },
+        "detailed_errors": [
+            {"file": e.file_path, "line": e.line_number, "type": e.error_type, "message": e.message,
+             "context": e.context[:100] + "..." if len(e.context) > 100 else e.context}
+            for e in (errors + bindings)[:10]
+        ],
+        "total_detailed": len(errors) + len(bindings),
+    }
 
 
-def test_dax_quoting_fix(pbip_path: str) -> Dict[str, Any]:
-    """Test the DAX quoting fix on a PBIP file (preview mode)"""
-    try:
-        connector = PowerBIPBIPConnector(auto_backup=False)
-        if not connector.load_project(pbip_path):
-            return {"error": f"Failed to load PBIP: {pbip_path}"}
-
-        # Run validation before fix
-        errors_before = connector.validate_tmdl_syntax()
-        dax_errors_before = [e for e in errors_before if e.error_type == "UNQUOTED_TABLE_IN_DAX"]
-
-        # This does NOT modify files - just previews what would be fixed
-        fix_result = connector.fix_all_dax_quoting()
-
-        # Run validation after fix
-        errors_after = connector.validate_tmdl_syntax()
-        dax_errors_after = [e for e in errors_after if e.error_type == "UNQUOTED_TABLE_IN_DAX"]
-
-        return {
-            "pbip_path": pbip_path,
-            "files_modified": fix_result["files_modified"],
-            "references_fixed": fix_result["count"],
-            "tables_fixed": fix_result["tables_fixed"],
-            "errors_before": len(dax_errors_before),
-            "errors_after": len(dax_errors_after),
-            "improvement": len(dax_errors_before) - len(dax_errors_after),
-            "sample_fixes": fix_result["count"],
-        }
-
-    except Exception as e:
-        return {"error": str(e), "pbip_path": pbip_path}
+def preview_dax_quoting_fix(pbip_path: str) -> Dict[str, Any]:
+    """What fix_all_dax_quoting would change, computed with dry_run=True: no file is written."""
+    connector = PowerBIPBIPConnector(auto_backup=False)
+    if not connector.load_project(pbip_path):
+        return {"error": f"Failed to load PBIP: {connector.last_error or pbip_path}", "pbip_path": pbip_path}
+    before = [e for e in connector.validate_tmdl_syntax() if e.error_type == "UNQUOTED_TABLE_IN_DAX"]
+    plan = connector.fix_all_dax_quoting(dry_run=True)
+    return {
+        "pbip_path": pbip_path,
+        "files_to_modify": plan["files_modified"],
+        "references_to_fix": plan["count"],
+        "tables_affected": plan["tables_fixed"],
+        "expressions_with_unquoted_tables": len(before),
+        "errors": plan["errors"],
+    }
 
 
-def print_pbip_list(pbip_files: List[Path]):
-    """Print formatted list of PBIP files found"""
+def print_pbip_list(pbip_files: List[Path]) -> None:
     if not pbip_files:
         print("  No .pbip files found")
         return
-
     print(f"\nFound {len(pbip_files)} PBIP file(s):\n")
     for i, pbip in enumerate(pbip_files, 1):
+        modified = datetime.fromtimestamp(pbip.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         print(f"  {i}. {pbip}")
-        print(f"     Size: {pbip.stat().st_size / (1024*1024):.2f} MB")
-        print(f"     Modified: {Path(pbip).stat().st_mtime}")
-        print()
+        print(f"     Modified: {modified}\n")
 
 
-def print_analysis(analysis: Dict[str, Any]):
-    """Print formatted analysis results"""
+def print_analysis(analysis: Dict[str, Any]) -> None:
     if "error" in analysis:
         print(f"  ERROR: {analysis['error']}")
         return
-
-    print(f"\n  Project: {analysis['project_info'].get('pbip_file', 'Unknown')}")
-    print(f"  TMDL Files: {analysis['project_info'].get('tmdl_file_count', 0)}")
-    print(f"  Report: {'Yes' if analysis['project_info'].get('report_json_path') else 'No'}")
-    print()
-    print(f"  Validation Errors Summary:")
-    print(f"    - Total errors: {analysis['error_summary']['total_errors']}")
-    print(f"    - Unquoted names: {analysis['error_summary']['unquoted_names']}")
-    print(f"    - Unquoted references: {analysis['error_summary']['unquoted_references']}")
-    print(f"    - Unquoted DAX: {analysis['error_summary']['unquoted_dax']}")
-
+    info = analysis["project_info"]
+    summary = analysis["error_summary"]
+    print(f"\n  Project: {info.get('pbip_file', 'Unknown')}")
+    print(f"  Report:  {info.get('report_folder') or 'none'} ({info.get('report_format')})")
+    print(f"  Model:   {info.get('semantic_model_folder') or 'none (remote or missing)'}")
+    print(f"  TMDL files: {info.get('tmdl_file_count', 0)}   Visuals: {info.get('visual_json_count', 0)}")
+    print(f"\n  Model validation: {summary['total_errors']} finding(s)")
+    for kind, count in sorted(summary["by_type"].items()):
+        print(f"    - {kind}: {count}")
+    print(f"  Report bindings that do not resolve: {summary['report_binding_errors']}")
     if analysis["detailed_errors"]:
-        print(f"\n  Sample Errors (showing 1-{len(analysis['detailed_errors'])} of {analysis['total_detailed']}):")
-        for err in analysis["detailed_errors"][:5]:
+        shown = analysis["detailed_errors"][:5]
+        print(f"\n  First {len(shown)} of {analysis['total_detailed']}:")
+        for err in shown:
             print(f"    - {err['type']}: {err['message']}")
             print(f"      {err['file']}:{err['line']}")
 
 
-def print_fix_preview(result: Dict[str, Any]):
-    """Print formatted fix preview results"""
+def print_fix_preview(result: Dict[str, Any]) -> None:
     if "error" in result:
         print(f"  ERROR: {result['error']}")
         return
-
-    print(f"\n  DAX Quoting Fix Preview")
-    print(f"  =====================")
-    print(f"  Files to be fixed: {len(result['files_modified'])}")
-    for f in result['files_modified']:
+    print("\n  DAX quoting fix: preview only, nothing was written")
+    print(f"  Files that would change: {len(result['files_to_modify'])}")
+    for f in result["files_to_modify"]:
         print(f"    - {f}")
-
-    print(f"\n  References to be fixed: {result['references_fixed']}")
-    print(f"  Tables affected: {result['tables_fixed']}")
-
-    if result['errors_before'] > 0:
-        print(f"\n  Impact:")
-        print(f"    - Errors before: {result['errors_before']}")
-        print(f"    - Errors after: {result['errors_after']}")
-        print(f"    - Improvement: {result['improvement']} errors fixed")
+    print(f"  References that would be quoted: {result['references_to_fix']}")
+    print(f"  Tables affected: {result['tables_affected']}")
+    for err in result["errors"]:
+        print(f"  ERROR: {err}")
 
 
-def main():
-    print("\n" + "="*70)
-    print("  PBIP DIAGNOSTIC AND UTILITY TOOL")
-    print("="*70)
-
-    # Check for command line arguments
+def main() -> int:
+    print("\n" + "=" * 70)
+    print("  PBIP DIAGNOSTIC TOOL (read-only)")
+    print("=" * 70)
     if len(sys.argv) > 1:
         pbip_path = sys.argv[1]
         print(f"\nAnalyzing PBIP: {pbip_path}")
-        print("="*70)
-
-        analysis = analyze_pbip_structure(pbip_path)
-        print_analysis(analysis)
-
-        print("\n" + "-"*70)
-        print("Testing DAX Quoting Fix (Preview)")
-        print("-"*70)
-        fix_preview = test_dax_quoting_fix(pbip_path)
-        print_fix_preview(fix_preview)
-
+        print_analysis(analyze_pbip_structure(pbip_path))
+        print("\n" + "-" * 70)
+        print_fix_preview(preview_dax_quoting_fix(pbip_path))
         return 0
-
-    # Interactive mode - find PBIP files
     print("\nSearching for PBIP files...")
-    print("-"*70)
-
     pbip_files = find_pbip_files()
     print_pbip_list(pbip_files)
-
     if pbip_files:
-        print("="*70)
-        print("\nUsage:")
-        print("-"*70)
-        print("1. Analyze a specific PBIP:")
-        print(f"   python pbip_diagnostic_tool.py \"{pbip_files[0]}\"")
-        print()
-        print("2. Find and analyze custom location:")
-        print("   python pbip_diagnostic_tool.py \"C:/path/to/your/file.pbip\"")
-        print()
-
-    print("\nTo use the PBIP Connector in your code:")
-    print("-"*70)
-    print("""
-from powerbi_pbip_connector import PowerBIPBIPConnector
-
-# Initialize connector
-connector = PowerBIPBIPConnector(auto_backup=True)
-
-# Load your PBIP file
-pbip_path = "C:/path/to/your/Report.pbip"
-connector.load_project(pbip_path)
-
-# Check for issues
-errors = connector.validate_tmdl_syntax()
-print(f"Found {len(errors)} issues")
-
-# Fix DAX quoting issues
-fix_result = connector.fix_all_dax_quoting()
-print(f"Fixed {fix_result['count']} references")
-
-# Rename a table (includes proper quoting)
-result = connector.rename_table_in_files("OldName", "New Table Name")
-print(f"Renamed: {result.success}")
-    """)
-
+        print("Analyze one with:")
+        print(f'   python pbip_diagnostic_tool.py "{pbip_files[0]}"')
     return 0
 
 

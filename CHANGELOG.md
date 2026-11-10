@@ -3,6 +3,143 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.8.0] - 2026-11-10 — Correctness overhaul and report as code
+
+A full audit of the code (every module read, the headline defects reproduced on copies of real
+report projects) followed by a rewrite of what did not hold. The server grew from **82 to 90
+tools** and from 25 to 50 test suites. Several things earlier entries of this changelog called
+safe, transactional or enforced were not; this release makes them so, and the sections below say
+which.
+
+Nothing in this release was re-run against a live Power BI Desktop or a tenant: the connectors
+and the rename engine are tested through fakes and on copies of real projects. See
+docs/TESTING.md for what is and is not verified by execution.
+
+### Fixed — safe renames (the previous engine corrupted projects while reporting success)
+The regex cascade is replaced by an engine that parses TMDL, DAX, Power Query and report JSON.
+- **Column renames never updated the field a visual actually reads.** Only the `queryRef` string
+  changed; `Column.Property` kept the old name, so the visual broke. Fixed, for visuals, mobile
+  layouts, page and report filters and bookmarks.
+- **A column rename rewrote `column <name>` in every table**, and a measure rename rewrote a
+  same-named column in DAX and in visuals. Renames are now scoped to the owning object.
+- **A new name starting with a digit corrupted relationship names** and `PBI_QueryOrder`
+  (`\1` + `2024` was read as an octal escape); other names raised an error that was swallowed.
+  Nothing is built from regex templates any more.
+- **Only `visual.json` was rewritten**; page and report filters, bookmarks and legacy
+  `report.json` kept old names. All are covered now.
+- **Deneb specs** keep working: field names inside the spec follow the rename.
+- **Per-file errors were swallowed**, so a half-applied rename was reported as success and the
+  rollback never ran. A rename is now planned in memory and committed in one transaction:
+  every file or none.
+- **Line endings were rewritten** (LF to CRLF on Windows) and writes on the rename path were
+  not atomic. All writes go through `safe_io`: encoding, BOM, newline style (mixed included) and
+  file-name case are preserved, and untouched files stay byte-identical.
+- **Success was hard-coded.** A rename of a name that does not exist, a collision, or a result
+  with a broken reference is now refused with nothing written.
+- New: `pbip_undo` restores the files changed by the last rename or repair. Backups are scoped
+  to the project (`.pbip-backups/`) instead of copying the whole parent folder.
+- Project discovery reads the `.pbip` artifacts and `definition.pbir`, so the right model is
+  loaded when several projects share a folder. The diagnostic tool's "preview" no longer writes.
+
+### Fixed — security layer
+- **Policies failed open.** One typo in `config/policies.yaml`, a YAML error or a missing file
+  silently left zero policies. The layer now locks: queries are refused and `security_status`
+  says why.
+- **`POWERBI_MCP_READONLY=1` did not enable lockdown** (only the exact word `true` did). Flags
+  accept 1/true/yes/on, and an unreadable value fails safe.
+- **Policies, PII masking and audit covered 2 of the DAX-running tools.** `run_dax_tests`,
+  `rls_test_harness`, `validate_dax`, `analyze_query_performance` and the sample step of
+  `scan_referential_integrity` returned data unfiltered. Every one now goes through one guarded
+  path.
+- **Aliasing defeated masking** (`SELECTCOLUMNS(T, "x", T[card])` came back raw), and a measure
+  or `TOCSV(table)` defeated a block. The check follows aliases, expands measures and refuses
+  whole-table serialisers over protected tables. Engine error text is withheld when the query
+  reads a protected column.
+- **Query tools forwarded any command text** to the engine. They now accept DAX queries only;
+  TMSL, XMLA and MDX are refused in the server and in the connectors.
+- **PII masking corrupted ordinary data** (a `Description` column became `***.***.***.***`, a
+  city became a phone mask, an ISO date a card mask) and ignored its own configuration. Detection
+  validates values (Luhn, SSN ranges), matches whole words in the column name only, and runs in
+  linear time.
+- **Audit:** the chain now continues across rotated files and detects truncation through a
+  checkpoint; rotation works on Windows; several server processes can share one log; `hash` is
+  keyed (HMAC) instead of an unsalted SHA-256. The docs now say plainly that an unkeyed chain
+  only catches accidental edits.
+- Secret redaction covers quoted values with `;`, JSON, bearer tokens and SAS signatures, and is
+  applied to structured content and resources as well as text.
+
+### Fixed — live connectors
+- **Transactions were a flag in the server.** A failed commit cleared it and left the edits
+  staged; the deprecated renames saved in the middle of a transaction; "will be checked at
+  commit" was never checked. The TOM connector now owns transactions: nothing saves while one is
+  open, a failed commit leaves it open, a failed save outside one undoes the edit.
+- **`batch_create_measures` was not all-or-nothing** and skipped validation for any measure that
+  mentioned a sibling's name. The whole batch, sibling and pending references included, is now
+  compiled in one DEFINE query before anything is created.
+- **Connection strings were built from unescaped names**: a dataset or role name containing `;`
+  could redirect the connection while the secret was still attached. Every value is quoted.
+- **The REST token was fetched once and never refreshed.** Tokens refresh; 401 retries once; 429
+  and 503 honour `Retry-After`; errors are typed instead of becoming empty lists.
+- Queries set a timeout, stop reading at the row cap, and always close their connection.
+- `cross_workspace_lineage` silently stopped at 100 workspaces and promised a resume it could not
+  do. It scans in batches, says when it stopped at `max_workspaces`, and resumes by scan id.
+- `fleet_refresh_monitor` no longer reports "all succeeded" when it could not read a dataset.
+- The ADOMD/TOM loader picks a build the active .NET runtime can load. `pyadomd` is no longer a
+  dependency.
+- A failed RLS role switch keeps the previous role; `rls_test_harness` restores the role that was
+  active before it ran.
+
+### Fixed — analysis tools
+- `model_diff` reported "No semantic changes" after relationship and calculated-column edits. It
+  now compares every gathered property and detects renames.
+- The Best Practice Analyzer's only error-level rule skipped tables, so `pre_deploy_gate` could
+  hardly fail. There are 33 rules, 5 at error level. **Behaviour change:** the gate can now fail
+  models that used to pass (broken references, `USERELATIONSHIP` without a relationship).
+- The DAX linter flagged 115 real functions as hallucinated (including `INFO.VIEW.*`) and lost
+  track on names containing `--`, `//` or `"`. It uses the shared tokenizer and a catalog of 472
+  functions; `/` is rewritten to `DIVIDE` mechanically.
+- `generate_measure_suite`: every measure has a format string (6 of 8 time-intelligence measures
+  had none), YoY / MoM are blank-safe on both sides, shares and ranks clear the sort-by column,
+  plus an ALLSELECTED rank and a fiscal year end option.
+- `audit_naming`: `ORDER_DATE` no longer becomes `Order DATE`; colliding suggestions are flagged;
+  it recommends the report-aware rename tools.
+- `audit_star_schema` no longer gives a flat table or an empty model an A.
+- `find_unused_objects` no longer lists a sort-by column as unused.
+- SVG measures return blank without data, escape labels and encode `#`.
+
+### Added — report as code
+The methods behind script-built showcase reports, as tools:
+- **`pbir_apply_spec`** — build or update a whole report from one declarative JSON spec: theme,
+  pages, visuals, text, shapes, images, navigation buttons, synced slicers, HTML Content and
+  Deneb visuals, private custom visuals, hidden pop-ups with open/close bookmarks, elements
+  shared across pages. Idempotent, all-or-nothing, never touches what it did not create
+  (docs/REPORT_SPEC.md).
+- **`audit_report_design`** — a best-practice audit of the report layer: structure, design and
+  governance notes.
+- **`generate_payload_measure`** — "DAX as transport": a text measure that packs rows for a
+  JavaScript consumer, with the matching parser and a size budget.
+- **`build_js_app_measure`** — assemble CSS and JavaScript modules into measures for the HTML
+  Content visual, with a string/regex-aware minifier, build refusals and a size report.
+- **`generate_html_measure`** — KPI cards, headline sentences, bar lists and tables as HTML.
+- **`pbip_embed_data`** — embed CSV data in the model's partitions so the service can refresh
+  it with no gateway (dry run by default).
+- **`pbip_stage_publish`** — stage a report bound to a published model for an in-place publish
+  that keeps its links (offline).
+- `pbip_add_measures` gains `mode: upsert`: same-named measures are replaced in place and new
+  ones get a deterministic lineage tag, so a rebuild is byte-identical.
+
+### Added — foundations and tooling
+- `dax_tokens.py`: one DAX tokenizer, reference extraction and token-level renames, used by the
+  linter, both rename engines, the policy check and the validation probes.
+- `safe_io.py`: faithful atomic writes and a multi-file transaction.
+- `tests/test_docs_parity.py` checks the docs against the code (tools, safety marks, counts,
+  environment variables, version); `run_tests.py` fails a suite that prints `[FAIL]` even if it
+  exits 0 (one suite did exactly that); a GitHub Actions workflow runs the suites on Windows and
+  Linux.
+- The server reports its real version (it said 2.0.0).
+
+---
+
 ## [3.7.0] - 2026-07-23 — Power BI Desktop Bridge integration (preview)
 
 Grew the server from **78 to 82 tools** by integrating Microsoft's **Power BI Desktop Bridge**

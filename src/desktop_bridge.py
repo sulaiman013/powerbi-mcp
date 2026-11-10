@@ -15,19 +15,29 @@ Documented methods (bridge.manifest reports what a given build supports):
 
 This client is pure Python: Windows named pipes are opened with plain open() - no pywin32.
 Reference: learn.microsoft.com/power-bi/developer/agentic/power-bi-desktop-bridge-overview
+
+Timeouts. A pipe opened this way does blocking I/O, so each call runs its exchange on a worker
+thread and the caller waits at most ``timeout`` seconds. On a timeout the worker's pending read
+is cancelled (CancelSynchronousIo) so the thread ends and the pipe handle is closed. If the
+cancel is not possible the worker stays blocked until Desktop answers or closes the pipe; that
+is bounded to ONE stuck worker per pipe, because further calls to the same pipe fail at once
+with BridgeBusyError instead of queueing up behind it.
 """
 import json
 import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 PIPE_DIR = "\\\\.\\pipe"
 PIPE_PREFIX = "pbi-desktop-bridge-"
 DEFAULT_TIMEOUT = 60.0  # screenshots and model reloads can take a while
+MAX_HEADER_BYTES = 8 * 1024             # a frame header is one or two short lines
+MAX_BODY_BYTES = 512 * 1024 * 1024      # a full-page screenshot is a few megabytes of base64
+MAX_SKIPPED_MESSAGES = 1000             # notifications tolerated while waiting for one response
 
 
 # ---------------------------------------------------------------- framing (pure, testable)
@@ -38,27 +48,38 @@ def encode_frame(obj: Dict[str, Any]) -> bytes:
     return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
 
 
-def read_frame(stream) -> Dict[str, Any]:
-    """Read one Content-Length framed JSON message from a byte stream."""
+def read_frame(stream, max_body: int = MAX_BODY_BYTES) -> Any:
+    """Read one Content-Length framed JSON message from a byte stream. Raises ConnectionError
+    when the stream ends early or the frame is malformed or larger than the limits allow."""
     header = b""
     while b"\r\n\r\n" not in header:
         ch = stream.read(1)
         if not ch:
             raise ConnectionError("Bridge pipe closed while reading response headers")
         header += ch
+        if len(header) > MAX_HEADER_BYTES:
+            raise ConnectionError("Bridge response header is too long to be a Content-Length frame")
     length = None
     for line in header.split(b"\r\n"):
         if line.lower().startswith(b"content-length:"):
-            length = int(line.split(b":", 1)[1].strip())
+            value = line.split(b":", 1)[1].strip()
+            if not value.isdigit():
+                raise ConnectionError(f"Bridge response has an invalid Content-Length: {value[:40]!r}")
+            length = int(value)
     if length is None:
         raise ConnectionError("Bridge response missing Content-Length header")
+    if length > max_body:
+        raise ConnectionError(f"Bridge response of {length:,} bytes exceeds the {max_body:,} byte limit")
     body = b""
     while len(body) < length:
         chunk = stream.read(length - len(body))
         if not chunk:
             raise ConnectionError("Bridge pipe closed mid-response")
         body += chunk
-    return json.loads(body.decode("utf-8"))
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError as e:
+        raise ConnectionError(f"Bridge response is not valid JSON: {e}") from None
 
 
 # ---------------------------------------------------------------- discovery
@@ -90,7 +111,9 @@ def msmdsrv_port_for_desktop_pid(desktop_pid: int) -> Optional[int]:
                     continue
                 if proc.info["ppid"] != desktop_pid:
                     continue
-                for conn in proc.net_connections(kind="tcp"):
+                # psutil 6 renamed Process.connections() to net_connections().
+                connections = getattr(proc, "net_connections", None) or proc.connections
+                for conn in connections(kind="tcp"):
                     if conn.status == psutil.CONN_LISTEN and conn.laddr:
                         return conn.laddr.port
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -111,11 +134,43 @@ class BridgeError(Exception):
         self.message = message
 
 
+class BridgeBusyError(TimeoutError):
+    """An earlier call to this pipe timed out and is still blocked waiting for Desktop."""
+
+
+def _cancel_blocked_io(thread: threading.Thread) -> bool:
+    """Cancel the synchronous read a worker thread is blocked in, so it can exit and close
+    its pipe handle. Windows only; returns False wherever that is not possible."""
+    if os.name != "nt" or thread.native_id is None:
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenThread.restype = ctypes.c_void_p
+        kernel32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.CancelSynchronousIo.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenThread(0x0001, False, thread.native_id)      # THREAD_TERMINATE
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.CancelSynchronousIo(handle))
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError) as e:
+        logger.debug(f"Could not cancel blocked bridge I/O: {e}")
+        return False
+
+
 class DesktopBridgeClient:
     """One-shot-per-call client for a Desktop Bridge pipe.
 
     The bridge allows a single in-flight operation; a fresh pipe handle per call keeps this
-    client stateless and safe across long gaps between tool invocations."""
+    client stateless and safe across long gaps between tool invocations. See the module
+    docstring for what happens when a call times out."""
+
+    _stuck: Dict[str, threading.Thread] = {}       # pipe -> worker still blocked after a timeout
+    _stuck_lock = threading.Lock()
 
     def __init__(self, pipe: str, timeout: float = DEFAULT_TIMEOUT):
         self.pipe = pipe
@@ -123,10 +178,24 @@ class DesktopBridgeClient:
         self._id = 0
 
     def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Send one JSON-RPC request and return the `result`. Raises BridgeError on a JSON-RPC
-        error and TimeoutError if the bridge does not answer within the timeout."""
+        """Send one JSON-RPC request and return its ``result`` object.
+
+        Messages that are not the response to this request (notifications, responses carrying
+        another id) are skipped. A null result is returned as {}; a result that is not an
+        object is returned as {"value": result}. Raises BridgeError on a JSON-RPC error,
+        TimeoutError if the bridge does not answer within the timeout, BridgeBusyError if an
+        earlier timed-out call to this pipe is still blocked, and ConnectionError for a
+        malformed or truncated response."""
+        with self._stuck_lock:
+            previous = self._stuck.get(self.pipe)
+            if previous is not None and previous.is_alive():
+                raise BridgeBusyError(
+                    f"Desktop Bridge is still busy with an earlier request that timed out; {method} "
+                    "was not sent. Wait for Power BI Desktop to finish (or restart it) and retry.")
+            self._stuck.pop(self.pipe, None)
         self._id += 1
-        request = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}}
+        request_id = self._id
+        request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
 
         result: Dict[str, Any] = {}
         error: List[BaseException] = []
@@ -135,25 +204,44 @@ class DesktopBridgeClient:
             try:
                 with open(self.pipe, "r+b", buffering=0) as f:
                     f.write(encode_frame(request))
-                    result["response"] = read_frame(f)
+                    for _ in range(MAX_SKIPPED_MESSAGES):
+                        message = read_frame(f)
+                        if not isinstance(message, dict):
+                            raise ConnectionError("Bridge sent a message that is not a JSON-RPC object")
+                        # A response to a request the bridge could not parse carries a null id.
+                        if ("id" in message and message["id"] in (request_id, None)
+                                and ("result" in message or "error" in message)):
+                            result["response"] = message
+                            return
+                    raise ConnectionError(f"Bridge sent {MAX_SKIPPED_MESSAGES} messages without "
+                                          f"answering {method}")
             except BaseException as e:  # surfaced on the caller thread
                 error.append(e)
 
-        worker = threading.Thread(target=_exchange, daemon=True)
+        worker = threading.Thread(target=_exchange, daemon=True, name=f"bridge-{method}")
         worker.start()
         worker.join(self.timeout)
         if worker.is_alive():
+            _cancel_blocked_io(worker)
+            worker.join(1.0)
+            if worker.is_alive():
+                with self._stuck_lock:
+                    self._stuck[self.pipe] = worker
             raise TimeoutError(
                 f"Desktop Bridge did not respond to {method} within {self.timeout:.0f}s "
                 "(another operation may be running; the bridge is single-operation)")
         if error:
             raise error[0]
 
-        response = result.get("response", {})
-        if "error" in response:
-            err = response["error"] or {}
-            raise BridgeError(int(err.get("code", -1)), str(err.get("message", "unknown")))
-        return response.get("result", {})
+        response = result["response"]
+        if response.get("error") is not None:
+            err = response["error"] if isinstance(response["error"], dict) else {}
+            code = err.get("code", -1)
+            raise BridgeError(code if isinstance(code, int) else -1, str(err.get("message", "unknown")))
+        value = response.get("result")
+        if value is None:
+            return {}
+        return value if isinstance(value, dict) else {"value": value}
 
     # -------- typed wrappers over the documented methods
 
@@ -245,9 +333,9 @@ def resolve_page_id(pages: List[Dict[str, Any]], ref: str) -> Optional[str]:
     """Resolve a page reference (internal id or display name, case-insensitive) to the id."""
     want = (ref or "").strip().lower()
     for p in pages:
-        if p["id"].lower() == want:
+        if str(p["id"]).lower() == want:
             return p["id"]
     for p in pages:
-        if p["display_name"].lower() == want:
+        if str(p["display_name"]).lower() == want:
             return p["id"]
     return None

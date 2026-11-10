@@ -1,7 +1,11 @@
 """
-Power BI MCP Server V2
-Supports both Power BI Service (Cloud) and Power BI Desktop (Local)
-Features: PII Detection, Audit Logging, Access Policies
+Power BI MCP Server
+
+One stdio MCP server over five integration paths: Power BI Desktop (ADOMD), Power BI Service
+(XMLA + REST), live model writes (TOM), offline PBIP files (TMDL + PBIR), and the Desktop
+Bridge. This module owns the tool registry, the request boundary (read-only gate, statement
+guard, policy and PII enforcement, secret redaction) and the handlers; the work itself lives
+in the connectors and the pure modules beside it.
 """
 import asyncio
 import json
@@ -25,8 +29,10 @@ from mcp.types import (
 from mcp.server.models import InitializationOptions
 from urllib.parse import unquote
 
-# Load environment variables
-load_dotenv()
+# Load settings from a .env file beside the server, unless told not to. The test runner sets
+# POWERBI_MCP_SKIP_DOTENV so a developer's local settings cannot change a test result.
+if os.getenv("POWERBI_MCP_SKIP_DOTENV", "").strip().lower() not in ("1", "true", "yes", "on"):
+    load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -34,43 +40,66 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stderr)]
 )
-logger = logging.getLogger("powerbi-mcp-v2")
+logger = logging.getLogger("powerbi-mcp")
+
+__version__ = "3.8.0"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable: 1/true/yes/on and 0/false/no/off in any case.
+    Unset or blank gives ``default``; so does an unrecognised value, with a warning. (The
+    server's own safety switches are read with a stricter fallback, see PowerBIMCPServer.)"""
+    raw = os.getenv(name)
+    value = _security_env_flag(name, default, invalid=default)
+    if raw is not None and raw.strip() and raw.strip().lower() not in (
+            "1", "true", "yes", "on", "0", "false", "no", "off"):
+        logger.warning(f"{name}={raw!r} is not a recognised boolean; using {default}")
+    return value
 
 
 def redact_secrets(text: Any, extra_secrets: Optional[List[str]] = None) -> str:
-    """Redact connection-string secrets and known secret values before logging or returning to the client.
+    """Redact connection-string secrets, tokens and known secret values before text is logged
+    or returned to the client. Implemented in security.redaction; kept here under its
+    long-standing name because handlers and tests call it as server.redact_secrets."""
+    return _security_redact_secrets(text, extra_secrets)
 
-    Power BI cloud connectors embed the service-principal client secret directly in the
-    ADOMD/MSOLAP connection string (Password=...). Exception messages and verbose argument
-    logs can therefore leak credentials. This masks the common vectors.
+
+def define_measures_block(measures: List[Dict[str, str]]) -> str:
+    """A DEFINE block declaring query-scoped measures: [{table, name, expression}, ...].
+
+    Each expression sits on its own lines, so a trailing ``--`` comment in one measure cannot
+    swallow the next declaration. Returns "" for an empty list.
     """
-    if text is None:
+    if not measures:
         return ""
-    s = str(text)
-    # Connection-string / URL style secrets
-    s = re.sub(r"(?i)(password\s*=\s*)[^;]+", r"\1***", s)
-    s = re.sub(r"(?i)(client_secret\s*=\s*)[^;&\s]+", r"\1***", s)
-    s = re.sub(r"(?i)(\bsecret\s*=\s*)[^;&\s]+", r"\1***", s)
-    # Known literal secret values (e.g. the configured client secret)
-    for sec in (extra_secrets or []):
-        if sec and len(sec) >= 6:
-            s = s.replace(sec, "***")
-    return s
+    lines = ["DEFINE"]
+    for m in measures:
+        host = dax_tokens.quote_table(str(m["table"]), force=True)
+        lines.append(f"\tMEASURE {host}{dax_tokens.bracket(str(m['name']))} =\n{(m.get('expression') or '').strip()}")
+    return "\n".join(lines) + "\n"
 
 
-def build_validation_probe(dax: str, as_measure: bool = False) -> str:
-    """Wrap a DAX expression/query into an executable probe used to validate it.
+def build_validation_probe(dax: str, as_measure: bool = False, table: Optional[str] = None,
+                           extra_measures: Optional[List[Dict[str, str]]] = None) -> str:
+    """Wrap DAX into an executable probe that makes the engine parse and evaluate it.
 
-    A full query (starts with EVALUATE/DEFINE) is run as-is; a scalar measure
-    expression is wrapped in EVALUATE ROW(...) so the engine parses and evaluates it.
-    Executing the probe with a tiny row cap surfaces syntax/semantic errors without
-    materializing real data.
+    A full query (EVALUATE / DEFINE, possibly after comments) runs as it is. A measure
+    expression is validated as a measure: given a host ``table`` it becomes a query-scoped
+    DEFINE MEASURE, which is how the engine will compile the real one, so a stray top-level
+    comma is rejected instead of being read as extra ROW() arguments. Without a table it is
+    evaluated inside ROW(). ``extra_measures`` ([{table, name, expression}]) are declared in
+    the same query, so the expression may reference measures that do not exist in the model
+    yet. The expression always sits on its own lines, so a trailing ``--`` comment cannot
+    swallow the rest of the probe.
     """
     stripped = (dax or "").strip()
-    upper = stripped.upper()
-    if not as_measure and (upper.startswith("EVALUATE") or upper.startswith("DEFINE")):
+    if not as_measure and dax_tokens.statement_kind(stripped) == "dax":
         return stripped
-    return f'EVALUATE ROW("validation", {stripped})'
+    if table:
+        probe = {"table": table, "name": "__mcp_validation__", "expression": stripped}
+        return (define_measures_block(list(extra_measures or []) + [probe])
+                + 'EVALUATE ROW("validation", [__mcp_validation__])')
+    return define_measures_block(list(extra_measures or [])) + f'EVALUATE ROW("validation",\n{stripped}\n)'
 
 
 # Real constraints on INFO.CALCDEPENDENCY (not "old engine"): it needs write permission on
@@ -96,22 +125,33 @@ import dax_lint
 import svg_measures
 import naming_audit
 import pbix_tools
+import publish_stage
+import report_spec
+import report_audit
+import html_measures
+import js_app_measure
+import model_embed
+import payload_measures as payload_gen
 import bpa_authoring
 import dax_generator
+import dax_tokens
+import safe_io
 import star_schema
 import tmdl_authoring
 import desktop_bridge
 
 # Import security layer
-from security import SecurityLayer, get_security_layer
-from security.access_policy import AccessPolicyEngine
+from security import SecurityLayer
+from security import env_flag as _security_env_flag
+from security import redact_secrets as _security_redact_secrets
+from security import redact_structure as security_redact_structure
 
 
 class PowerBIMCPServer:
     """Power BI MCP Server supporting Cloud and Desktop connectivity"""
 
     def __init__(self):
-        self.server = Server("powerbi-mcp-v2")
+        self.server = Server("powerbi-mcp")
 
         # Cloud credentials (optional for Desktop-only usage)
         self.tenant_id = os.getenv("TENANT_ID", "")
@@ -125,16 +165,30 @@ class PowerBIMCPServer:
         self.tom_connector: Optional[PowerBITOMConnector] = None
         self.pbip_connector: Optional[PowerBIPBIPConnector] = None
 
-        # When a TOM transaction is open, write tools defer SaveChanges until commit.
-        self._tom_transaction_active = False
+        # A TOM transaction is owned by the connector (see _tom_transaction_active).
+        # Measures created inside the open transaction ({table, name, expression}). They are
+        # not on the server until commit, so validation probes declare them with DEFINE MEASURE:
+        # a later edit in the same transaction can reference them and still be checked.
+        self._tom_pending_measures: List[Dict[str, str]] = []
 
-        # Initialize security layer
-        config_path = Path(__file__).parent.parent / "config" / "policies.yaml"
+        # Model metadata gathered through INFO.VIEW is reused briefly: completion, resources
+        # and back-to-back analysis tools would otherwise each re-run four metadata queries.
+        self._metadata_cache: Dict[Any, Any] = {}
+
+        # Security layer. POWERBI_MCP_POLICY_FILE names an explicit policy file; a path that is
+        # set but missing is passed through on purpose so the layer refuses queries instead of
+        # running with no policies at all. Only the bundled default is allowed to be absent.
+        explicit_policy = os.getenv("POWERBI_MCP_POLICY_FILE", "").strip()
+        default_policy = Path(__file__).parent.parent / "config" / "policies.yaml"
+        if explicit_policy:
+            policy_path: Optional[str] = explicit_policy
+        else:
+            policy_path = str(default_policy) if default_policy.exists() else None
         self.security = SecurityLayer(
-            config_path=str(config_path) if config_path.exists() else None,
-            enable_pii_detection=os.getenv("ENABLE_PII_DETECTION", "true").lower() == "true",
-            enable_audit=os.getenv("ENABLE_AUDIT", "true").lower() == "true",
-            enable_policies=os.getenv("ENABLE_POLICIES", "true").lower() == "true"
+            config_path=policy_path,
+            enable_pii_detection=_security_env_flag("ENABLE_PII_DETECTION", True, invalid=True),
+            enable_audit=_security_env_flag("ENABLE_AUDIT", True, invalid=True),
+            enable_policies=_security_env_flag("ENABLE_POLICIES", True, invalid=True),
         )
 
         # Single source of truth for call routing and MCP safety hints. New tools
@@ -143,9 +197,11 @@ class PowerBIMCPServer:
         self._tool_annotations = self._build_tool_annotations()
         self._prompts = self._build_prompts()
 
-        # Read-only / lockdown mode: when POWERBI_MCP_READONLY=true, every write tool is
+        # Read-only / lockdown mode: when POWERBI_MCP_READONLY is on, every write tool is
         # refused. Write tools = destructive ops plus the non-destructive creates/commit.
-        self._read_only = os.getenv("POWERBI_MCP_READONLY", "false").lower() == "true"
+        # A value that cannot be read as a boolean turns lockdown ON: a typo must not
+        # silently leave the write tools enabled.
+        self._read_only = _security_env_flag("POWERBI_MCP_READONLY", False, invalid=True)
         # Tools refused in read-only/lockdown mode = anything that mutates a model/report
         # (destructive-hinted) plus the non-destructive creates/commit, plus the tools that
         # WRITE FILES to disk (a data dictionary, a snapshot, an extracted PBIX). Session-only
@@ -157,6 +213,15 @@ class PowerBIMCPServer:
                "batch_create_measures"}
             | {"export_data_dictionary", "model_snapshot", "pbix_extract", "bridge_screenshot"}
         )
+        # Every tool that is not annotated read-only is refused in lockdown unless it is one of
+        # these session-scoped tools, which change no model, report or file. A new write tool is
+        # therefore gated by default instead of depending on someone remembering to list it.
+        session_only = {"desktop_connect", "desktop_set_rls_role", "tom_begin_transaction",
+                        "tom_rollback_transaction"}
+        # These three stay available in lockdown and refuse only their own write option.
+        session_only |= {"generate_measure_suite", "build_js_app_measure", "cross_workspace_lineage"}
+        self._write_tools |= {n for n, a in self._tool_annotations.items()
+                              if not a.readOnlyHint and n not in session_only}
         # generate_measure_suite is generation-only by default; its write targets
         # (target="pbip"/"live") are refused inside the handler when read-only.
 
@@ -284,7 +349,7 @@ class PowerBIMCPServer:
             "pbip_rename_measures": lambda a: self._handle_pbip_rename_measures(a),
             # PBIP repair
             "pbip_fix_broken_visuals": lambda a: self._handle_pbip_fix_broken_visuals(a),
-            "pbip_fix_dax_quoting": lambda a: self._handle_pbip_fix_dax_quoting(),
+            "pbip_fix_dax_quoting": lambda a: self._handle_pbip_fix_dax_quoting(a),
             "pbip_scan_broken_refs": lambda a: self._handle_pbip_scan_broken_refs(),
             "pbip_validate": lambda a: self._handle_pbip_validate(),
             # PBIR report authoring (preview)
@@ -347,6 +412,15 @@ class PowerBIMCPServer:
             "bridge_manifest": lambda a: self._handle_bridge_manifest(a),
             "bridge_screenshot": lambda a: self._handle_bridge_screenshot(a),
             "bridge_reload": lambda a: self._handle_bridge_reload(a),
+            # Report as code (Wave 7): the gallery build pipeline as tools
+            "pbip_stage_publish": lambda a: self._handle_pbip_stage_publish(a),
+            "pbir_apply_spec": lambda a: self._handle_pbir_apply_spec(a),
+            "generate_payload_measure": lambda a: self._handle_generate_payload_measure(a),
+            "generate_html_measure": lambda a: self._handle_generate_html_measure(a),
+            "build_js_app_measure": lambda a: self._handle_build_js_app_measure(a),
+            "pbip_embed_data": lambda a: self._handle_pbip_embed_data(a),
+            "audit_report_design": lambda a: self._handle_audit_report_design(a),
+            "pbip_undo": lambda a: self._handle_pbip_undo(a),
         }
 
     def _build_tool_annotations(self):
@@ -365,6 +439,8 @@ class PowerBIMCPServer:
         cloud_read = ann(True, open_world=True)
         local_state = ann(False, destructive=False, idempotent=True, open_world=False)
         local_destructive = ann(False, destructive=True, open_world=False)
+        # Writes new files on disk without altering a model or an existing report.
+        local_file_writer = ann(False, destructive=False, idempotent=True, open_world=False)
         return {
             # Desktop reads (local)
             "desktop_discover_instances": local_read,
@@ -434,7 +510,8 @@ class PowerBIMCPServer:
             "run_dax_tests": local_read,
             "verify_audit_integrity": local_read,
             # Governance-ops fleet (Wave 3) - read-only, cloud/admin
-            "cross_workspace_lineage": cloud_read,
+            # reads the tenant; can also write a cache file on request (refused in read-only mode)
+            "cross_workspace_lineage": ann(False, destructive=False, idempotent=True, open_world=True),
             "fleet_refresh_monitor": cloud_read,
             "usage_and_orphan_analytics": cloud_read,
             # Relationship management (Bundle D) - mutate the live model
@@ -466,14 +543,22 @@ class PowerBIMCPServer:
             "bridge_manifest": local_read,
             "bridge_screenshot": ann(False, destructive=False, idempotent=True, open_world=False),  # writes PNGs
             "bridge_reload": local_destructive,  # can discard unsaved Desktop changes (guarded)
+            # Report as code (Wave 7)
+            "pbip_stage_publish": local_file_writer,  # writes a staged copy; the source is untouched
+            "pbir_apply_spec": local_destructive,  # writes report files; prune removes managed ones
+            "generate_payload_measure": ann(True, open_world=False),  # generates DAX + a JavaScript parser; writes nothing
+            "generate_html_measure": ann(True, open_world=False),  # generates DAX; writes nothing
+            "build_js_app_measure": ann(False, destructive=False, idempotent=True, open_world=False),  # can write measures (target='pbip'); refused in the handler when read-only
+            "pbip_embed_data": local_destructive,  # rewrites partition sources (dry_run by default)
+            "audit_report_design": local_read,  # reads report files only
+            "pbip_undo": local_destructive,  # restores files changed by the last rename or repair
         }
 
     def _setup_handlers(self):
         """Set up MCP tool handlers"""
 
-        @self.server.list_tools()
-        async def handle_list_tools() -> List[Tool]:
-            """Return list of available tools"""
+        def build_tools() -> List[Tool]:
+            """Every tool this server exposes, with its schemas and safety annotations."""
             tools = [
                 # === DESKTOP TOOLS ===
                 Tool(
@@ -990,7 +1075,8 @@ class PowerBIMCPServer:
                                     "type": "object",
                                     "properties": {
                                         "old_name": {"type": "string", "description": "Current measure name"},
-                                        "new_name": {"type": "string", "description": "New measure name"}
+                                        "new_name": {"type": "string", "description": "New measure name"},
+                                        "table_name": {"type": "string", "description": "Optional: the measure's home table, when the name alone is ambiguous"}
                                     },
                                     "required": ["old_name", "new_name"]
                                 }
@@ -1020,10 +1106,12 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="pbip_fix_dax_quoting",
-                    description="Fix all DAX expressions by properly quoting table names with spaces. Fixes: Leads Sales Data[Amount] -> 'Leads Sales Data'[Amount]",
+                    description="Fix DAX expressions by quoting table names that need it: Leads Sales Data[Amount] -> 'Leads Sales Data'[Amount]. DAX only (Power Query is not touched); every file is fixed or none. Use dry_run=true to see what would change.",
                     inputSchema={
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "dry_run": {"type": "boolean", "default": False, "description": "Report what would change without writing"}
+                        },
                         "required": []
                     }
                 ),
@@ -1103,7 +1191,8 @@ class PowerBIMCPServer:
                         "type": "object",
                         "properties": {
                             "dax": {"type": "string", "description": "A full DAX query (EVALUATE/DEFINE...) or a scalar measure expression to validate"},
-                            "as_measure": {"type": "boolean", "description": "Treat 'dax' as a scalar measure expression (wraps it in EVALUATE ROW for validation). Default false.", "default": False},
+                            "as_measure": {"type": "boolean", "description": "Treat 'dax' as a scalar measure expression rather than a query. Default false.", "default": False},
+                            "table_name": {"type": "string", "description": "With as_measure: the table that will host the measure. When given, the expression is validated as a real query-scoped measure (DEFINE MEASURE), which is stricter than the default."},
                             "source": {"type": "string", "enum": ["desktop", "cloud"], "description": "Validate against Desktop (local) or cloud. Default 'desktop'.", "default": "desktop"},
                             "workspace_name": {"type": "string", "description": "Cloud only: workspace name"},
                             "dataset_name": {"type": "string", "description": "Cloud only: dataset name"}
@@ -1282,7 +1371,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="dax_suggest_rewrite",
-                    description="For the auto-fixable DAX anti-patterns (bare '/' -> DIVIDE, FILTER(whole table) -> boolean filter, SUMMARIZE-aggregation -> SUMMARIZECOLUMNS), return concrete before/after rewrite hints for a raw expression or a named measure. Pair with validate_dax to confirm the rewrite is still valid.",
+                    description="Rewrite help for DAX anti-patterns, for a raw expression or a named measure. Bare '/' division is rewritten mechanically to DIVIDE(a, b) and the whole rewritten expression is returned (kind 'rewrite' / 'expression'). FILTER-over-a-whole-table and SUMMARIZE-with-aggregation need a judgement call, so they come back as before/after templates (kind 'template'), not as edits of your text. Run validate_dax on the result before saving it.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -1339,7 +1428,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="audit_naming",
-                    description="Audit naming conventions across the connected model's tables, columns, and measures and return a rename PLAN (old -> new with reasons): snake_case/camelCase to spaced Title Case, strip warehouse DIM_/FACT_ prefixes, trim whitespace, optionally expand abbreviations. Apply the plan with the rename tools (batch_rename_* live, or pbip_rename_* for model + report).",
+                    description="Audit naming conventions across the connected model's tables, columns, and measures and return a rename PLAN (old -> new with reasons): snake_case/camelCase to spaced Title Case, strip warehouse DIM_/FACT_ prefixes, trim whitespace, optionally expand abbreviations. Suggestions that would collide with an existing or another suggested name are flagged (safe=false). Apply the safe ones with the pbip_rename_* tools, which update the model and the report together.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -1348,6 +1437,8 @@ class PowerBIMCPServer:
                             "target_case": {"type": "string", "enum": ["title", "none"], "default": "title"},
                             "strip_warehouse_prefixes": {"type": "boolean", "default": True},
                             "expand_abbreviations": {"type": "boolean", "default": False},
+                            "acronyms": {"type": "array", "items": {"type": "string"}, "description": "Words to keep in capitals (e.g. ['AOP', 'EBITDA']); added to the built-in list"},
+                            "replace_acronyms": {"type": "boolean", "default": False, "description": "Use only the given acronyms instead of adding them to the built-in list"},
                             "workspace_name": {"type": "string"},
                             "dataset_name": {"type": "string"}
                         },
@@ -1390,7 +1481,8 @@ class PowerBIMCPServer:
                         "properties": {
                             "path": {"type": "string", "description": "Path to the .pbix file"},
                             "dest": {"type": "string", "description": "Destination folder to extract into"},
-                            "decode_layout": {"type": "boolean", "default": True, "description": "Also write a decoded Report/Layout.json"}
+                            "decode_layout": {"type": "boolean", "default": True, "description": "Also write a decoded Report/Layout.json"},
+                            "max_bytes": {"type": "integer", "description": "Refuse a package whose extracted size exceeds this (default 8 GiB)"}
                         },
                         "required": ["path", "dest"]
                     },
@@ -1461,7 +1553,11 @@ class PowerBIMCPServer:
                             "column": {"type": "string", "description": "Numeric column as Table.Column (column_stats)"},
                             "stats": {"type": "array", "items": {"type": "string"}, "description": "Stats subset: sum/avg/min/max/median/distinct"},
                             "display_folder": {"type": "string"},
-                            "base_format": {"type": "string", "description": "Base measure's format string, inherited by non-percent variants"},
+                            "base_format": {"type": "string", "description": "Base measure's format string, inherited by non-percent variants (default: read from the connected model)"},
+                            "fiscal_year_end": {"type": "string", "description": "time_intelligence: fiscal year end as MM-DD (e.g. '06-30') for YTD/QTD"},
+                            "sort_by_columns": {"type": "object", "description": "ratios/ranking: {'Table.Column': 'Table.SortColumn'} so the share and rank also clear the sort-by column (default: read from the connected model)"},
+                            "include_all_selected": {"type": "boolean", "default": True, "description": "ratios/ranking: also emit the ALLSELECTED variant that respects slicers"},
+                            "column_format": {"type": "string", "description": "column_stats: format string for the generated measures"},
                             "target": {"type": "string", "enum": ["none", "pbip", "live"], "default": "none"},
                             "table": {"type": "string", "description": "Table to host the measures (required for target pbip/live)"},
                             "skip_validation": {"type": "boolean", "default": False, "description": "target='live' only: skip the per-expression validation probe"}
@@ -1540,7 +1636,7 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="pbip_add_measures",
-                    description="Bulk-add measures OFFLINE into a loaded PBIP project's TMDL (no Power BI needed): each measure is appended to the target table's .tmdl with formatString, displayFolder, and description. The batch is linted (dax_lint) and checked for name collisions first; writes are atomic with backup. Close Power BI Desktop before editing, then reopen.",
+                    description="Bulk-add measures OFFLINE into a loaded PBIP project's TMDL (no Power BI needed): each measure is written to the target table's .tmdl with formatString, displayFolder, and description. The batch is linted (dax_lint) and checked for name collisions first, and the write is atomic. mode='add' refuses a name that already exists; mode='upsert' replaces a same-named measure of that table in place (keeping its lineageTag) and gives new measures a deterministic tag, so re-running a build leaves the file byte-identical.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -1552,6 +1648,7 @@ class PowerBIMCPServer:
                                 "description": {"type": "string"},
                                 "display_folder": {"type": "string"}
                             }, "required": ["name", "expression"]}},
+                            "mode": {"type": "string", "enum": ["add", "upsert"], "default": "add", "description": "add = refuse existing names; upsert = replace a same-named measure of this table in place (idempotent rebuilds)"},
                             "skip_lint": {"type": "boolean", "default": False}
                         },
                         "required": ["table", "measures"]
@@ -1560,6 +1657,7 @@ class PowerBIMCPServer:
                         "type": "object",
                         "properties": {
                             "created": {"type": "array"},
+                            "updated": {"type": "array"},
                             "path": {"type": "string"}
                         }
                     }
@@ -1854,8 +1952,11 @@ class PowerBIMCPServer:
                         "type": "object",
                         "properties": {
                             "dataset_name": {"type": "string", "description": "Optional: focus lineage on this dataset (downstream reports)"},
-                            "workspace_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit workspace GUIDs (default: up to 100 tenant workspaces)"},
-                            "cache_path": {"type": "string", "description": "Optional path to read/write the scan result for reuse"},
+                            "workspace_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit workspace GUIDs (default: every workspace the admin API lists, up to max_workspaces)"},
+                            "max_workspaces": {"type": "integer", "default": 500, "description": "Upper bound on workspaces scanned in one call (scanned 100 per scan). The output says so when the tenant has more."},
+                            "max_wait_seconds": {"type": "number", "default": 240, "description": "How long to wait for the scans before returning their ids for a later resume"},
+                            "scan_ids": {"type": "array", "items": {"type": "string"}, "description": "Resume: scan ids returned by an earlier call that timed out (no new scan is started)"},
+                            "cache_path": {"type": "string", "description": "Optional path to read/write the scan result for reuse (not written in read-only mode)"},
                             "use_cache": {"type": "boolean", "default": True}
                         },
                         "required": []
@@ -1883,6 +1984,275 @@ class PowerBIMCPServer:
                         },
                         "required": []
                     }
+                ),
+                # === REPORT AS CODE (Wave 7): publish staging ===
+                Tool(
+                    name="pbip_stage_publish",
+                    description="Stage a PBIP report (and optionally its model) for publishing IN PLACE: copies the report into a stage folder with definition.pbir rebound from the local model path to a published semantic model (byConnection), drops local caches, and returns the one Fabric CLI command that imports it. Importing over an existing report keeps its id, so shared and public links keep working. Offline: never contacts the service and never changes the source project. Uses the loaded PBIP project unless report_dir is given.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "stage_dir": {"type": "string", "description": "Folder to stage into (must be outside the project)"},
+                            "workspace": {"type": "string", "description": "Workspace name that holds the published model"},
+                            "model_name": {"type": "string", "description": "Published semantic model name"},
+                            "model_id": {"type": "string", "description": "Published semantic model GUID"},
+                            "display_name": {"type": "string", "description": "Name of the report item to import over (default: the local report name)"},
+                            "report_dir": {"type": "string", "description": "A *.Report folder (default: the loaded project's report)"},
+                            "include_model": {"type": "boolean", "default": False, "description": "Also stage the semantic model definition and report whether the service could refresh it"},
+                            "model_dir": {"type": "string", "description": "A *.SemanticModel folder (default: the loaded project's model)"},
+                            "overwrite": {"type": "boolean", "default": False, "description": "Replace a previously staged folder of the same name"}
+                        },
+                        "required": ["stage_dir", "workspace", "model_name", "model_id"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "report": {"type": "object"},
+                            "model": {"type": ["object", "null"]},
+                            "error": {"type": ["string", "null"]}
+                        }
+                    }
+                ),
+                Tool(
+                    name="pbir_apply_spec",
+                    description=(
+                        "Report as code: build or update the loaded PBIP report from ONE declarative JSON spec "
+                        "(theme, pages, visuals, text, shapes, images, navigation buttons, slicers with sync, "
+                        "HTML Content and Deneb visuals, private custom visuals, hidden pop-ups with open/close "
+                        "bookmarks, and elements shared across pages). Idempotent: every page and element has a "
+                        "stable name, so re-applying updates in place and an unchanged spec rewrites nothing. "
+                        "All-or-nothing: the whole spec is validated (names, layout, navigation targets, and "
+                        "every field against the model) before any file is written. Pages and visuals the spec "
+                        "did not create are never touched. Use dry_run=true first to see the plan. "
+                        "Spec keys: theme, custom_visuals, page_defaults, pages[{name, display_name, width, "
+                        "height, background, elements[], popups[]}], shared[{name, pages, elements[], popups[]}], "
+                        "bookmarks[], page_order, active_page. Element: {name, type, x, y, width, height, ...} "
+                        "with type textbox | shape | image | button | slicer | html | deneb | visual | group; a "
+                        "visual takes visual_type and fields {role: 'Table.Field'}; a button takes text and "
+                        "action {type: page | bookmark | back | url | clear_slicers, target}. Fields are "
+                        "'Table.Field' or {measure: 'Table.Name'} / {column: 'Table.Name'}. Full format and an "
+                        "example: docs/REPORT_SPEC.md."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "spec": {"type": "object", "description": "The report spec (see docs/REPORT_SPEC.md)"},
+                            "spec_path": {"type": "string", "description": "Alternative: path to a JSON file holding the spec"},
+                            "dry_run": {"type": "boolean", "default": False, "description": "Validate and return the files that would be written or removed, without touching disk"},
+                            "prune": {"type": "boolean", "default": False, "description": "Also remove pages, elements and bookmarks that an earlier apply created and this spec no longer contains (never anything else)"},
+                            "adopt": {"type": "boolean", "default": False, "description": "Take over existing pages or elements that already use a name from the spec instead of refusing"},
+                            "backup": {"type": "boolean", "default": True, "description": "Back up the project before writing"},
+                            "skip_field_validation": {"type": "boolean", "default": False, "description": "Do not check field references against the model"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "success": {"type": "boolean"},
+                            "written": {"type": "array", "items": {"type": "string"}},
+                            "removed": {"type": "array", "items": {"type": "string"}},
+                            "unchanged": {"type": "integer"},
+                            "warnings": {"type": "array", "items": {"type": "string"}},
+                            "errors": {"type": "array", "items": {"type": "string"}}
+                        }
+                    }
+                ),
+                Tool(
+                    name="generate_payload_measure",
+                    description=(
+                        "DAX as transport: generate a text measure that packs rows at a chosen grain into one "
+                        "string for a JavaScript consumer (an HTML Content app or a custom visual), plus the "
+                        "matching JavaScript parser. The browser then filters and aggregates in memory, so a "
+                        "click inside the visual costs no query, while report slicers still narrow what the "
+                        "measure sends. Numbers are emitted locale-safe (integers through FORMAT(x, \"0\"), "
+                        "decimals as scaled integers, dates as yyyymmdd) and text is escaped for the chosen "
+                        "format. Pass 'fields' for a fact payload, or 'dimensions' for key-to-label lookup tables "
+                        "in one measure. Returns the DAX, the parser and a character-budget estimate (the "
+                        "2,100,000-character ceiling is an empirical figure, not a documented limit). Generation "
+                        "only: save it with pbip_add_measures or create_measure."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Measure name"},
+                            "table": {"type": "string", "description": "Fact payload: the table whose rows (or groups) are packed"},
+                            "fields": {"type": "array", "description": "Fact payload: each 'Column:type' or {column | measure | expression, type, name?, scale?, blank?, aggregate?}; type is int | decimal | date | bool | text", "items": {}},
+                            "dimensions": {"type": "array", "description": "Dimension payload instead of fields: each {table, name?, key, key_type?, labels: [columns], where?, all_rows?}", "items": {"type": "object"}},
+                            "format": {"type": "string", "enum": ["delimited", "json"], "default": "delimited"},
+                            "grain": {"type": "string", "enum": ["rows", "groups"], "description": "rows = one record per table row; groups = one per distinct combination of the column fields (default when a measure field is present)"},
+                            "where": {"type": "string", "description": "Row-level DAX condition on the table, e.g. Sales[Qty] > 0"},
+                            "order_by": {"type": "array", "items": {}, "description": "Field names (or [name, 'ASC'|'DESC']) for a stable record order"},
+                            "record_sep": {"type": "string", "description": "Delimited format: record separator (default ';')"},
+                            "field_sep": {"type": "string", "description": "Delimited format: field separator (default ',' for facts, '^' for dimensions)"},
+                            "expected_rows": {"description": "Row count (facts) or {dimension: rows} to size the payload against the ceiling"},
+                            "display_folder": {"type": "string"}
+                        },
+                        "required": ["name"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "expression": {"type": "string"},
+                            "js_parser": {"type": "string"},
+                            "budget": {"type": "object"},
+                            "notes": {},
+                            "error": {"type": ["string", "null"]}
+                        }
+                    }
+                ),
+                Tool(
+                    name="generate_html_measure",
+                    description=(
+                        "Generate a DAX measure that returns styled HTML for the HTML Content visual (no "
+                        "JavaScript): a KPI card with an optional comparison, a KPI strip, a headline sentence "
+                        "with live numbers, a ranked bar list, or a simple table. Inline CSS only; every value is "
+                        "HTML-escaped inside the DAX; blank-safe. kind = kpi_card (value_measure, label, "
+                        "format_string, comparison_measure, comparison_label, higher_is_better) | kpi_strip "
+                        "(items: [{value_measure, label, format_string, ...}]) | headline (template with {0} {1} "
+                        "placeholders, values: [{measure, format_string} | text]) | bar_list (category "
+                        "'Table.Column', value_measure, top_n, title) | table (category, columns: [{measure, "
+                        "header, format_string}], top_n). Style keys such as font_family, text_colour, accent, "
+                        "background apply to every kind. Generation only: save it with pbip_add_measures or "
+                        "create_measure, then bind it with an 'html' element in pbir_apply_spec."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["kpi_card", "kpi_strip", "headline", "bar_list", "table"]},
+                            "name": {"type": "string", "description": "Measure name (a default is derived when omitted)"},
+                            "params": {"type": "object", "description": "The parameters for that kind (see the description)"}
+                        },
+                        "required": ["kind"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "dax": {"type": "string"},
+                            "expression": {"type": "string"},
+                            "notes": {},
+                            "error": {"type": ["string", "null"]}
+                        }
+                    }
+                ),
+                Tool(
+                    name="build_js_app_measure",
+                    description=(
+                        "A JavaScript app inside a DAX measure: assemble CSS and ordered JavaScript modules into "
+                        "three measures for the HTML Content visual: '<Prefix> Styles' and '<Prefix> Runtime' "
+                        "(constants) and '<Prefix>' (the document: style, a stage element and one script that "
+                        "sets the payload globals, then runs the runtime; an empty-state message when the "
+                        "payload is blank). Modules share one function scope and define main(app); a persistent "
+                        "window singleton and keyed listeners make re-evaluation in the reused iframe safe. The "
+                        "build strips comments and whitespace with a minifier that understands strings, template "
+                        "literals and regex literals, refuses sources that cannot be shipped (</script, control "
+                        "characters), checks syntax with Node when it is installed, and reports each measure's "
+                        "size against the ceiling. Pair with generate_payload_measure for the data. "
+                        "target='none' returns sizes and warnings; target='pbip' writes the measures into the "
+                        "loaded project (idempotent upsert)."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "prefix": {"type": "string", "description": "Measure name stem; the document measure is the prefix itself"},
+                            "css": {"type": "string", "description": "Stylesheet source"},
+                            "css_path": {"type": "string", "description": "Alternative: path to a .css file"},
+                            "js_modules": {"type": "array", "description": "Ordered modules: [{name, source}]", "items": {"type": "object"}},
+                            "js_dir": {"type": "string", "description": "Alternative: a folder whose .js files are taken in file-name order"},
+                            "payload_measures": {"type": "array", "description": "[{measure, global, embed_as?: string | json | text, required?}]: each measure is assigned to that JavaScript global before the runtime runs", "items": {"type": "object"}},
+                            "root_id": {"type": "string", "default": "app-root"},
+                            "empty_message": {"type": "string"},
+                            "minify": {"type": "boolean", "default": True},
+                            "display_folder": {"type": "string"},
+                            "target": {"type": "string", "enum": ["none", "pbip"], "default": "none"},
+                            "table": {"type": "string", "description": "target='pbip': table that hosts the measures"},
+                            "return_expressions": {"type": "boolean", "default": False, "description": "Include the full measure expressions in the result (they can exceed 100 KB)"}
+                        },
+                        "required": ["prefix"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "measures": {"type": "array"},
+                            "sizes": {"type": "object"},
+                            "warnings": {"type": "array"},
+                            "node_check": {"type": "string"},
+                            "written": {"type": "boolean"},
+                            "error": {"type": ["string", "null"]}
+                        }
+                    }
+                ),
+                Tool(
+                    name="pbip_embed_data",
+                    description=(
+                        "Make the loaded PBIP model self-contained: replace the query of each named table with "
+                        "its CSV data embedded in the partition (deflate + base64 inside the M expression), so "
+                        "the model can be published and refreshed in the service with no local files, no "
+                        "credentials and no gateway. Suited to small static or demo data. Column types come from "
+                        "the model; the CSV header must use the table's source column names. A folder parameter "
+                        "that nothing references any more is removed. DRY RUN BY DEFAULT: it reports sizes and "
+                        "what would change; pass dry_run=false to write (all tables together or none)."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "tables": {"type": "object", "description": "{table name: path of a UTF-8 CSV file}", "additionalProperties": {"type": "string"}},
+                            "dry_run": {"type": "boolean", "default": True},
+                            "max_bytes": {"type": "integer", "description": "Largest CSV accepted per table (default 8 MiB)"},
+                            "delimiter": {"type": "string", "default": ","},
+                            "backup": {"type": "boolean", "default": True, "description": "Back up the project before writing"}
+                        },
+                        "required": ["tables"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "success": {"type": "boolean"},
+                            "dry_run": {"type": "boolean"},
+                            "tables": {"type": "array"},
+                            "self_contained": {"type": "boolean"},
+                            "changed_files": {"type": "array"},
+                            "error": {"type": ["string", "null"]}
+                        }
+                    }
+                ),
+                Tool(
+                    name="audit_report_design",
+                    description=(
+                        "Best Practice Analyzer for the REPORT layer: audit the loaded PBIP report (or report_dir) "
+                        "without changing it. Structure: unparseable JSON, byte order marks, folder and name "
+                        "mismatches, pages.json consistency, custom visuals used but not registered, visuals "
+                        "outside the page, misplaced properties, mixed schema versions, fields missing from the "
+                        "model. Design: overlapping data visuals, crowded pages, missing alt text and titles, "
+                        "tiny elements, inconsistent page sizes, hidden pages nothing navigates to, the same "
+                        "field sliced on several pages without a sync group, buttons and bookmarks pointing at "
+                        "missing targets, hard-coded colours that bypass the theme. Governance notes: private "
+                        "(uncertified) custom visuals and script-capable HTML visuals a tenant admin may block."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "report_dir": {"type": "string", "description": "A *.Report folder or its definition folder (default: the loaded project's report)"},
+                            "min_severity": {"type": "string", "enum": ["info", "warning", "error"], "default": "info"},
+                            "max_data_visuals_per_page": {"type": "integer", "default": 12},
+                            "max_visuals_per_page": {"type": "integer", "default": 40}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "summary": {"type": "object"},
+                            "findings": {"type": "array"},
+                            "error": {"type": ["string", "null"]}
+                        }
+                    }
+                ),
+                Tool(
+                    name="pbip_undo",
+                    description="Undo the last committed pbip_rename_* / pbip_fix_* change on the loaded PBIP project by restoring every file it changed to its previous bytes. One level of undo, for this session only.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
                 )
             ]
             # Attach MCP safety/behavior hints from the annotations registry.
@@ -1892,51 +2262,65 @@ class PowerBIMCPServer:
                     t.annotations = annotations
             return tools
 
+        self._tools = build_tools()
+        # Tools that declare an outputSchema must always return structuredContent, including
+        # on refusal and on an unexpected error, or the SDK rejects the result.
+        self._structured_tools = {t.name for t in self._tools if t.outputSchema}
+
+        @self.server.list_tools()
+        async def handle_list_tools() -> List[Tool]:
+            return self._tools
+
         @self.server.call_tool()
-        async def handle_call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> List[TextContent]:
-            """Handle tool calls"""
+        async def handle_call_tool(name: str, arguments: Optional[Dict[str, Any]]):
+            """Request boundary for every tool call: read-only gate, dispatch, then secret
+            redaction of whatever the handler returned (text and structured content alike), so a
+            handler that passes an exception message through cannot leak a credential."""
             try:
                 args = arguments or {}
                 logger.info(f"Tool called: {name}")
                 # Arguments can carry DAX (with PII literals) or secrets; only log at DEBUG, redacted.
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"Tool args ({name}): "
-                        f"{redact_secrets(json.dumps(args, default=str), [self.client_secret])}"
-                    )
+                    logger.debug(f"Tool args ({name}): {self._redact(json.dumps(args, default=str))}")
 
                 handler = self._tool_dispatch.get(name)
                 if handler is None:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
                 if self._read_only and name in self._write_tools:
-                    # Return a structured payload too: tools that declare an outputSchema must
-                    # produce structuredContent or the SDK rejects the (refusal) result.
                     return [TextContent(type="text", text=(
                         f"Refused: '{name}' is a write operation and the server is running in "
                         "READ-ONLY mode. Unset POWERBI_MCP_READONLY to allow model/report changes."
                     ))], {"error": "read_only_mode", "refused": True}
 
-                result = await handler(args)
-                # Handlers return either a plain string (text only) or a
-                # (text, structured_dict) tuple for tools that declare an outputSchema.
-                # The MCP SDK puts the dict in structuredContent for typed, chainable results.
-                # Defense in depth: redact connection-string secrets from the text at the
-                # boundary, so a handler that swallows an exception and returns its raw message
-                # cannot leak the service-principal secret to the model.
+                annotations = self._tool_annotations.get(name)
+                try:
+                    result = await handler(args)
+                finally:
+                    if annotations is None or not annotations.readOnlyHint:
+                        self._metadata_cache.clear()  # the model or connection may have changed
+
+                # Handlers return a plain string, or (text, structured_dict) for tools that
+                # declare an outputSchema; the SDK puts the dict in structuredContent.
                 if isinstance(result, tuple) and len(result) == 2:
                     text, structured = result
-                    if isinstance(text, str):
-                        text = redact_secrets(text, [self.client_secret])
-                    return [TextContent(type="text", text=text)], structured
-                if isinstance(result, str):
-                    result = redact_secrets(result, [self.client_secret])
-                return [TextContent(type="text", text=result)]
+                    return ([TextContent(type="text", text=self._redact(text))],
+                            self._redact_structure(structured))
+                text = self._redact(result)
+                if name in self._structured_tools:
+                    return [TextContent(type="text", text=text)], {"error": text}
+                return [TextContent(type="text", text=text)]
 
             except Exception as e:
-                safe_err = redact_secrets(str(e), [self.client_secret])
-                logger.error(f"Error executing {name}: {safe_err}", exc_info=True)
-                return [TextContent(type="text", text=f"Error executing {name}: {safe_err}")]
+                safe_err = self._redact(str(e))
+                logger.error(f"Error executing {name}: {safe_err}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    import traceback
+                    logger.debug(self._redact(traceback.format_exc()))
+                message = f"Error executing {name}: {safe_err}"
+                if name in self._structured_tools:
+                    return [TextContent(type="text", text=message)], {"error": safe_err}
+                return [TextContent(type="text", text=message)]
 
         # ---------- MCP Resources: model context without spending a tool call ----------
         @self.server.list_resources()
@@ -1979,7 +2363,7 @@ class PowerBIMCPServer:
 
         @self.server.read_resource()
         async def handle_read_resource(uri):
-            return await self._read_resource(str(uri))
+            return self._redact(await self._read_resource(str(uri)))
 
         # ---------- MCP Prompts: reusable guided BI workflows ----------
         @self.server.list_prompts()
@@ -2005,6 +2389,138 @@ class PowerBIMCPServer:
         @self.server.completion()
         async def handle_completion(ref, argument, context):
             return await self._complete_argument(argument)
+
+    # ==================== BOUNDARY HELPERS ====================
+
+    def _redact(self, text: Any) -> str:
+        """Secret-redacted text for anything that leaves the process (responses and logs)."""
+        return redact_secrets(text, [self.client_secret])
+
+    def _redact_structure(self, obj: Any) -> Any:
+        """Redact secrets inside structured content: every string at any depth, and any value
+        stored under a credential-named key."""
+        return security_redact_structure(obj, [self.client_secret])
+
+    async def _measure_definitions(self, query: str, source: str, workspace=None, dataset=None) -> Dict[str, str]:
+        """Measure name -> DAX for the connected model, so the policy check can see through a
+        measure that wraps a protected column. Only read when the query uses an unqualified
+        [Name] at all (a query without one cannot call a measure); empty when the model cannot
+        be read, in which case measures are judged by name only."""
+        if not any(r.kind == "bare" for r in dax_tokens.references(query)):
+            return {}
+        try:
+            model, err = await self._gather_model_metadata(source, workspace, dataset)
+        except Exception as e:
+            logger.warning(f"Could not read measure definitions for the policy check: {self._redact(str(e))}")
+            return {}
+        if err or not model:
+            return {}
+        return {m["name"]: m.get("expression") or ""
+                for t in model.get("tables", []) for m in t.get("measures", []) if m.get("name")}
+
+    async def _run_guarded_query(self, query: str, *, tool: str, source: str = "desktop",
+                                 workspace: Optional[str] = None, dataset: Optional[str] = None,
+                                 max_rows: int = 1000, run=None):
+        """Run a DAX query on behalf of a tool and return (rows, report, error).
+
+        Every tool that executes caller-supplied DAX goes through here, not only the two
+        execute tools: the text must be a DAX query (never TMSL or XMLA), it must pass the
+        access policy (which sees through aliases and through measures), and the rows that come
+        back are filtered by the same column policies and PII masking and written to the audit
+        log. ``error`` is a message for the caller when the query was refused or failed; in that
+        case ``rows`` is empty.
+
+        ``run`` overrides how the query is executed (a callable taking the query text); by
+        default the Desktop or XMLA connector for ``source`` is used.
+        """
+        try:
+            dax_tokens.ensure_query(query)
+        except dax_tokens.NonQueryStatementError as e:
+            self.security.log_policy_violation(policy_name="statement_guard", violation_type=str(e),
+                                               query=query, tool=tool)
+            return [], {}, f"Refused: {e}"
+
+        measures = await self._measure_definitions(query, source, workspace, dataset)
+        check = self.security.pre_query_check(query, measure_definitions=measures)
+        if not check.allowed:
+            self.security.log_policy_violation(policy_name="query_policy", violation_type=check.reason,
+                                               query=query, tool=tool)
+            return [], {}, f"Query blocked by security policy: {check.reason}"
+        if check.max_rows and check.max_rows < max_rows:
+            max_rows = check.max_rows
+
+        loop = asyncio.get_event_loop()
+        model_name = dataset
+        port = None
+        if run is None:
+            if (source or "desktop").lower() == "cloud":
+                connector = await loop.run_in_executor(None, self._get_xmla_connector, workspace, dataset)
+                if not connector:
+                    return [], {}, f"Error: could not connect to dataset '{dataset}'"
+                run = lambda q: connector.execute_dax(q, max_rows)  # noqa: E731
+            else:
+                desktop = self._get_desktop_connector()
+                if not desktop.current_port:
+                    return [], {}, "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+                model_name, port = getattr(desktop, "current_model_name", None), desktop.current_port
+                run = lambda q: desktop.execute_dax(q, max_rows)  # noqa: E731
+
+        start = time.time()
+        try:
+            rows = await loop.run_in_executor(None, run, query)
+        except Exception as e:
+            # An engine error can quote data (ERROR(CONCATENATEX(...))): the layer withholds the
+            # text when the query reads a protected column, and redacts secrets otherwise.
+            safe = self.security.safe_error_text(str(e), query=query, measure_definitions=measures,
+                                                 extra_secrets=[self.client_secret])
+            self.security.process_results(results=[], query=query, source=source, model_name=model_name,
+                                          success=False, error_message=safe, measure_definitions=measures,
+                                          tool=tool)
+            return [], {}, f"Error executing DAX: {safe}"
+        duration_ms = (time.time() - start) * 1000
+        truncated = bool(getattr(rows, "truncated", False))
+        rows = list(rows) if isinstance(rows, list) else []
+        if len(rows) > max_rows:
+            truncated = True
+            rows = rows[:max_rows]
+        safe_rows, report = self.security.process_results(
+            results=rows, query=query, source=source, model_name=model_name, port=port,
+            duration_ms=duration_ms, success=True, measure_definitions=measures, tool=tool)
+        report = dict(report or {})
+        if report.get("query_denied"):
+            return [], report, f"Query blocked by security policy: {report.get('denied_reason') or 'denied'}"
+        report.update({"duration_ms": duration_ms, "tool": tool,
+                       "truncated": truncated or bool(report.get("rows_truncated"))})
+        return safe_rows, report, None
+
+    @staticmethod
+    def _first_value(rows: List[Dict[str, Any]]):
+        """First cell of the first row, or None: how the scalar-style tools read a result."""
+        if not rows:
+            return None
+        return next(iter(rows[0].values()), None)
+
+    @staticmethod
+    def _row_limit(requested: Any, default: int, ceiling: int = 100000) -> int:
+        """A sane row cap from a caller-supplied value: default when absent or invalid,
+        never below 1 and never above the hard ceiling that protects memory."""
+        try:
+            value = int(requested) if requested is not None else default
+        except (TypeError, ValueError):
+            value = default
+        return max(1, min(value, ceiling))
+
+    @staticmethod
+    def _render_query_result(rows: List[Dict[str, Any]], report: Dict[str, Any]) -> str:
+        lines = [f"Query returned {len(rows)} row(s)"]
+        if report.get("pii_detected"):
+            lines.append(f"PII detected and masked: {report.get('pii_count', 0)} instance(s) of "
+                         f"{', '.join(report.get('pii_types', []))}")
+        if report.get("columns_blocked"):
+            lines.append(f"Blocked columns: {', '.join(report['columns_blocked'])}")
+        if report.get("truncated"):
+            lines.append(f"(Note: result truncated to the first {len(rows)} rows)")
+        return "\n".join(lines) + "\n\n" + json.dumps(rows, indent=2, default=str)
 
     # ==================== DESKTOP HANDLERS ====================
 
@@ -2159,79 +2675,19 @@ class PowerBIMCPServer:
             return f"Error listing measures: {str(e)}"
 
     async def _handle_desktop_execute_dax(self, args: Dict[str, Any]) -> str:
-        """Execute DAX query on Desktop model with security processing"""
-        try:
-            connector = self._get_desktop_connector()
-            dax_query = args.get("dax_query")
-            max_rows = args.get("max_rows", 100)
-
-            if not connector.current_port:
-                return "Not connected to Power BI Desktop. Use 'desktop_connect' first."
-
-            if not dax_query:
-                return "Error: dax_query is required"
-
-            # Pre-query security check (resolve referenced tables/columns so column policies fire)
-            ref_tables, ref_columns = AccessPolicyEngine.extract_references(dax_query)
-            policy_check = self.security.pre_query_check(
-                dax_query, tables=ref_tables, columns=ref_columns
-            )
-            if not policy_check.allowed:
-                self.security.log_policy_violation(
-                    policy_name="query_policy",
-                    violation_type=policy_check.reason,
-                    query=dax_query
-                )
-                return f"Query blocked by security policy: {policy_check.reason}"
-
-            # Apply max_rows from policy if lower
-            if policy_check.max_rows and policy_check.max_rows < max_rows:
-                max_rows = policy_check.max_rows
-
-            # Execute query with timing
-            start_time = time.time()
-            rows = await asyncio.get_event_loop().run_in_executor(
-                None, connector.execute_dax, dax_query, max_rows
-            )
-            duration_ms = (time.time() - start_time) * 1000
-
-            # Process results through security layer (PII detection, masking, audit)
-            safe_rows, security_report = self.security.process_results(
-                results=rows,
-                query=dax_query,
-                source="desktop",
-                model_name=connector.current_model_name,
-                port=connector.current_port,
-                duration_ms=duration_ms,
-                success=True
-            )
-
-            # Build response
-            result = f"Query returned {len(safe_rows)} row(s)"
-
-            # Add security notices
-            if security_report.get('pii_detected'):
-                result += f"\n⚠️ PII detected and masked: {security_report['pii_count']} instance(s) of {', '.join(security_report['pii_types'])}"
-
-            if security_report.get('columns_blocked'):
-                result += f"\n🚫 Blocked columns: {', '.join(security_report['columns_blocked'])}"
-
-            result += "\n\n"
-            result += json.dumps(safe_rows, indent=2, default=str)
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Desktop execute DAX error: {e}")
-            # Log failed query to audit
-            self.security.process_results(
-                results=[],
-                query=args.get("dax_query", ""),
-                source="desktop",
-                success=False,
-                error_message=str(e)
-            )
-            return f"Error executing DAX: {str(e)}"
+        """Execute a DAX query on the Desktop model (guarded: query-only, policy, PII, audit)."""
+        connector = self._get_desktop_connector()
+        dax_query = args.get("dax_query")
+        if not connector.current_port:
+            return "Not connected to Power BI Desktop. Use 'desktop_connect' first."
+        if not dax_query:
+            return "Error: dax_query is required"
+        rows, report, error = await self._run_guarded_query(
+            dax_query, tool="desktop_execute_dax", source="desktop",
+            max_rows=self._row_limit(args.get("max_rows"), 100))
+        if error:
+            return error
+        return self._render_query_result(rows, report)
 
     async def _handle_desktop_get_model_info(self) -> str:
         """Get comprehensive model info from Desktop"""
@@ -2427,95 +2883,18 @@ class PowerBIMCPServer:
             return f"Error listing columns: {str(e)}"
 
     async def _handle_execute_dax(self, args: Dict[str, Any]) -> str:
-        """Execute DAX on Cloud dataset with security processing"""
-        try:
-            workspace_name = args.get("workspace_name")
-            dataset_name = args.get("dataset_name")
-            dax_query = args.get("dax_query")
-
-            if not all([workspace_name, dataset_name, dax_query]):
-                return "Error: workspace_name, dataset_name, and dax_query are required"
-
-            # Pre-query security check (resolve referenced tables/columns so column policies fire)
-            ref_tables, ref_columns = AccessPolicyEngine.extract_references(dax_query)
-            policy_check = self.security.pre_query_check(
-                dax_query, tables=ref_tables, columns=ref_columns
-            )
-            if not policy_check.allowed:
-                self.security.log_policy_violation(
-                    policy_name="query_policy",
-                    violation_type=policy_check.reason,
-                    query=dax_query
-                )
-                return f"Query blocked by security policy: {policy_check.reason}"
-
-            # Determine a row cap (cloud execute_dax is otherwise unbounded). Honor an explicit
-            # max_rows, clamp to policy, and enforce an absolute ceiling to protect memory.
-            cap = policy_check.max_rows or 10000
-            requested = args.get("max_rows")
-            max_rows = min(requested, cap) if requested else cap
-            max_rows = min(max_rows, 100000)
-
-            connector = await asyncio.get_event_loop().run_in_executor(
-                None, self._get_xmla_connector, workspace_name, dataset_name
-            )
-
-            if not connector:
-                return f"Error: Could not connect to dataset '{dataset_name}'"
-
-            # Execute query with timing
-            start_time = time.time()
-            rows = await asyncio.get_event_loop().run_in_executor(
-                None, connector.execute_dax, dax_query
-            )
-            duration_ms = (time.time() - start_time) * 1000
-
-            # Enforce the row cap (XMLA connector does not cap internally)
-            truncated = False
-            if isinstance(rows, list) and len(rows) > max_rows:
-                rows = rows[:max_rows]
-                truncated = True
-
-            # Process results through security layer
-            safe_rows, security_report = self.security.process_results(
-                results=rows,
-                query=dax_query,
-                source="cloud",
-                model_name=dataset_name,
-                duration_ms=duration_ms,
-                success=True
-            )
-
-            # Build response
-            result = f"Query returned {len(safe_rows)} row(s)"
-
-            # Add security notices
-            if security_report.get('pii_detected'):
-                result += f"\n⚠️ PII detected and masked: {security_report['pii_count']} instance(s) of {', '.join(security_report['pii_types'])}"
-
-            if security_report.get('columns_blocked'):
-                result += f"\n🚫 Blocked columns: {', '.join(security_report['columns_blocked'])}"
-
-            if truncated:
-                result += f"\n(Note: result truncated to the first {max_rows} rows)"
-
-            result += "\n\n"
-            result += json.dumps(safe_rows, indent=2, default=str)
-
-            return result
-
-        except Exception as e:
-            safe = redact_secrets(str(e), [self.client_secret])
-            logger.error(f"Execute DAX error: {safe}")
-            # Log failed query to audit (redacted: a connection-string error can carry the secret)
-            self.security.process_results(
-                results=[],
-                query=args.get("dax_query", ""),
-                source="cloud",
-                success=False,
-                error_message=safe
-            )
-            return f"Error executing DAX: {safe}"
+        """Execute a DAX query on a cloud dataset (guarded: query-only, policy, PII, audit)."""
+        workspace_name = args.get("workspace_name")
+        dataset_name = args.get("dataset_name")
+        dax_query = args.get("dax_query")
+        if not all([workspace_name, dataset_name, dax_query]):
+            return "Error: workspace_name, dataset_name, and dax_query are required"
+        rows, report, error = await self._run_guarded_query(
+            dax_query, tool="execute_dax", source="cloud", workspace=workspace_name,
+            dataset=dataset_name, max_rows=self._row_limit(args.get("max_rows"), 10000))
+        if error:
+            return error
+        return self._render_query_result(rows, report)
 
     async def _handle_get_model_info(self, args: Dict[str, Any]) -> str:
         """Get model info from Cloud dataset using INFO.VIEW functions"""
@@ -2591,43 +2970,57 @@ class PowerBIMCPServer:
         try:
             status = self.security.get_status()
             policy_summary = self.security.get_policy_summary()
+            enabled = status.get("enabled", {})
+            policies = status.get("policies", {}) or {}
+            audit = status.get("audit", {}) or {}
+            on = lambda flag: "Enabled" if flag else "Disabled"  # noqa: E731
 
             result = "=== Power BI MCP Security Status ===\n\n"
-
-            # Enabled features
+            if status.get("locked"):
+                result += ("LOCKED: the access policies could not be loaded, so every query is refused.\n"
+                           f"  Reason: {status.get('config_error')}\n"
+                           "  Fix the policy file (or unset POWERBI_MCP_POLICY_FILE) and restart the server.\n\n")
             result += "--- Features ---\n"
-            enabled = status.get('enabled', {})
-            result += f"  PII Detection:    {'✅ Enabled' if enabled.get('pii_detection') else '❌ Disabled'}\n"
-            result += f"  Audit Logging:    {'✅ Enabled' if enabled.get('audit_logging') else '❌ Disabled'}\n"
-            result += f"  Access Policies:  {'✅ Enabled' if enabled.get('access_policies') else '❌ Disabled'}\n\n"
+            result += f"  PII Detection:    {on(enabled.get('pii_detection'))}\n"
+            result += f"  Audit Logging:    {on(enabled.get('audit_logging'))}\n"
+            result += f"  Access Policies:  {on(enabled.get('access_policies'))}\n"
+            result += f"  Read-only mode:   {on(self._read_only)}\n\n"
 
-            # PII Detection settings
-            if enabled.get('pii_detection'):
-                pii = status.get('pii_detector', {})
+            if enabled.get("pii_detection"):
+                pii = status.get("pii_detector", {})
                 result += "--- PII Detection ---\n"
                 result += f"  Strategy: {pii.get('strategy', 'N/A')}\n"
                 result += f"  Types: {', '.join(pii.get('enabled_types', []))}\n\n"
 
-            # Policy settings
-            if enabled.get('access_policies'):
+            if enabled.get("access_policies"):
                 result += "--- Access Policies ---\n"
-                result += f"  Enabled: {policy_summary.get('enabled', False)}\n"
+                result += f"  {policies.get('message') or 'No status message.'}\n"
                 result += f"  Max rows per query: {policy_summary.get('max_rows', 'N/A')}\n"
-                result += f"  Tables with policies: {len(policy_summary.get('tables_with_policies', []))}\n\n"
+                result += f"  Tables with policies: {len(policy_summary.get('tables_with_policies', []))}\n"
+                if not policies.get("hash_key_persistent"):
+                    result += ("  Hash key: per session (set POWERBI_MCP_HASH_KEY for hashes that stay the "
+                               "same across sessions)\n")
+                result += ("  Note: policies work on query text and result names. They are defence in depth; "
+                           "row-level and object-level security in the model is the real boundary.\n\n")
 
-            # Audit log info
-            if enabled.get('audit_logging'):
-                audit = status.get('audit', {})
+            if enabled.get("audit_logging"):
                 result += "--- Audit Log ---\n"
                 result += f"  Session ID: {audit.get('session_id', 'N/A')}\n"
                 result += f"  Queries logged: {audit.get('query_count', 0)}\n"
                 result += f"  Log file: {audit.get('log_file', 'N/A')}\n"
+                result += (f"  Chain: {'HMAC-SHA256 (keyed)' if audit.get('keyed') else 'SHA-256, no key'}"
+                           f"; query text stored: {audit.get('store_query_text', 'N/A')}\n")
+                if audit.get("healthy") is False or audit.get("write_failures"):
+                    result += (f"  WARNING: {audit.get('write_failures', 0)} audit write(s) failed. "
+                               f"Last error: {audit.get('last_write_error')}\n")
+                if audit.get("rotation_failures"):
+                    result += f"  WARNING: log rotation failed: {audit.get('last_rotation_error')}\n"
 
             return result
 
         except Exception as e:
-            logger.error(f"Security status error: {e}")
-            return f"Error getting security status: {str(e)}"
+            logger.error(f"Security status error: {self._redact(str(e))}")
+            return f"Error getting security status: {self._redact(str(e))}"
 
     async def _handle_security_audit_log(self, args: Dict[str, Any]) -> str:
         """View recent audit log entries"""
@@ -2658,7 +3051,7 @@ class PowerBIMCPServer:
                     pii_info = event.get('pii', {})
 
                     result += f"  Query: {query_info.get('fingerprint', 'N/A')}\n"
-                    result += f"  Rows: {result_info.get('row_count', 0)}, Duration: {result_info.get('duration_ms', 0):.0f}ms\n"
+                    result += f"  Rows: {result_info.get('row_count', 0)}, Duration: {(result_info.get('duration_ms') or 0):.0f}ms\n"
 
                     if pii_info.get('detected'):
                         result += f"  ⚠️ PII: {pii_info.get('count', 0)} instances\n"
@@ -2776,7 +3169,9 @@ class PowerBIMCPServer:
     async def _ensure_tom_connected(self) -> Optional[str]:
         """Ensure TOM connector is connected, returns error message if not"""
         if not PowerBITOMConnector.is_available():
-            return "TOM (Tabular Object Model) is not available. Write operations require Microsoft.AnalysisServices.Tabular.dll."
+            details = getattr(PowerBITOMConnector, "availability_details", None)
+            return ("TOM (Tabular Object Model) is not available. Write operations require "
+                    "Microsoft.AnalysisServices.Tabular.dll." + (f"\n{details()}" if callable(details) else ""))
 
         desktop = self._get_desktop_connector()
         if not desktop.current_port:
@@ -2784,11 +3179,14 @@ class PowerBIMCPServer:
 
         tom = self._get_tom_connector()
         if not tom.model or tom.current_port != desktop.current_port:
-            # Connect TOM to the same port as desktop connector
-            connect_fn = lambda: tom.connect(desktop.current_port)
+            # Connect TOM to the same port as the desktop connector. The connector refuses to
+            # switch instances while a transaction is open or edits are staged.
+            connect_fn = lambda: tom.connect(desktop.current_port)  # noqa: E731
             success = await asyncio.get_event_loop().run_in_executor(None, connect_fn)
             if not success:
-                return "Failed to connect TOM to Power BI Desktop. Write operations may not be supported."
+                reason = getattr(tom, "last_error", None)
+                return ("Failed to connect TOM to Power BI Desktop"
+                        + (f": {self._redact(reason)}" if reason else ". Write operations may not be supported."))
 
         return None
 
@@ -2800,7 +3198,7 @@ class PowerBIMCPServer:
                 return error
 
             renames = args.get("renames", [])
-            auto_save = args.get("auto_save", True)
+            auto_save = bool(args.get("auto_save", True)) and not self._tom_transaction_active
 
             if not renames:
                 return "Error: 'renames' array is required"
@@ -2931,7 +3329,7 @@ class PowerBIMCPServer:
                 return error
 
             renames = args.get("renames", [])
-            auto_save = args.get("auto_save", True)
+            auto_save = bool(args.get("auto_save", True)) and not self._tom_transaction_active
 
             if not renames:
                 return "Error: 'renames' array is required"
@@ -2983,7 +3381,7 @@ class PowerBIMCPServer:
                 return error
 
             renames = args.get("renames", [])
-            auto_save = args.get("auto_save", True)
+            auto_save = bool(args.get("auto_save", True)) and not self._tom_transaction_active
 
             if not renames:
                 return "Error: 'renames' array is required"
@@ -3055,7 +3453,7 @@ class PowerBIMCPServer:
                     )
 
             # Inside an explicit transaction, defer the save until commit.
-            auto_save = args.get("auto_save", not self._tom_transaction_active)
+            auto_save = bool(args.get("auto_save", True)) and not self._tom_transaction_active
 
             tom = self._get_tom_connector()
 
@@ -3082,7 +3480,7 @@ class PowerBIMCPServer:
             return f"Error: {str(e)}"
 
     async def _handle_create_measure(self, args: Dict[str, Any]) -> str:
-        """Handle create measure"""
+        """Create one measure on the live model, validated first."""
         try:
             error = await self._ensure_tom_connected()
             if error:
@@ -3091,52 +3489,44 @@ class PowerBIMCPServer:
             table_name = args.get("table_name")
             measure_name = args.get("measure_name")
             expression = args.get("expression")
-            format_string = args.get("format_string")
-            description = args.get("description")
-
             if not all([table_name, measure_name, expression]):
                 return "Error: table_name, measure_name, and expression are required"
 
-            # Validate-before-commit: probe the expression against the live model first.
+            # Validate-before-commit: compile the expression as a measure on its target table.
             if not bool(args.get("skip_validation", False)):
-                status, verr = await self._validate_via_desktop(expression, as_measure=True)
+                status, verr = await self._validate_via_desktop(expression, as_measure=True, table=table_name)
                 if status is False:
                     return (
                         f"[INVALID] Measure '{measure_name}' was NOT created - the expression failed validation.\n\n"
-                        f"Error: {redact_secrets(verr, [self.client_secret])}\n\n"
+                        f"Error: {self._redact(verr)}\n\n"
                         "Fix the DAX and retry (or pass skip_validation=true to override)."
                     )
 
             tom = self._get_tom_connector()
-
-            # Create measure
-            create_fn = lambda: tom.create_measure(
-                table_name, measure_name, expression,
-                format_string=format_string,
-                description=description
-            )
+            optional = {"format_string": args.get("format_string"), "description": args.get("description")}
+            if args.get("display_folder"):
+                optional["display_folder"] = args["display_folder"]
+            create_fn = lambda: tom.create_measure(table_name, measure_name, expression, **optional)  # noqa: E731
             result = await asyncio.get_event_loop().run_in_executor(None, create_fn)
-
-            if result.success:
-                if self._tom_transaction_active:
-                    return (
-                        f"Measure '{measure_name}' created in table '{table_name}' (PENDING - "
-                        "run tom_commit_transaction to save).\n\nExpression: {expr}".format(expr=expression)
-                    )
-                # Auto-save
-                save_fn = lambda: tom.save_changes()
-                save_result = await asyncio.get_event_loop().run_in_executor(None, save_fn)
-
-                if save_result.success:
-                    return f"Measure '{measure_name}' created successfully in table '{table_name}'.\n\nExpression: {expression}"
-                else:
-                    return f"Measure created but failed to save: {save_result.message}"
-            else:
+            if not result.success:
                 return f"Failed to create measure: {result.message}"
 
+            ok, note = await self._tom_save(tom)
+            if not ok:
+                return f"Measure '{measure_name}' was NOT created: the change could not be saved ({note})."
+            if self._tom_transaction_active:
+                self._tom_pending_measures.append(
+                    {"table": table_name, "name": measure_name, "expression": expression})
+                return (f"Measure '{measure_name}' created in table '{table_name}' (PENDING - "
+                        f"run tom_commit_transaction to save).\n\nExpression: {expression}")
+            return f"Measure '{measure_name}' created successfully in table '{table_name}'.\n\nExpression: {expression}"
+
         except Exception as e:
-            logger.error(f"Create measure error: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"Create measure error: {self._redact(str(e))}")
+            return f"Error: {self._redact(str(e))}"
+
+    _SCAN_POLL_SECONDS = 15.0
+    _SCAN_CHUNK = 100          # the Scanner API accepts at most 100 workspaces per getInfo call
 
     async def _handle_delete_measure(self, args: Dict[str, Any]) -> str:
         """Handle delete measure"""
@@ -3147,33 +3537,25 @@ class PowerBIMCPServer:
 
             measure_name = args.get("measure_name")
             table_name = args.get("table_name")
-
             if not measure_name:
                 return "Error: measure_name is required"
 
             tom = self._get_tom_connector()
-
-            # Delete measure
-            delete_fn = lambda: tom.delete_measure(measure_name, table_name)
+            delete_fn = lambda: tom.delete_measure(measure_name, table_name)  # noqa: E731
             result = await asyncio.get_event_loop().run_in_executor(None, delete_fn)
-
-            if result.success:
-                if self._tom_transaction_active:
-                    return f"Measure '{measure_name}' deleted (PENDING - run tom_commit_transaction to save)."
-                # Auto-save
-                save_fn = lambda: tom.save_changes()
-                save_result = await asyncio.get_event_loop().run_in_executor(None, save_fn)
-
-                if save_result.success:
-                    return f"Measure '{measure_name}' deleted successfully."
-                else:
-                    return f"Measure deleted but failed to save: {save_result.message}"
-            else:
+            if not result.success:
                 return f"Failed to delete measure: {result.message}"
 
+            ok, note = await self._tom_save(tom)
+            if not ok:
+                return f"Measure '{measure_name}' was NOT deleted: the change could not be saved ({note})."
+            self._tom_pending_measures[:] = [m for m in self._tom_pending_measures
+                                             if not dax_tokens.names_equal(m["name"], measure_name)]
+            return f"Measure '{measure_name}' deleted{note or ' successfully'}."
+
         except Exception as e:
-            logger.error(f"Delete measure error: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"Delete measure error: {self._redact(str(e))}")
+            return f"Error: {self._redact(str(e))}"
 
     # ==================== RELATIONSHIPS (Bundle D) ====================
 
@@ -3188,22 +3570,21 @@ class PowerBIMCPServer:
             if not all([ft, fc, tt, tc]):
                 return "Error: from_table, from_column, to_table, and to_column are required"
             tom = self._get_tom_connector()
-            loop = asyncio.get_event_loop()
-            fn = lambda: tom.create_relationship(
+            fn = lambda: tom.create_relationship(  # noqa: E731
                 ft, fc, tt, tc,
                 cardinality=args.get("cardinality", "many_to_one"),
                 cross_filter=args.get("cross_filter", "single"),
                 is_active=args.get("is_active", True),
             )
-            result = await loop.run_in_executor(None, fn)
+            result = await asyncio.get_event_loop().run_in_executor(None, fn)
             if not result.success:
                 return f"Failed to create relationship: {result.message}"
-            if self._tom_transaction_active:
-                return f"{result.message} (PENDING - run tom_commit_transaction to save)."
-            save = await loop.run_in_executor(None, tom.save_changes)
-            return result.message + ("" if getattr(save, "success", False) else f" (save failed: {save.message})")
+            ok, note = await self._tom_save(tom)
+            if not ok:
+                return f"Relationship was NOT created: the change could not be saved ({note})."
+            return f"{result.message}{note}"
         except Exception as e:
-            return f"Error creating relationship: {redact_secrets(str(e), [self.client_secret])}"
+            return f"Error creating relationship: {self._redact(str(e))}"
 
     async def _handle_delete_relationship(self, args: Dict[str, Any]) -> str:
         """Delete a relationship by name or by from/to table[/column] (TOM)."""
@@ -3212,41 +3593,41 @@ class PowerBIMCPServer:
             if error:
                 return error
             tom = self._get_tom_connector()
-            loop = asyncio.get_event_loop()
-            fn = lambda: tom.delete_relationship(
+            fn = lambda: tom.delete_relationship(  # noqa: E731
                 from_table=args.get("from_table"), from_column=args.get("from_column"),
                 to_table=args.get("to_table"), to_column=args.get("to_column"),
                 name=args.get("name"),
             )
-            result = await loop.run_in_executor(None, fn)
+            result = await asyncio.get_event_loop().run_in_executor(None, fn)
             if not result.success:
                 return f"Failed to delete relationship: {result.message}"
-            if self._tom_transaction_active:
-                return f"{result.message} (PENDING - run tom_commit_transaction to save)."
-            save = await loop.run_in_executor(None, tom.save_changes)
-            return result.message + ("" if getattr(save, "success", False) else f" (save failed: {save.message})")
+            ok, note = await self._tom_save(tom)
+            if not ok:
+                return f"Relationship was NOT deleted: the change could not be saved ({note})."
+            return f"{result.message}{note}"
         except Exception as e:
-            return f"Error deleting relationship: {redact_secrets(str(e), [self.client_secret])}"
+            return f"Error deleting relationship: {self._redact(str(e))}"
 
     # ==================== DAX SAFETY LOOP & TRANSACTIONS (Bundle A) ====================
 
-    async def _validate_via_desktop(self, dax: str, as_measure: bool = True):
+    async def _validate_via_desktop(self, dax: str, as_measure: bool = True, table: Optional[str] = None):
         """Validate a DAX expression against the connected Desktop model.
 
-        Returns (status, error) where status is True (valid), False (invalid),
-        or None (could not validate, e.g. Desktop not connected -> caller skips).
+        Returns (status, error): status is True (valid), False (invalid or refused by policy),
+        or None (could not validate, e.g. Desktop not connected, so the caller skips).
+        The probe runs through the guarded query path, so validating an expression cannot be
+        used to read a protected column out through an engine error message. Measures created
+        earlier in an open transaction are defined in the probe, so an expression may refer to
+        them before they are saved.
         """
-        desktop = self._get_desktop_connector()
-        if not desktop.current_port:
-            return None, "Desktop not connected"
-        probe = build_validation_probe(dax, as_measure)
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None, desktop.execute_dax, probe, 1
-            )
+        probe = build_validation_probe(dax, as_measure, table,
+                                       extra_measures=self._tom_pending_measures if as_measure else None)
+        _rows, _report, error = await self._run_guarded_query(probe, tool="validate", max_rows=1)
+        if error is None:
             return True, None
-        except Exception as e:
-            return False, str(e)
+        if error.startswith("Not connected"):
+            return None, "Desktop not connected"
+        return False, error[len("Error executing DAX: "):] if error.startswith("Error executing DAX: ") else error
 
     async def _handle_validate_dax(self, args: Dict[str, Any]):
         """Validate DAX (query or scalar measure expression) without committing.
@@ -3254,39 +3635,30 @@ class PowerBIMCPServer:
         Returns (text, {valid, error, probe}) so agents get a typed result.
         """
         dax = args.get("dax")
-        probe = build_validation_probe(dax or "", bool(args.get("as_measure", False)))
+        probe = build_validation_probe(dax or "", bool(args.get("as_measure", False)), args.get("table_name"))
         if not dax:
             return ("Error: dax is required", {"valid": False, "error": "dax is required", "probe": probe})
         source = (args.get("source") or "desktop").lower()
-        loop = asyncio.get_event_loop()
-        try:
-            if source == "cloud":
-                workspace = args.get("workspace_name")
-                dataset = args.get("dataset_name")
-                if not (workspace and dataset):
-                    msg = "Error: workspace_name and dataset_name are required for cloud validation"
-                    return (msg, {"valid": False, "error": msg, "probe": probe})
-                connector = await loop.run_in_executor(None, self._get_xmla_connector, workspace, dataset)
-                if not connector:
-                    msg = f"Error: could not connect to dataset '{dataset}'"
-                    return (msg, {"valid": False, "error": msg, "probe": probe})
-                await loop.run_in_executor(None, connector.execute_dax, probe)
-            else:
-                desktop = self._get_desktop_connector()
-                if not desktop.current_port:
-                    msg = "Not connected to Power BI Desktop. Use 'desktop_connect' first."
-                    return (msg, {"valid": False, "error": msg, "probe": probe})
-                await loop.run_in_executor(None, desktop.execute_dax, probe, 1)
+        workspace, dataset = args.get("workspace_name"), args.get("dataset_name")
+        if source == "cloud" and not (workspace and dataset):
+            msg = "Error: workspace_name and dataset_name are required for cloud validation"
+            return (msg, {"valid": False, "error": msg, "probe": probe})
+        _rows, _report, error = await self._run_guarded_query(
+            probe, tool="validate_dax", source=source, workspace=workspace, dataset=dataset, max_rows=1)
+        if error is None:
             return (
                 f"[VALID] DAX validated successfully against the model.\n\nProbe executed:\n{probe}",
                 {"valid": True, "error": None, "probe": probe},
             )
-        except Exception as e:
-            msg = redact_secrets(str(e), [self.client_secret])
-            return (
-                f"[INVALID] DAX failed validation.\n\nError:\n{msg}\n\nProbe:\n{probe}",
-                {"valid": False, "error": msg, "probe": probe},
-            )
+        if error.startswith(("Refused:", "Query blocked")):
+            return (f"[BLOCKED] {error}", {"valid": False, "error": error, "probe": probe, "blocked": True})
+        if error.startswith(("Not connected", "Error: could not connect")):
+            return (error, {"valid": False, "error": error, "probe": probe})
+        msg = error[len("Error executing DAX: "):] if error.startswith("Error executing DAX: ") else error
+        return (
+            f"[INVALID] DAX failed validation.\n\nError:\n{msg}\n\nProbe:\n{probe}",
+            {"valid": False, "error": msg, "probe": probe},
+        )
 
     @staticmethod
     def _row_get(row: Dict[str, Any], *names):
@@ -3367,40 +3739,47 @@ class PowerBIMCPServer:
             )
 
     async def _handle_tom_begin_transaction(self) -> str:
-        """Begin a TOM write transaction (defers SaveChanges until commit)."""
+        """Begin a TOM write transaction: live edits are held until commit."""
         error = await self._ensure_tom_connected()
         if error:
             return error
         if self._tom_transaction_active:
             return "A TOM transaction is already open. Commit or roll it back first."
-        self._tom_transaction_active = True
+        tom = self._get_tom_connector()
+        result = await asyncio.get_event_loop().run_in_executor(None, tom.begin_transaction)
+        if not getattr(result, "success", False):
+            return f"Could not start a transaction: {self._redact(getattr(result, 'message', 'unknown error'))}"
+        self._tom_pending_measures.clear()
         return (
-            "TOM transaction started. Subsequent create_measure / delete_measure / "
-            "batch_update_measures edits are deferred until tom_commit_transaction "
-            "(or discarded by tom_rollback_transaction)."
+            "TOM transaction started. Subsequent live model edits (measures, relationships, renames) "
+            "are held until tom_commit_transaction, or discarded by tom_rollback_transaction."
         )
 
     async def _handle_tom_commit_transaction(self) -> str:
-        """Commit pending TOM edits."""
+        """Commit pending TOM edits. A failed commit leaves the transaction open."""
         if not self._tom_transaction_active:
             return "No TOM transaction is open."
         tom = self._get_tom_connector()
-        result = await asyncio.get_event_loop().run_in_executor(None, tom.save_changes)
-        self._tom_transaction_active = False
+        result = await asyncio.get_event_loop().run_in_executor(None, tom.commit_transaction)
+        message = self._redact(getattr(result, "message", "") or "")
         if getattr(result, "success", False):
-            return f"Transaction committed. {getattr(result, 'message', '')}".strip()
-        return f"Commit failed: {getattr(result, 'message', 'unknown error')}"
+            self._tom_pending_measures.clear()
+            return f"Transaction committed. {message}".strip()
+        return (f"Commit failed: {message or 'unknown error'}\n\n"
+                "Nothing was saved and the transaction is still open. Fix the problem and run "
+                "tom_commit_transaction again, or run tom_rollback_transaction to discard the pending edits.")
 
     async def _handle_tom_rollback_transaction(self) -> str:
         """Roll back pending TOM edits."""
         if not self._tom_transaction_active:
             return "No TOM transaction is open."
         tom = self._get_tom_connector()
-        result = await asyncio.get_event_loop().run_in_executor(None, tom.discard_changes)
-        self._tom_transaction_active = False
+        result = await asyncio.get_event_loop().run_in_executor(None, tom.rollback_transaction)
+        message = self._redact(getattr(result, "message", "") or "")
         if getattr(result, "success", False):
-            return f"Transaction rolled back. {getattr(result, 'message', '')}".strip()
-        return f"Rollback failed: {getattr(result, 'message', 'unknown error')}"
+            self._tom_pending_measures.clear()
+            return f"Transaction rolled back. {message}".strip()
+        return f"Rollback failed: {message or 'unknown error'}. The transaction is still open."
 
     # ==================== MODEL ANALYSIS (Bundle B) ====================
 
@@ -3422,11 +3801,31 @@ class PowerBIMCPServer:
             return None, "Not connected to Power BI Desktop. Use 'desktop_connect' first."
         return (lambda q: desktop.execute_dax(q, 100000)), None
 
-    async def _gather_model_metadata(self, source: str, workspace=None, dataset=None):
-        """Build a normalized model dict (for BPA / AI-readiness) via INFO.VIEW.* DAX.
+    _METADATA_TTL_SECONDS = 20.0
 
-        Returns (model_dict, error).
+    async def _gather_model_metadata(self, source: str, workspace=None, dataset=None):
+        """Normalized model dict (tables, columns, measures, relationships). Returns (model, error).
+
+        Results are reused for a few seconds per connection: completion fires on every
+        keystroke and analysis tools are usually called back to back, and each gather costs
+        four metadata queries. The cache is dropped whenever a non-read-only tool runs, and
+        callers get their own copy so one tool cannot alter what the next one sees.
         """
+        import copy
+        desktop = self.desktop_connector
+        key = ((source or "desktop").lower(), workspace, dataset,
+               getattr(desktop, "current_port", None), getattr(desktop, "current_rls_role", None))
+        hit = self._metadata_cache.get(key)
+        if hit and time.time() - hit[0] < self._METADATA_TTL_SECONDS:
+            return copy.deepcopy(hit[1]), None
+        model, err = await self._gather_model_metadata_uncached(source, workspace, dataset)
+        if not err and model is not None:
+            self._metadata_cache[key] = (time.time(), model)
+            return copy.deepcopy(model), None
+        return model, err
+
+    async def _gather_model_metadata_uncached(self, source: str, workspace=None, dataset=None):
+        """Read the model through INFO.VIEW.* DAX. Returns (model_dict, error)."""
         run, err = await self._get_query_runner(source, workspace, dataset)
         if err:
             return None, err
@@ -3454,7 +3853,8 @@ class PowerBIMCPServer:
             if nm is None:
                 continue
             tmap[nm] = {"name": nm, "is_hidden": g(r, "IsHidden"),
-                        "description": g(r, "Description") or "", "columns": [], "measures": []}
+                        "description": g(r, "Description") or "", "data_category": g(r, "DataCategory"),
+                        "columns": [], "measures": []}
         for r in cols_rows:
             tn = g(r, "Table")
             tmap.setdefault(tn, {"name": tn, "is_hidden": False, "description": "", "columns": [], "measures": []})
@@ -3465,7 +3865,7 @@ class PowerBIMCPServer:
                 "summarize_by": g(r, "SummarizeBy"), "sort_by": g(r, "SortByColumn"),
                 "description": g(r, "Description") or "", "display_folder": g(r, "DisplayFolder"),
                 "data_category": g(r, "DataCategory"), "is_calculated": ctype == "calculated",
-                "expression": g(r, "Expression"),
+                "expression": g(r, "Expression"), "format_string": g(r, "FormatString"),
             })
         for r in meas_rows:
             tn = g(r, "Table")
@@ -3573,7 +3973,7 @@ class PowerBIMCPServer:
                 if args.get("measure_name") and not measures:
                     return (f"Measure '{args.get('measure_name')}' not found in the model.",
                             {"error": "measure_not_found", "summary": {"total": 0}, "findings": []})
-            result = dax_lint.lint_measures(measures)
+            result = dax_lint.lint_measures(measures, min_severity=(args.get("min_severity") or "info").lower())
             result["findings"] = [f for f in result["findings"]
                                   if dax_lint.SEVERITY_RANK.get(f["severity"], 0) >= min_rank]
             s = result["summary"]
@@ -3618,7 +4018,9 @@ class PowerBIMCPServer:
                 out += "No auto-fixable anti-patterns detected.\n"
             for h in rewrites[:100]:
                 label = (h.get("object") + ": ") if h.get("object") else ""
-                out += f"--- {label}{h['rule_id']} (line {h['line']}) ---\n"
+                kind = {"rewrite": "rewrite", "expression": "rewritten expression",
+                        "template": "template only"}.get(h.get("kind"), h.get("kind") or "hint")
+                out += f"--- {label}{h['rule_id']} (line {h['line']}) [{kind}] ---\n"
                 out += f"  before: {h['before']}\n  after:  {h['after']}\n  note:   {h['note']}\n\n"
             return (out, {"rewrites": rewrites})
         except Exception as e:
@@ -3658,7 +4060,8 @@ class PowerBIMCPServer:
                 args.get("source") or "desktop", args.get("workspace_name"), args.get("dataset_name"))
             if err:
                 return (f"Error: {err}", {"error": err, "summary": {"total_suggestions": 0}, "plan": []})
-            options = {k: args[k] for k in ("scope", "target_case", "strip_warehouse_prefixes", "expand_abbreviations")
+            options = {k: args[k] for k in ("scope", "target_case", "strip_warehouse_prefixes",
+                                            "expand_abbreviations", "acronyms", "replace_acronyms")
                        if k in args and args[k] is not None}
             result = naming_audit.audit(model, options)
             s = result["summary"]
@@ -3667,13 +4070,19 @@ class PowerBIMCPServer:
             if s.get("by_type"):
                 out += "  (" + ", ".join(f"{k}: {v}" for k, v in s["by_type"].items()) + ")"
             out += f"\nDominant style: {s.get('dominant_style')}  (single style: {s.get('single_style')})\n\n"
+            unsafe = [p for p in result["plan"] if p.get("safe") is False]
             for p in result["plan"][:200]:
                 loc = f"{p['table']}[{p['old']}]" if p.get("table") else p["old"]
-                out += f"  {p['object_type']}: {loc}  ->  '{p['new']}'  ({', '.join(p['reasons'])})\n"
+                mark = "  [DO NOT APPLY AS IS]" if p.get("safe") is False else ""
+                out += f"  {p['object_type']}: {loc}  ->  '{p['new']}'  ({', '.join(p['reasons'])}){mark}\n"
             if not result["plan"]:
                 out += "No naming issues found.\n"
             else:
-                out += "\nApply with the rename tools (pbip_rename_* updates model + report; batch_rename_* is live).\n"
+                if unsafe:
+                    out += (f"\n{len(unsafe)} suggestion(s) collide with another name and are marked; "
+                            "choose different names for those before applying.\n")
+                out += ("\nApply the safe entries with pbip_rename_tables / pbip_rename_columns / "
+                        "pbip_rename_measures, which update the model and the report together.\n")
             return (out, result)
         except Exception as e:
             msg = redact_secrets(str(e), [self.client_secret])
@@ -3703,16 +4112,19 @@ class PowerBIMCPServer:
             path, dest = args.get("path"), args.get("dest")
             if not path or not dest:
                 return ("Error: 'path' and 'dest' are required.", {"error": "path_and_dest_required"})
-            result = pbix_tools.extract(path, dest, decode_layout=args.get("decode_layout", True))
+            options = {"decode_layout": args.get("decode_layout", True)}
+            if args.get("max_bytes"):
+                options["max_bytes"] = int(args["max_bytes"])
+            result = pbix_tools.extract(path, dest, **options)
             out = f"=== Extracted {result['file_count']} file(s) to {result['dest']} ===\n"
-            if result["layout_decoded"]:
+            if result.get("layout_decoded"):
                 out += "Decoded legacy layout to Report/Layout.json\n"
             out += "\n" + "\n".join(f"  {f}" for f in result["files"][:50])
             if result["file_count"] > 50:
                 out += f"\n  ... and {result['file_count'] - 50} more"
             return (out, result)
         except Exception as e:
-            msg = redact_secrets(str(e), [self.client_secret])
+            msg = self._redact(str(e))
             return (f"Error extracting PBIX: {msg}", {"error": msg})
 
     async def _handle_bpa_validate_rules(self, args: Dict[str, Any]):
@@ -3812,24 +4224,28 @@ class PowerBIMCPServer:
         if kind in ("time_intelligence", "time", "ti"):
             kw = {"base_measure": args.get("base_measure"), "date_column": args.get("date_column"),
                   "variants": args.get("variants"), "display_folder": args.get("display_folder"),
-                  "base_format": args.get("base_format")}
+                  "base_format": args.get("base_format"), "fiscal_year_end": args.get("fiscal_year_end")}
             if not kw["base_measure"] or not kw["date_column"]:
                 raise ValueError("time_intelligence needs base_measure and date_column")
         elif kind in ("ratios", "ratio", "share"):
             kw = {"base_measure": args.get("base_measure"),
                   "dimension_columns": args.get("dimension_columns"),
-                  "display_folder": args.get("display_folder")}
+                  "display_folder": args.get("display_folder"),
+                  "include_all_selected": args.get("include_all_selected"),
+                  "sort_by_columns": args.get("sort_by_columns")}
             if not kw["base_measure"] or not kw["dimension_columns"]:
                 raise ValueError("ratios needs base_measure and dimension_columns")
         elif kind in ("ranking", "rank"):
             kw = {"base_measure": args.get("base_measure"),
                   "dimension_columns": args.get("dimension_columns"),
-                  "display_folder": args.get("display_folder")}
+                  "display_folder": args.get("display_folder"),
+                  "include_all_selected": args.get("include_all_selected"),
+                  "sort_by_columns": args.get("sort_by_columns")}
             if not kw["base_measure"] or not kw["dimension_columns"]:
                 raise ValueError("ranking needs base_measure and dimension_columns")
         elif kind in ("column_stats", "stats"):
             kw = {"column": args.get("column"), "stats": args.get("stats"),
-                  "display_folder": args.get("display_folder")}
+                  "display_folder": args.get("display_folder"), "column_format": args.get("column_format")}
             if not kw["column"]:
                 raise ValueError("column_stats needs column")
         else:
@@ -3837,61 +4253,31 @@ class PowerBIMCPServer:
         return {k: v for k, v in kw.items() if v is not None}
 
     async def _batch_create_live(self, table: str, measures: List[Dict[str, Any]],
-                                 skip_validation: bool = False) -> str:
-        """Shared live bulk-create path: validate, then all-or-nothing TOM batch.
+                                 skip_validation: bool = False):
+        """Shared live bulk-create path. Returns (created, message).
 
-        Measures may reference sibling measures created in the SAME batch (e.g. a ratio over a
-        base defined two entries earlier). Those cannot be probed against the current model, so
-        they are validated AFTER creation; if a post-check fails, every measure created by the
-        batch is deleted again (compensating rollback), preserving all-or-nothing semantics."""
+        The whole batch is validated against the live model first, sibling references included
+        (see _validate_measure_batch), and only then handed to the connector's all-or-nothing
+        batch create. Inside an open transaction the measures stay pending until commit."""
         error = await self._ensure_tom_connected()
         if error:
-            return error
-        loop = asyncio.get_event_loop()
-        batch_names = {(m.get("name") or "") for m in measures}
-
-        def refs_sibling(expr: str) -> bool:
-            return any(f"[{n}]" in (expr or "") for n in batch_names if n)
-
-        deferred = [m for m in measures if refs_sibling(m.get("expression", ""))]
+            return False, error
         if not skip_validation:
-            for m in measures:
-                if m in deferred:
-                    continue  # references a sibling from this batch; validated post-create
-                status, verr = await self._validate_via_desktop(m["expression"], as_measure=True)
-                if status is False:
-                    return (f"[INVALID] Batch NOT created - measure '{m['name']}' failed validation.\n\n"
-                            f"Error: {redact_secrets(verr, [self.client_secret])}\n\n"
-                            "Fix the DAX and retry (or pass skip_validation=true).")
+            problem = await self._validate_measure_batch(table, measures)
+            if problem:
+                return False, problem
 
         tom = self._get_tom_connector()
-        auto_save = not self._tom_transaction_active
-        create_fn = lambda: tom.batch_create_measures(table, measures, auto_save=auto_save)
+        in_transaction = self._tom_transaction_active
+        create_fn = lambda: tom.batch_create_measures(table, measures, auto_save=not in_transaction)  # noqa: E731
         result = await asyncio.get_event_loop().run_in_executor(None, create_fn)
         if not result.success:
-            return f"Failed: {result.message}"
-
-        # Post-validate the sibling-referencing measures now that the whole batch exists.
-        if deferred and not skip_validation and auto_save:
-            for m in deferred:
-                status, verr = await self._validate_via_desktop(f"[{m['name']}]", as_measure=True)
-                if status is False:
-                    for created in measures:  # compensating rollback of the whole batch
-                        del_fn = lambda n=created["name"]: tom.delete_measure(n, table)
-                        await loop.run_in_executor(None, del_fn)
-                    await loop.run_in_executor(None, tom.save_changes)
-                    return (f"[INVALID] Batch rolled back - measure '{m['name']}' failed post-create "
-                            f"validation.\n\nError: {redact_secrets(verr, [self.client_secret])}\n\n"
-                            "Nothing remains from this batch. Fix the DAX and retry.")
-
-        pending = " (PENDING - run tom_commit_transaction to save)" if self._tom_transaction_active else ""
-        note = ""
-        if deferred:
-            names = ", ".join(m["name"] for m in deferred[:5])
-            note = (f"\n({len(deferred)} measure(s) referencing batch siblings were validated "
-                    f"after creation: {names})") if auto_save else \
-                   (f"\n({len(deferred)} sibling-referencing measure(s) will be checked at commit)")
-        return f"{result.message}{pending}{note}"
+            return False, f"Failed: {result.message}"
+        if in_transaction:
+            self._tom_pending_measures.extend(
+                {"table": table, "name": m["name"], "expression": m.get("expression") or ""} for m in measures)
+            return True, f"{result.message} (PENDING - run tom_commit_transaction to save)"
+        return True, result.message
 
     async def _handle_generate_measure_suite(self, args: Dict[str, Any]):
         """Bulk-generate a measure suite; optionally write it (pbip TMDL or live TOM).
@@ -3904,7 +4290,8 @@ class PowerBIMCPServer:
                 return ("Refused: writing a measure suite is a write operation and the server is in "
                         "READ-ONLY mode. Use target='none' to generate without writing.",
                         {"error": "read_only", "measures": []})
-            measures = dax_generator.generate_suite(args.get("kind"), **self._suite_kwargs(args))
+            suite_kwargs = await self._suite_model_defaults(self._suite_kwargs(args))
+            measures = dax_generator.generate_suite(args.get("kind"), **suite_kwargs)
             result = {"measures": measures, "written": False, "target": target}
             out = f"=== Measure suite: {args.get('kind')} ({len(measures)} measures) ===\n\n"
             out += self._render_measure_list(measures)
@@ -3923,11 +4310,13 @@ class PowerBIMCPServer:
                     return (f"Generated but NOT written: {res.get('message')}", {"error": res.get("message"), "measures": measures})
                 result["written"] = True
                 out += f"Written into TMDL: {res.get('path')} ({len(res.get('created', []))} measures).\n"
-                out += "Close and reopen Power BI Desktop to see them."
+                out += self._RELOAD_HINT
                 return (out, result)
             # live
-            msg = await self._batch_create_live(table, measures, bool(args.get("skip_validation", False)))
-            result["written"] = msg.startswith("Created")
+            created, msg = await self._batch_create_live(table, measures, bool(args.get("skip_validation", False)))
+            result["written"] = created
+            if not created:
+                result["error"] = msg
             return (out + msg, result)
         except ValueError as e:
             return (f"Error: {e}", {"error": str(e), "measures": []})
@@ -3942,13 +4331,13 @@ class PowerBIMCPServer:
             measures = args.get("measures") or []
             if not table or not measures:
                 return "Error: table_name and a non-empty measures array are required"
-            bad = [m for m in measures if not (m.get("name") and m.get("expression"))]
+            bad = [m for m in measures if not (isinstance(m, dict) and m.get("name") and m.get("expression"))]
             if bad:
                 return "Error: every measure needs both 'name' and 'expression'"
-            return await self._batch_create_live(table, measures, bool(args.get("skip_validation", False)))
+            _created, message = await self._batch_create_live(table, measures, bool(args.get("skip_validation", False)))
+            return message
         except Exception as e:
-            msg = redact_secrets(str(e), [self.client_secret])
-            return f"Error creating measures: {msg}"
+            return f"Error creating measures: {self._redact(str(e))}"
 
     async def _handle_audit_star_schema(self, args: Dict[str, Any]):
         """Dimensional-model audit. Returns (text, result)."""
@@ -3987,10 +4376,11 @@ class PowerBIMCPServer:
         """Orphan-key scan across active relationships. Returns (text, result)."""
         try:
             source = args.get("source") or "desktop"
-            model, err = await self._gather_model_metadata(source, args.get("workspace_name"), args.get("dataset_name"))
+            workspace, dataset = args.get("workspace_name"), args.get("dataset_name")
+            model, err = await self._gather_model_metadata(source, workspace, dataset)
             if err:
                 return (f"Error: {err}", {"error": err, "checked": 0, "violations": []})
-            run, err = await self._get_query_runner(source, args.get("workspace_name"), args.get("dataset_name"))
+            run, err = await self._get_query_runner(source, workspace, dataset)
             if err:
                 return (f"Error: {err}", {"error": err, "checked": 0, "violations": []})
             loop = asyncio.get_event_loop()
@@ -4007,30 +4397,29 @@ class PowerBIMCPServer:
                     active = active.strip().lower() in ("true", "1", "yes")
                 if not active:
                     continue
-                fcol = self._dax_col(r["from_table"], r["from_column"])
-                tcol = self._dax_col(r["to_table"], r["to_column"])
-                q = (f"EVALUATE ROW(\"Orphans\", COUNTROWS(EXCEPT(DISTINCT({fcol}), DISTINCT({tcol}))))")
+                label = f"{r['from_table']}[{r['from_column']}] -> {r['to_table']}[{r['to_column']}]"
+                fcol = dax_tokens.column_ref(r["from_table"], r["from_column"])
+                tcol = dax_tokens.column_ref(r["to_table"], r["to_column"])
+                q = f"EVALUATE ROW(\"Orphans\", COUNTROWS(EXCEPT(DISTINCT({fcol}), DISTINCT({tcol}))))"
                 try:
                     rows = await loop.run_in_executor(None, run, q)
-                    count = int(list(rows[0].values())[0] or 0) if rows else 0
+                    count = int(float(list(rows[0].values())[0] or 0)) if rows else 0
                 except Exception as qe:
-                    violations.append({"relationship": f"{r['from_table']}[{r['from_column']}] -> {r['to_table']}[{r['to_column']}]",
-                                       "error": redact_secrets(str(qe), [self.client_secret])})
+                    violations.append({"relationship": label, "error": self._redact(str(qe))})
                     continue
                 checked += 1
                 if count > 0:
-                    samples = []
-                    try:
-                        sq = f"EVALUATE TOPN({max_samples}, EXCEPT(DISTINCT({fcol}), DISTINCT({tcol})))"
-                        srows = await loop.run_in_executor(None, run, sq)
-                        samples = [list(x.values())[0] for x in (srows or [])]
-                    except Exception:
-                        pass
-                    violations.append({
-                        "relationship": f"{r['from_table']}[{r['from_column']}] -> {r['to_table']}[{r['to_column']}]",
-                        "orphan_keys": count,
-                        "samples": samples,
-                    })
+                    # The sample keys are real data values, so they go through the guarded path
+                    # and get the same column policies and PII masking as any query result.
+                    sq = f"EVALUATE TOPN({max_samples}, EXCEPT(DISTINCT({fcol}), DISTINCT({tcol})))"
+                    srows, _report, serr = await self._run_guarded_query(
+                        sq, tool="scan_referential_integrity", source=source, workspace=workspace,
+                        dataset=dataset, max_rows=max_samples)
+                    entry = {"relationship": label, "orphan_keys": count,
+                             "samples": [] if serr else [list(x.values())[0] for x in srows]}
+                    if serr:
+                        entry["samples_note"] = serr[:160]
+                    violations.append(entry)
             result = {"checked": checked, "violations": violations}
             out = "=== Referential Integrity Scan ===\n\n"
             out += f"Relationships checked: {checked}   Violations: {len([v for v in violations if v.get('orphan_keys')])}\n\n"
@@ -4041,6 +4430,8 @@ class PowerBIMCPServer:
                     out += f"  [ORPHANS] {v['relationship']}: {v['orphan_keys']} key(s) missing on the one side"
                     if v.get("samples"):
                         out += f"  e.g. {', '.join(str(s) for s in v['samples'])}"
+                    elif v.get("samples_note"):
+                        out += f"  (samples withheld: {v['samples_note']})"
                     out += "\n"
             if not violations:
                 out += "  No orphan keys. Every fact key has a matching dimension row.\n"
@@ -4049,34 +4440,43 @@ class PowerBIMCPServer:
                         "source join or add the missing dimension rows.\n")
             return (out, result)
         except Exception as e:
-            msg = redact_secrets(str(e), [self.client_secret])
+            msg = self._redact(str(e))
             return (f"Error scanning referential integrity: {msg}", {"error": msg, "checked": 0, "violations": []})
 
     async def _handle_pbip_add_measures(self, args: Dict[str, Any]):
-        """Bulk-add measures offline into the loaded PBIP project's TMDL. Returns (text, result)."""
+        """Bulk-add (or upsert) measures offline into the loaded PBIP project's TMDL. Returns (text, result)."""
         try:
             table = args.get("table")
             measures = args.get("measures") or []
             if not table or not measures:
-                return ("Error: table and a non-empty measures array are required", {"error": "args", "created": []})
+                return ("Error: table and a non-empty measures array are required",
+                        {"error": "args", "created": [], "updated": []})
+            mode = (args.get("mode") or "add").lower()
+            if mode not in ("add", "upsert"):
+                return (f"Error: unknown mode '{mode}'. Use add or upsert.",
+                        {"error": "bad_mode", "created": [], "updated": []})
             lint_note = ""
             if not args.get("skip_lint"):
-                lint = dax_lint.lint_measures([{"name": m.get("name"), "expression": m.get("expression", "")} for m in measures])
-                warn = [f for f in lint["findings"] if f["severity"] == "warning"]
+                lint = dax_lint.lint_measures([{"name": m.get("name"), "expression": m.get("expression", "")}
+                                               for m in measures])
+                warn = [f for f in lint["findings"] if f["severity"] in ("warning", "error")]
                 if warn:
-                    lint_note = f"\nLint: {len(warn)} warning(s) - " + "; ".join(
-                        f"{f['object']}: {f['rule_id']}" for f in warn[:8]) + " (created anyway; review suggested)\n"
+                    lint_note = f"\nLint: {len(warn)} finding(s) - " + "; ".join(
+                        f"{f['object']}: {f['rule_id']}" for f in warn[:8]) + " (written anyway; review suggested)\n"
             connector = self._get_pbip_connector()
-            write_fn = lambda: connector.add_measures(table, measures)
+            write_fn = lambda: connector.add_measures(table, measures, mode=mode)  # noqa: E731
             res = await asyncio.get_event_loop().run_in_executor(None, write_fn)
             if not res.get("success"):
-                return (f"Error: {res.get('message')}", {"error": res.get("message"), "created": []})
-            out = f"Added {len(res.get('created', []))} measure(s) to '{table}' in {res.get('path')}.{lint_note}"
-            out += "\nClose and reopen Power BI Desktop to see them. Validate with pbip_validate."
-            return (out, {"created": res.get("created", []), "path": res.get("path")})
+                return (f"Error: {res.get('message')}", {"error": res.get("message"), "created": [], "updated": []})
+            created, updated = res.get("created", []), res.get("updated", [])
+            out = f"'{table}' in {res.get('path')}: added {len(created)} measure(s)"
+            if mode == "upsert":
+                out += f", replaced {len(updated)} in place"
+            out += f".{lint_note}\nValidate with pbip_validate. " + self._RELOAD_HINT
+            return (out, {"created": created, "updated": updated, "path": res.get("path")})
         except Exception as e:
-            msg = redact_secrets(str(e), [self.client_secret])
-            return (f"Error adding measures: {msg}", {"error": msg, "created": []})
+            msg = self._redact(str(e))
+            return (f"Error adding measures: {msg}", {"error": msg, "created": [], "updated": []})
 
     async def _handle_pbip_create_date_table(self, args: Dict[str, Any]) -> str:
         """Create an offline DAX date-dimension table in the loaded PBIP project."""
@@ -4093,7 +4493,7 @@ class PowerBIMCPServer:
                 return f"Error: {res.get('message')}"
             return (f"Date table '{res.get('table')}' created at {res.get('path')} "
                     f"(marked as date table; {res.get('columns')} columns).\n"
-                    "Relate your fact date columns to it, then reopen Power BI Desktop.")
+                    "Relate your fact date columns to it. " + self._RELOAD_HINT)
         except Exception as e:
             return f"Error creating date table: {redact_secrets(str(e), [self.client_secret])}"
 
@@ -4118,7 +4518,7 @@ class PowerBIMCPServer:
             if not res.get("success"):
                 return f"Error: {res.get('message')}"
             return (f"Calculation group '{name}' created at {res.get('path')} with "
-                    f"{res.get('items')} item(s).\nReopen Power BI Desktop; drop the "
+                    f"{res.get('items')} item(s).\n" + self._RELOAD_HINT + " Then drop the "
                     f"'{args.get('column_name') or 'Calculation'}' column on a slicer or matrix to use it.")
         except Exception as e:
             return f"Error creating calculation group: {redact_secrets(str(e), [self.client_secret])}"
@@ -4135,7 +4535,7 @@ class PowerBIMCPServer:
             if not res.get("success"):
                 return f"Error: {res.get('message')}"
             return (f"Hierarchy '{name}' added to '{table}' ({' > '.join(levels)}).\n"
-                    "Reopen Power BI Desktop to see it (or hot-reload it with bridge_reload).")
+                    + self._RELOAD_HINT)
         except Exception as e:
             return f"Error adding hierarchy: {redact_secrets(str(e), [self.client_secret])}"
 
@@ -4257,7 +4657,8 @@ class PowerBIMCPServer:
                 data = base64.b64decode(snap.get("payload") or "")
                 display = snap.get("pageDisplayName") or by_id.get(page_id, page_id)
                 safe = re.sub(r'[<>:"/\\|?*]', "_", display)
-                path = out_dir / f"{safe}.png"
+                safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(page_id))[:24]
+                path = out_dir / f"{safe} [{safe_id}].png"
                 path.write_bytes(data)
                 shots.append({"page_id": page_id, "page": display, "path": str(path), "bytes": len(data)})
             out = f"=== Captured {len(shots)} page screenshot(s) from Desktop (pid {pid}) ===\n\n"
@@ -4323,7 +4724,7 @@ class PowerBIMCPServer:
             rows_by_table = {}
             for t in tables:
                 name = t["name"]
-                q = f"EVALUATE ROW(\"r\", COUNTROWS('{name}'))"
+                q = f"EVALUATE ROW(\"r\", COUNTROWS({dax_tokens.quote_table(str(name), force=True)}))"
                 try:
                     res = await loop.run_in_executor(None, run, q)
                     val = None
@@ -4372,37 +4773,43 @@ class PowerBIMCPServer:
             if not dax:
                 return "Error: dax is required"
             source = args.get("source") or "desktop"
-            run, err = await self._get_query_runner(source, args.get("workspace_name"), args.get("dataset_name"))
-            if err:
-                return f"Error: {err}"
-            loop = asyncio.get_event_loop()
-            start = time.time()
-            rows = await loop.run_in_executor(None, run, dax)
-            duration_ms = (time.time() - start) * 1000
-            row_count = len(rows) if isinstance(rows, list) else 0
+            rows, report, error = await self._run_guarded_query(
+                dax, tool="analyze_query_performance", source=source,
+                workspace=args.get("workspace_name"), dataset=args.get("dataset_name"), max_rows=20000)
+            if error:
+                return error if error.startswith(("Refused:", "Query blocked", "Not connected")) else \
+                    f"Error analyzing query performance: {error}"
+            duration_ms = report.get("duration_ms", 0.0)
+            row_count = len(rows)
 
             hints = []
-            up = dax.upper()
+            # Count calls on tokens, so a FILTER( inside a string or comment is not a hint.
+            calls = [t.text.upper() for t in dax_tokens.tokenize(dax) if t.kind == dax_tokens.IDENT]
             if duration_ms > 2000:
                 hints.append(f"Slow ({duration_ms:.0f} ms). Check relationship cardinality and avoid row-by-row iterators over large fact tables.")
-            if row_count > 10000:
+            if report.get("truncated"):
+                hints.append(f"Large result (more than {row_count:,} rows; counting stopped there). Add TOPN / SUMMARIZECOLUMNS filters.")
+            elif row_count > 10000:
                 hints.append(f"Large result ({row_count:,} rows). Add TOPN / SUMMARIZECOLUMNS filters.")
-            if up.count("FILTER(") >= 3:
+            if calls.count("FILTER") >= 3:
                 hints.append("Multiple FILTER() calls; prefer CALCULATE with boolean filters or KEEPFILTERS where possible.")
-            if "ADDCOLUMNS(" in up and "SUMMARIZE(" in up:
+            if "ADDCOLUMNS" in calls and "SUMMARIZE" in calls:
                 hints.append("SUMMARIZE+ADDCOLUMNS pattern; SUMMARIZECOLUMNS is usually faster and safer.")
+            lint = [f for f in dax_lint.lint_expression("query", dax) if f.get("severity") in ("warning", "error")]
+            for f in lint[:5]:
+                hints.append(f"{f['rule_id']}: {f['message']}")
             if not hints:
                 hints.append("No obvious red flags. For storage-engine vs formula-engine timings, use DAX Studio Server Timings.")
 
             out = "=== Query Performance ===\n\n"
             out += f"Duration: {duration_ms:.0f} ms\n"
-            out += f"Rows returned: {row_count:,}\n\n"
+            out += f"Rows returned: {row_count:,}{'+' if report.get('truncated') else ''}\n\n"
             out += "--- Hints ---\n"
             for h in hints:
                 out += f"  - {h}\n"
             return out
         except Exception as e:
-            return f"Error analyzing query performance: {redact_secrets(str(e), [self.client_secret])}"
+            return f"Error analyzing query performance: {self._redact(str(e))}"
 
     async def _handle_export_data_dictionary(self, args: Dict[str, Any]) -> str:
         """Generate a portable data dictionary (Markdown/HTML) with a documentation-coverage score."""
@@ -4618,6 +5025,12 @@ class PowerBIMCPServer:
                     used.add((str(rel["from_table"]), str(rel["from_column"])))
                 if rel.get("to_table") and rel.get("to_column"):
                     used.add((str(rel["to_table"]), str(rel["to_column"])))
+            # A column that only orders another column (Month Number behind Month) is not in
+            # the calculation dependency graph, yet deleting it breaks the sort.
+            for t in model.get("tables", []):
+                for c in t.get("columns", []):
+                    if c.get("sort_by"):
+                        used.add((str(t.get("name")), str(c["sort_by"])))
 
             report_scanned = False
             pbip = self.pbip_connector
@@ -4643,8 +5056,10 @@ class PowerBIMCPServer:
             out += ("\n".join(f"  - {m}" for m in unused_measures[:100]) or "  (none)") + "\n\n"
             out += f"Unused columns ({len(unused_cols)}):\n"
             out += ("\n".join(f"  - {c}" for c in unused_cols[:100]) or "  (none)") + "\n"
-            out += ("\nNote: dependency graph includes measures, calc columns, RLS, calc groups and "
-                    "field parameters (via INFO.CALCDEPENDENCY) plus relationships; review before deleting.")
+            out += ("\nNote: 'used' means referenced by a measure, calculated column, RLS rule, calculation "
+                    "group or field parameter (INFO.CALCDEPENDENCY), a relationship, a sort-by setting, or "
+                    "a visual in the loaded report. Columns used only as hierarchy levels, or only by "
+                    "other reports and external tools, are not visible here; review before deleting.")
             return out
         except Exception as e:
             return f"Error finding unused objects: {redact_secrets(str(e), [self.client_secret])}"
@@ -4715,9 +5130,9 @@ class PowerBIMCPServer:
         measure = args.get("measure_name")
         if not dax:
             if table:
-                dax = f"EVALUATE ROW(\"rows\", COUNTROWS('{table}'))"
+                dax = f'EVALUATE ROW("rows", COUNTROWS({dax_tokens.quote_table(str(table), force=True)}))'
             elif measure:
-                dax = f"EVALUATE ROW(\"value\", [{measure}])"
+                dax = f'EVALUATE ROW("value", {dax_tokens.bracket(str(measure))})'
             else:
                 return "Error: provide one of dax, table_name, or measure_name"
 
@@ -4726,30 +5141,36 @@ class PowerBIMCPServer:
         if not role_names:
             return "No RLS roles found in the model (nothing to test)."
 
-        def metric(rows):
-            if not rows:
-                return None
-            return next(iter(rows[0].values()), None)
-
+        # The harness switches the session's role; put back whatever the caller had active,
+        # so a session that was testing as one role does not silently end up unrestricted.
+        previous_role = getattr(connector, "current_rls_role", None)
+        baseline = None
+        results = []
         try:
             await loop.run_in_executor(None, connector.set_rls_role, None)
-            baseline = metric(await loop.run_in_executor(None, connector.execute_dax, dax, 10))
-            results = []
+            rows, _report, error = await self._run_guarded_query(dax, tool="rls_test_harness", max_rows=10)
+            if error:
+                return error
+            baseline = self._first_value(rows)
             for role in role_names:
                 ok = await loop.run_in_executor(None, connector.set_rls_role, role)
                 if not ok:
                     results.append((role, None, "ERROR activating role"))
                     continue
-                val = metric(await loop.run_in_executor(None, connector.execute_dax, dax, 10))
-                if val is None or val == 0:
+                rows, _report, error = await self._run_guarded_query(dax, tool="rls_test_harness", max_rows=10)
+                if error:
+                    results.append((role, None, f"ERROR: {error[:80]}"))
+                    continue
+                val = self._first_value(rows)
+                if val is None or self._is_zero(val):
                     note = "sees NOTHING (verify the role filter)"
-                elif baseline is not None and val == baseline:
+                elif baseline is not None and str(val) == str(baseline):
                     note = "sees EVERYTHING (no row reduction - verify intended)"
                 else:
                     note = "filtered"
                 results.append((role, val, note))
         finally:
-            await loop.run_in_executor(None, connector.set_rls_role, None)  # always restore
+            await loop.run_in_executor(None, connector.set_rls_role, previous_role)
 
         out = "=== RLS Test Matrix ===\n"
         out += f"Query: {dax}\nUnrestricted baseline: {baseline}\n\n"
@@ -4757,6 +5178,8 @@ class PowerBIMCPServer:
         out += "-" * 70 + "\n"
         for role, val, note in results:
             out += f"{str(role)[:31]:<32} {str(val):>14}  {note}\n"
+        if previous_role:
+            out += f"\nSession role restored to '{previous_role}'."
         out += ("\nNote: tests row-level (RLS) filters via role simulation. Object-level security "
                 "(OLS) visibility is not covered here; check object access separately.")
         return out
@@ -4768,50 +5191,65 @@ class PowerBIMCPServer:
             tests_path = args.get("tests_path")
             if not tests and tests_path:
                 try:
-                    with open(tests_path, "r", encoding="utf-8") as f:
+                    with open(tests_path, "r", encoding="utf-8-sig") as f:
                         tests = json.load(f)
                 except Exception as e:
                     return (f"Error reading tests_path: {e}", {"passed": 0, "total": 0, "error": str(e)})
             if not tests or not isinstance(tests, list):
                 return ("Error: provide 'tests' (array of {name, dax, expected, tolerance?}) or 'tests_path'.",
                         {"passed": 0, "total": 0})
-            run, rerr = await self._get_query_runner(args.get("source") or "desktop",
-                                                     args.get("workspace_name"), args.get("dataset_name"))
+            source = args.get("source") or "desktop"
+            workspace, dataset = args.get("workspace_name"), args.get("dataset_name")
+            _run, rerr = await self._get_query_runner(source, workspace, dataset)
             if rerr:
                 return (f"Error: {rerr}", {"passed": 0, "total": len(tests), "error": rerr})
-            loop = asyncio.get_event_loop()
 
             results = []
             passed = 0
             for t in tests:
-                name = t.get("name", t.get("dax", "test")[:40])
+                if not isinstance(t, dict):
+                    results.append({"name": str(t)[:40], "status": "ERROR", "detail": "test is not an object"})
+                    continue
                 dax = t.get("dax")
+                name = t.get("name") or (str(dax)[:40] if dax else "test")
                 if not dax:
                     results.append({"name": name, "status": "ERROR", "detail": "no dax"})
                     continue
-                try:
-                    rows = await loop.run_in_executor(None, run, dax)
-                    actual = next(iter(rows[0].values()), None) if rows else None
-                except Exception as e:
-                    results.append({"name": name, "status": "ERROR", "detail": redact_secrets(str(e), [self.client_secret])[:200]})
+                rows, _report, error = await self._run_guarded_query(
+                    dax, tool="run_dax_tests", source=source, workspace=workspace, dataset=dataset, max_rows=10)
+                if error:
+                    results.append({"name": name, "status": "ERROR", "detail": error[:200]})
                     continue
+                actual = self._first_value(rows)
                 if "expected" not in t:
                     results.append({"name": name, "status": "INFO", "detail": f"actual={actual} (no expected given)"})
                     continue
-                ok, detail = model_analysis.dax_test_verdict(actual, t.get("expected"), t.get("tolerance", 0))
+                try:
+                    ok, detail = model_analysis.dax_test_verdict(
+                        actual, t.get("expected"), t.get("tolerance", 0), rel_tolerance=t.get("rel_tolerance"))
+                except Exception as e:
+                    results.append({"name": name, "status": "ERROR", "detail": f"could not compare: {e}"[:200]})
+                    continue
                 results.append({"name": name, "status": "PASS" if ok else "FAIL", "detail": detail})
                 if ok:
                     passed += 1
 
             graded = [r for r in results if r["status"] in ("PASS", "FAIL")]
+            errored = [r for r in results if r["status"] == "ERROR"]
             total = len(graded)
-            all_passed = total > 0 and passed == total
-            out = f"[{'PASS' if all_passed else 'FAIL'}] DAX tests: {passed}/{total} passed\n\n"
+            # A test that could not run is not a pass: the suite only passes when every graded
+            # test passed and none errored.
+            all_passed = total > 0 and passed == total and not errored
+            out = f"[{'PASS' if all_passed else 'FAIL'}] DAX tests: {passed}/{total} passed"
+            if errored:
+                out += f", {len(errored)} could not run"
+            out += "\n\n"
             for r in results:
                 out += f"  [{r['status']}] {r['name']}: {r['detail']}\n"
-            return (out, {"passed": passed, "total": total, "all_passed": all_passed, "results": results})
+            return (out, {"passed": passed, "total": total, "errors": len(errored),
+                          "all_passed": all_passed, "results": results})
         except Exception as e:
-            msg = redact_secrets(str(e), [self.client_secret])
+            msg = self._redact(str(e))
             return (f"Error running DAX tests: {msg}", {"passed": 0, "total": 0, "error": msg})
 
     async def _handle_cross_workspace_lineage(self, args: Dict[str, Any]) -> str:
@@ -4820,54 +5258,35 @@ class PowerBIMCPServer:
             rest = self._get_rest_connector()
             if not rest:
                 return "Error: cloud credentials not configured (TENANT_ID / CLIENT_ID / CLIENT_SECRET)."
-            loop = asyncio.get_event_loop()
 
-            # Reuse a cached scanResult if provided (Scanner API is rate-limited).
+            # Reuse a cached scanResult if provided (the Scanner API is rate-limited).
             cache_path = args.get("cache_path")
+            notes: List[str] = []
             scan = None
-            if cache_path and args.get("use_cache", True):
+            if cache_path and args.get("use_cache", True) and not args.get("scan_ids"):
                 try:
-                    with open(cache_path, "r", encoding="utf-8") as f:
+                    with open(cache_path, "r", encoding="utf-8-sig") as f:
                         scan = json.load(f)
-                except Exception:
+                    notes.append(f"Read from cache: {cache_path} (pass use_cache=false to rescan).")
+                except FileNotFoundError:
+                    scan = None
+                except Exception as e:
+                    notes.append(f"Ignored an unreadable cache file ({e}); rescanning.")
                     scan = None
 
             if scan is None:
-                ids = args.get("workspace_ids")
-                if not ids:
-                    try:
-                        ws = await loop.run_in_executor(None, rest.admin_list_workspaces, 100)
-                        ids = [w.get("id") for w in ws if w.get("id")]
-                    except Exception as e:
-                        return (f"Error listing workspaces (needs admin / read-only admin APIs enabled): "
-                                f"{redact_secrets(str(e), [self.client_secret])}")
-                ids = [i for i in (ids or [])][:100]  # Scanner caps at 100 workspaces/call
-                if not ids:
-                    return "No workspaces found to scan."
-                started = await loop.run_in_executor(None, rest.admin_post_workspace_info, ids, True)
-                scan_id = started.get("id")
-                if not scan_id:
-                    return f"Error: scan did not start ({started})."
-                status = ""
-                last_st = {}
-                for _ in range(20):  # ~5 min budget (Microsoft suggests 30-60s polling for big scans)
-                    last_st = await loop.run_in_executor(None, rest.admin_get_scan_status, scan_id)
-                    status = str(last_st.get("status", "")).lower()
-                    if status == "succeeded":
-                        break
-                    if status == "failed":
-                        return f"Scan failed: {last_st.get('error') or last_st}"
-                    await asyncio.sleep(15)
-                if status != "succeeded":
-                    return (f"Scan still running after the wait (status={status}). Re-run with the same "
-                            "cache_path to resume later, or scan fewer workspace_ids.")
-                scan = await loop.run_in_executor(None, rest.admin_get_scan_result, scan_id)
+                scan, error, scan_notes = await self._run_workspace_scan(rest, args)
+                notes.extend(scan_notes)
+                if error:
+                    return error + ("\n\n" + "\n".join(notes) if notes else "")
                 if cache_path:
-                    try:
-                        with open(cache_path, "w", encoding="utf-8") as f:
-                            json.dump(scan, f)
-                    except Exception:
-                        pass
+                    if self._read_only:
+                        notes.append("READ-ONLY mode: the scan result was not written to cache_path.")
+                    else:
+                        try:
+                            safe_io.write_text(cache_path, json.dumps(scan))
+                        except Exception as e:
+                            notes.append(f"Could not write the cache file: {e}")
 
             s = governance.summarize_scan(scan, dataset_name=args.get("dataset_name"))
             out = "=== Cross-Workspace Lineage / Inventory ===\n\n"
@@ -4878,11 +5297,17 @@ class PowerBIMCPServer:
                 out += ("\n".join(f"  - {r}" for r in s['downstream_reports']) or "  (none)") + "\n\n"
             out += f"Datasets WITHOUT RLS roles ({len(s['datasets_without_rls'])}):\n"
             out += ("\n".join(f"  - {d}" for d in s['datasets_without_rls'][:50]) or "  (none)") + "\n\n"
+            unknown_rls = s.get("datasets_rls_unknown") or []
+            if unknown_rls:
+                out += f"Datasets whose RLS state is UNKNOWN ({len(unknown_rls)}):\n"
+                out += "\n".join(f"  - {d}" for d in unknown_rls[:50]) + "\n\n"
             out += f"Datasets WITHOUT a sensitivity label ({len(s['datasets_without_sensitivity_label'])}):\n"
             out += ("\n".join(f"  - {d}" for d in s['datasets_without_sensitivity_label'][:50]) or "  (none)") + "\n"
+            if notes:
+                out += "\n" + "\n".join(f"Note: {n}" for n in notes) + "\n"
             return out
         except Exception as e:
-            return f"Error in cross-workspace lineage: {redact_secrets(str(e), [self.client_secret])}"
+            return f"Error in cross-workspace lineage: {self._redact(str(e))}"
 
     async def _handle_fleet_refresh_monitor(self, args: Dict[str, Any]) -> str:
         """Refresh health across many datasets/workspaces, classifying failures (admin or workspace access)."""
@@ -4897,11 +5322,15 @@ class PowerBIMCPServer:
                         "Use list_workspaces or cross_workspace_lineage to discover them.")
 
             failures = []
+            unchecked = []     # could not be read: reported, never counted as healthy
+            healthy = 0
+            never_refreshed = 0
             checked = 0
             for wid in workspace_ids:
                 try:
                     datasets = await loop.run_in_executor(None, rest.list_datasets, wid)
-                except Exception:
+                except Exception as e:
+                    unchecked.append((f"workspace {wid}", self._redact(str(e))[:120]))
                     continue
                 for ds in datasets:
                     if not ds.get("isRefreshable"):
@@ -4909,25 +5338,35 @@ class PowerBIMCPServer:
                     checked += 1
                     try:
                         hist = await loop.run_in_executor(None, rest.get_refresh_history, wid, ds["id"], 1)
-                    except Exception:
+                    except Exception as e:
+                        unchecked.append((ds.get("name") or ds.get("id"), self._redact(str(e))[:120]))
                         continue
                     if not hist:
+                        never_refreshed += 1
                         continue
                     last = hist[0]
                     if str(last.get("status")) == "Failed":
                         diag = refresh_diagnostics.classify_refresh_error(last.get("serviceExceptionJson") or "")
                         failures.append((ds.get("name"), last.get("endTime"), diag["cause"]))
+                    else:
+                        healthy += 1
 
             out = "=== Fleet Refresh Monitor ===\n\n"
             out += f"Refreshable datasets checked: {checked}\n"
-            out += f"Most-recent-refresh FAILURES: {len(failures)}\n\n"
+            out += f"Most-recent-refresh FAILURES: {len(failures)}\n"
+            out += f"Healthy: {healthy}   No refresh history: {never_refreshed}   Could not check: {len(unchecked)}\n\n"
             for name, when, cause in failures[:100]:
                 out += f"  [FAILED] {name} ({when}): {cause}\n"
-            if not failures:
+            for name, why in unchecked[:50]:
+                out += f"  [UNKNOWN] {name}: {why}\n"
+            if not failures and not unchecked:
                 out += "  All checked datasets' most recent refresh succeeded.\n"
+            elif not failures:
+                out += ("  No failures among the datasets that could be read, but some could not be "
+                        "checked (see UNKNOWN above).\n")
             return out
         except Exception as e:
-            return f"Error in fleet refresh monitor: {redact_secrets(str(e), [self.client_secret])}"
+            return f"Error in fleet refresh monitor: {self._redact(str(e))}"
 
     async def _handle_usage_and_orphan_analytics(self, args: Dict[str, Any]) -> str:
         """Tenant usage analytics from the Admin Activity Events API for a single UTC day."""
@@ -4969,8 +5408,16 @@ class PowerBIMCPServer:
         res = self.security.verify_audit_integrity()
         status = "INTACT" if res.get("valid") else "TAMPERED"
         text = f"[{status}] Audit log integrity: {res.get('message', '')}\n  Entries checked: {res.get('checked', 0)}"
+        if res.get("files"):
+            text += f" across {res['files']} file(s)"
         if not res.get("valid") and res.get("broken_line"):
-            text += f"\n  First problem at line {res['broken_line']}"
+            where = f" of {res['broken_file']}" if res.get("broken_file") else ""
+            text += f"\n  First problem at line {res['broken_line']}{where}"
+        if not res.get("keyed"):
+            text += ("\n  Note: no POWERBI_MCP_AUDIT_KEY is set, so this chain only detects accidental edits. "
+                     "Someone who can rewrite the log can also recompute it.")
+        elif res.get("unkeyed_entries"):
+            text += f"\n  Warning: {res['unkeyed_entries']} entr(ies) were written without the key."
         return (text, res)
 
     # ==================== MCP RESOURCES & COMPLETION (Bundle C) ====================
@@ -5050,51 +5497,56 @@ class PowerBIMCPServer:
     # ==================== PBIP HANDLERS (File-based editing) ====================
 
     def _get_pbip_connector(self) -> PowerBIPBIPConnector:
-        """Get or create PBIP connector"""
+        """Get or create PBIP connector. Offline edits are made by an agent, so a backup of the
+        project files is taken before each rename or repair unless POWERBI_MCP_PBIP_BACKUPS is
+        turned off."""
         if not self.pbip_connector:
-            self.pbip_connector = PowerBIPBIPConnector()
+            self.pbip_connector = PowerBIPBIPConnector(
+                auto_backup=_security_env_flag("POWERBI_MCP_PBIP_BACKUPS", True, invalid=True))
         return self.pbip_connector
+
+    _RELOAD_HINT = ("If the report is open in Power BI Desktop, hot-reload it with bridge_reload "
+                    "(check bridge_status first; never reload over unsaved changes).")
 
     async def _handle_pbip_load_project(self, args: Dict[str, Any]) -> str:
         """Load a PBIP project for editing"""
         try:
             pbip_path = args.get("pbip_path")
-
             if not pbip_path:
                 return "Error: 'pbip_path' is required"
 
             connector = self._get_pbip_connector()
-
-            # Load the project
-            load_fn = lambda: connector.load_project(pbip_path)
+            load_fn = lambda: connector.load_project(pbip_path)  # noqa: E731
             success = await asyncio.get_event_loop().run_in_executor(None, load_fn)
+            if not success:
+                reason = getattr(connector, "last_error", None)
+                return (f"Failed to load PBIP project from: {pbip_path}\n\n"
+                        + (f"Reason: {reason}\n\n" if reason else "")
+                        + "Point at a .pbip file, or at a folder that contains exactly one.")
 
-            if success:
-                info = connector.get_project_info()
-                result = "=== PBIP Project Loaded Successfully ===\n\n"
-                result += f"Project: {info.get('pbip_file', 'N/A')}\n"
-                result += f"Root Path: {info.get('root_path', 'N/A')}\n\n"
+            info = connector.get_project_info()
+            result = "=== PBIP Project Loaded Successfully ===\n\n"
+            result += f"Project: {info.get('pbip_file', 'N/A')}\n"
+            result += f"Root Path: {info.get('root_path', 'N/A')}\n\n"
+            if info.get('semantic_model_folder'):
+                result += f"Semantic Model: {info.get('semantic_model_folder')}\n"
+                result += f"TMDL Files: {info.get('tmdl_file_count', 0)}\n\n"
+            elif info.get('remote_model'):
+                result += "Semantic Model: remote (the report is bound byConnection; model tools are unavailable)\n\n"
+            if info.get('report_folder'):
+                result += f"Report Folder: {info.get('report_folder')}\n"
+                result += f"Report format: {info.get('report_format', 'N/A')}\n\n"
 
-                if info.get('semantic_model_folder'):
-                    result += f"Semantic Model: {info.get('semantic_model_folder')}\n"
-                    result += f"TMDL Files: {info.get('tmdl_file_count', 0)}\n\n"
-
-                if info.get('report_folder'):
-                    result += f"Report Folder: {info.get('report_folder')}\n"
-                    result += f"Report JSON: {'Yes' if info.get('report_json_path') else 'No'}\n\n"
-
-                result += "You can now use:\n"
-                result += "  - pbip_rename_tables: Rename tables (updates model AND report visuals)\n"
-                result += "  - pbip_rename_columns: Rename columns (updates model AND report visuals)\n"
-                result += "  - pbip_rename_measures: Rename measures (updates model AND report visuals)\n"
-
-                return result
-            else:
-                return f"Failed to load PBIP project from: {pbip_path}\n\nEnsure the path points to a valid .pbip file or folder containing one."
+            result += "You can now use:\n"
+            result += "  - pbip_rename_tables / pbip_rename_columns / pbip_rename_measures (model AND report)\n"
+            result += "  - pbip_add_measures, pbip_create_date_table, pbip_add_calculation_group, pbip_add_hierarchy\n"
+            result += "  - pbir_apply_spec (build report pages from a spec), audit_report_design\n"
+            result += "  - pbip_validate, pbir_validate_report, pbip_scan_broken_refs\n"
+            return result
 
         except Exception as e:
-            logger.error(f"PBIP load error: {e}")
-            return f"Error loading PBIP project: {str(e)}"
+            logger.error(f"PBIP load error: {self._redact(str(e))}")
+            return f"Error loading PBIP project: {self._redact(str(e))}"
 
     async def _handle_pbip_get_project_info(self) -> str:
         """Get info about loaded PBIP project"""
@@ -5132,262 +5584,98 @@ class PowerBIMCPServer:
             return f"Error: {str(e)}"
 
     async def _handle_pbip_rename_tables(self, args: Dict[str, Any]) -> str:
-        """Rename tables in PBIP files (model + report)"""
-        try:
-            connector = self._get_pbip_connector()
-
-            if not connector.current_project:
-                return "No PBIP project loaded. Use 'pbip_load_project' first."
-
-            renames = args.get("renames", [])
-
-            if not renames:
-                return "Error: 'renames' array is required"
-
-            # Execute batch rename
-            batch_fn = lambda: connector.batch_rename_tables(renames)
-            result = await asyncio.get_event_loop().run_in_executor(None, batch_fn)
-
-            # Build response
-            response = "=== PBIP Batch Rename Tables ===\n\n"
-
-            # Show backup info if created
-            if result.backup_created:
-                response += f"BACKUP CREATED: {result.backup_created}\n\n"
-
-            response += f"{result.message}\n\n"
-
-            if result.files_modified:
-                response += "--- Files Modified ---\n"
-                for f in result.files_modified[:10]:
-                    response += f"  - {f}\n"
-                if len(result.files_modified) > 10:
-                    response += f"  ... and {len(result.files_modified) - 10} more\n"
-                response += "\n"
-
-            response += f"Total references updated: {result.references_updated}\n\n"
-
-            # Show validation errors if any
-            if result.validation_errors:
-                response += "--- VALIDATION ERRORS ---\n"
-                response += "WARNING: The following issues were detected:\n\n"
-                for err in result.validation_errors[:10]:
-                    response += f"  [{err.error_type}] {err.file_path}:{err.line_number}\n"
-                    response += f"    {err.message}\n"
-                    if err.context:
-                        response += f"    Context: {err.context[:80]}...\n" if len(err.context) > 80 else f"    Context: {err.context}\n"
-                    response += "\n"
-                if len(result.validation_errors) > 10:
-                    response += f"  ... and {len(result.validation_errors) - 10} more errors\n"
-                response += "\nConsider using connector.rollback_changes() to undo these changes.\n\n"
-
-            if result.success:
-                response += "SUCCESS: All table names properly quoted. Report visuals should NOT break!\n"
-                response += "\nNext steps:\n"
-                response += "  1. Open the .pbip file in Power BI Desktop\n"
-                response += "  2. Verify the changes look correct\n"
-                response += "  3. Save as .pbix if you want to share the file\n"
-            else:
-                response += "FAILED: Validation errors detected. Review and fix before opening in Power BI Desktop.\n"
-                if result.backup_created:
-                    response += f"\nTo restore: Copy files from backup folder: {result.backup_created}\n"
-
-            return response
-
-        except Exception as e:
-            logger.error(f"PBIP rename tables error: {e}")
-            return f"Error: {str(e)}"
+        """Rename tables in PBIP files (model + report), all or nothing."""
+        return await self._run_pbip_rename("PBIP Batch Rename Tables", "batch_rename_tables", args)
 
     async def _handle_pbip_rename_columns(self, args: Dict[str, Any]) -> str:
-        """Rename columns in PBIP files (model + report)"""
-        try:
-            connector = self._get_pbip_connector()
-
-            if not connector.current_project:
-                return "No PBIP project loaded. Use 'pbip_load_project' first."
-
-            renames = args.get("renames", [])
-
-            if not renames:
-                return "Error: 'renames' array is required"
-
-            # Execute batch rename
-            batch_fn = lambda: connector.batch_rename_columns(renames)
-            result = await asyncio.get_event_loop().run_in_executor(None, batch_fn)
-
-            # Build response
-            response = "=== PBIP Batch Rename Columns ===\n\n"
-
-            # Show backup info if created
-            if result.backup_created:
-                response += f"BACKUP CREATED: {result.backup_created}\n\n"
-
-            response += f"{result.message}\n\n"
-
-            if result.files_modified:
-                response += "--- Files Modified ---\n"
-                for f in result.files_modified[:10]:
-                    response += f"  - {f}\n"
-                if len(result.files_modified) > 10:
-                    response += f"  ... and {len(result.files_modified) - 10} more\n"
-                response += "\n"
-
-            response += f"Total references updated: {result.references_updated}\n\n"
-
-            if result.success:
-                response += "SUCCESS: Column names properly updated. Report visuals should NOT break!\n"
-                response += "\nNext steps:\n"
-                response += "  1. Reopen the .pbip file in Power BI Desktop to see changes\n"
-                response += "  2. Verify the changes look correct\n"
-                response += "  3. Save as .pbix if you want to share the file\n"
-
-            return response
-
-        except Exception as e:
-            logger.error(f"PBIP rename columns error: {e}")
-            return f"Error: {str(e)}"
+        """Rename columns in PBIP files (model + report), all or nothing."""
+        return await self._run_pbip_rename("PBIP Batch Rename Columns", "batch_rename_columns", args)
 
     async def _handle_pbip_rename_measures(self, args: Dict[str, Any]) -> str:
-        """Rename measures in PBIP files (model + report)"""
-        try:
-            connector = self._get_pbip_connector()
-
-            if not connector.current_project:
-                return "No PBIP project loaded. Use 'pbip_load_project' first."
-
-            renames = args.get("renames", [])
-
-            if not renames:
-                return "Error: 'renames' array is required"
-
-            # Execute batch rename
-            batch_fn = lambda: connector.batch_rename_measures(renames)
-            result = await asyncio.get_event_loop().run_in_executor(None, batch_fn)
-
-            # Build response
-            response = "=== PBIP Batch Rename Measures ===\n\n"
-
-            # Show backup info if created
-            if result.backup_created:
-                response += f"BACKUP CREATED: {result.backup_created}\n\n"
-
-            response += f"{result.message}\n\n"
-
-            if result.files_modified:
-                response += "--- Files Modified ---\n"
-                for f in result.files_modified[:10]:
-                    response += f"  - {f}\n"
-                if len(result.files_modified) > 10:
-                    response += f"  ... and {len(result.files_modified) - 10} more\n"
-                response += "\n"
-
-            response += f"Total references updated: {result.references_updated}\n\n"
-
-            if result.success:
-                response += "SUCCESS: Measure names properly updated. Report visuals should NOT break!\n"
-                response += "\nNext steps:\n"
-                response += "  1. Reopen the .pbip file in Power BI Desktop to see changes\n"
-                response += "  2. Verify the changes look correct\n"
-                response += "  3. Save as .pbix if you want to share the file\n"
-
-            return response
-
-        except Exception as e:
-            logger.error(f"PBIP rename measures error: {e}")
-            return f"Error: {str(e)}"
+        """Rename measures in PBIP files (model + report), all or nothing."""
+        return await self._run_pbip_rename("PBIP Batch Rename Measures", "batch_rename_measures", args)
 
     async def _handle_pbip_fix_broken_visuals(self, args: Dict[str, Any]) -> str:
         """Fix broken visual references after a table rename"""
         try:
             connector = self._get_pbip_connector()
-
             if not connector.current_project:
                 return "No PBIP project loaded. Use 'pbip_load_project' first."
 
             old_table_name = args.get("old_table_name")
             new_table_name = args.get("new_table_name")
-
             if not old_table_name or not new_table_name:
                 return "Error: 'old_table_name' and 'new_table_name' are required"
 
-            # Execute fix
-            fix_fn = lambda: connector.fix_broken_visual_references(old_table_name, new_table_name)
+            fix_fn = lambda: connector.fix_broken_visual_references(old_table_name, new_table_name)  # noqa: E731
             result = await asyncio.get_event_loop().run_in_executor(None, fix_fn)
 
-            # Build response
             response = "=== Fix Broken Visual References ===\n\n"
-
             response += f"Old table name: {old_table_name}\n"
             response += f"New table name: {new_table_name}\n"
             response += f"Report format: {result.get('format', 'Unknown')}\n\n"
-
             if result.get("success"):
-                response += f"✅ SUCCESS: Fixed {result.get('references_fixed', 0)} references\n\n"
-
+                response += f"Fixed {result.get('references_fixed', 0)} reference(s).\n\n"
                 if result.get("files_modified"):
                     response += "--- Files Modified ---\n"
                     for f in result["files_modified"][:15]:
                         response += f"  - {f}\n"
                     if len(result["files_modified"]) > 15:
                         response += f"  ... and {len(result['files_modified']) - 15} more\n"
-                    response += "\nNext step: Reopen the report in Power BI Desktop to see changes.\n"
+                if result.get("backup_created"):
+                    response += f"\nBackup: {result['backup_created']}\n"
+                response += "\n" + self._RELOAD_HINT + "\n"
             else:
-                response += f"❌ No references found for '{old_table_name}'\n"
-                response += "\nPossible reasons:\n"
-                response += "  - The old table name doesn't exist in visuals\n"
-                response += "  - Visuals may already be updated\n"
-                response += "  - Try using 'pbip_scan_broken_refs' to diagnose\n"
-
+                response += f"Nothing was changed. {result.get('message') or 'No references matched.'}\n"
+                response += "Use pbip_scan_broken_refs to see which table names the report uses.\n"
+            for w in (result.get("warnings") or [])[:20]:
+                response += f"  ! {w}\n"
             return response
 
         except Exception as e:
-            logger.error(f"PBIP fix broken visuals error: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"PBIP fix broken visuals error: {self._redact(str(e))}")
+            return f"Error: {self._redact(str(e))}"
 
-    async def _handle_pbip_fix_dax_quoting(self) -> str:
+    async def _handle_pbip_fix_dax_quoting(self, args: Optional[Dict[str, Any]] = None) -> str:
         """Fix DAX expressions by properly quoting table names with spaces"""
         try:
             connector = self._get_pbip_connector()
-
             if not connector.current_project:
                 return "No PBIP project loaded. Use 'pbip_load_project' first."
 
-            # Execute fix
-            fix_fn = lambda: connector.fix_all_dax_quoting()
+            dry_run = bool((args or {}).get("dry_run", False))
+            fix_fn = lambda: connector.fix_all_dax_quoting(dry_run=dry_run)  # noqa: E731
             result = await asyncio.get_event_loop().run_in_executor(None, fix_fn)
 
-            # Build response
-            response = "=== Fix DAX Table Name Quoting ===\n\n"
-
+            response = f"=== Fix DAX Table Name Quoting {'(dry run) ' if dry_run else ''}===\n\n"
             if result.get("count", 0) > 0:
-                response += f"✅ SUCCESS: Fixed {result['count']} unquoted table references\n\n"
-
+                verb = "Would fix" if dry_run else "Fixed"
+                response += f"{verb} {result['count']} unquoted table reference(s).\n\n"
                 if result.get("tables_fixed"):
                     response += "--- Tables That Needed Quoting ---\n"
                     for table in result["tables_fixed"]:
-                        response += f"  • {table} -> '{table}'\n"
+                        response += f"  - {table} -> '{table}'\n"
                     response += "\n"
-
                 if result.get("files_modified"):
-                    response += "--- Files Modified ---\n"
+                    response += "--- Files ---\n"
                     for f in result["files_modified"][:10]:
                         response += f"  - {f}\n"
                     if len(result["files_modified"]) > 10:
                         response += f"  ... and {len(result['files_modified']) - 10} more\n"
-                    response += "\nNext step: Reopen the report in Power BI Desktop to see changes.\n"
+                    response += "\n"
+                response += ("Nothing was written (dry run).\n" if dry_run else self._RELOAD_HINT + "\n")
             else:
-                response += "✅ No fixes needed - all table names are properly quoted.\n"
+                response += "No fixes needed - all table names are properly quoted.\n"
 
             if result.get("errors"):
                 response += "\n--- Errors ---\n"
                 for err in result["errors"]:
-                    response += f"  ❌ {err['file']}: {err['error']}\n"
-
+                    response += f"  {err.get('file')}: {err.get('error')}\n"
             return response
 
         except Exception as e:
-            logger.error(f"PBIP fix DAX quoting error: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"PBIP fix DAX quoting error: {self._redact(str(e))}")
+            return f"Error: {self._redact(str(e))}"
 
     async def _handle_pbip_scan_broken_refs(self) -> str:
         """Scan for broken references in the PBIP project"""
@@ -5461,52 +5749,42 @@ class PowerBIMCPServer:
         """Validate TMDL syntax in the loaded project"""
         try:
             connector = self._get_pbip_connector()
-
             if not connector.current_project:
                 return "No PBIP project loaded. Use 'pbip_load_project' first."
 
-            # Execute validation
-            validate_fn = lambda: connector.validate_tmdl_syntax()
+            validate_fn = lambda: connector.validate_tmdl_syntax()  # noqa: E731
             errors = await asyncio.get_event_loop().run_in_executor(None, validate_fn)
 
-            # Build response
             response = "=== PBIP Validation Results ===\n\n"
-
             report_format = "PBIR-Enhanced" if connector.current_project.is_pbir_enhanced else "PBIR-Legacy"
             response += f"Report format: {report_format}\n"
             response += f"TMDL files: {len(connector.current_project.tmdl_files)}\n"
             response += f"Visual files: {len(connector.current_project.visual_json_files)}\n\n"
 
-            if errors:
-                response += f"❌ Found {len(errors)} validation error(s):\n\n"
+            if not errors:
+                return response + "No validation errors found. TMDL syntax is valid.\n"
 
-                # Group errors by type
-                by_type = {}
-                for err in errors:
-                    if err.error_type not in by_type:
-                        by_type[err.error_type] = []
-                    by_type[err.error_type].append(err)
-
-                for error_type, type_errors in by_type.items():
-                    response += f"--- {error_type} ({len(type_errors)}) ---\n"
-                    for err in type_errors[:5]:
-                        response += f"  Line {err.line_number}: {err.message}\n"
-                        if err.context:
-                            ctx = err.context[:60] + "..." if len(err.context) > 60 else err.context
-                            response += f"    Context: {ctx}\n"
-                    if len(type_errors) > 5:
-                        response += f"  ... and {len(type_errors) - 5} more\n"
-                    response += "\n"
-
-                response += "💡 FIX: Use 'pbip_fix_dax_quoting' to automatically fix quoting issues.\n"
-            else:
-                response += "✅ No validation errors found! TMDL syntax is valid.\n"
-
+            response += f"Found {len(errors)} validation error(s):\n\n"
+            by_type: Dict[str, list] = {}
+            for err in errors:
+                by_type.setdefault(err.error_type, []).append(err)
+            for error_type, type_errors in by_type.items():
+                response += f"--- {error_type} ({len(type_errors)}) ---\n"
+                for err in type_errors[:5]:
+                    response += f"  {os.path.basename(str(err.file_path))}:{err.line_number}: {err.message}\n"
+                    if err.context:
+                        ctx = err.context[:60] + "..." if len(err.context) > 60 else err.context
+                        response += f"    Context: {ctx}\n"
+                if len(type_errors) > 5:
+                    response += f"  ... and {len(type_errors) - 5} more\n"
+                response += "\n"
+            if "UNQUOTED_TABLE_IN_DAX" in by_type:
+                response += "Fix the quoting issues with pbip_fix_dax_quoting (dry_run=true shows the changes first).\n"
             return response
 
         except Exception as e:
-            logger.error(f"PBIP validate error: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"PBIP validate error: {self._redact(str(e))}")
+            return f"Error: {self._redact(str(e))}"
 
     # ==================== PBIR REPORT AUTHORING (preview) ====================
 
@@ -5526,7 +5804,7 @@ class PowerBIMCPServer:
             if not result.get("success"):
                 return f"Failed to add page: {result.get('message')}"
             return (f"Added page '{display_name}' (name {result['page_name']}).\n"
-                    f"Path: {result['path']}\nReopen Power BI Desktop to see it.")
+                    f"Path: {result['path']}\n" + self._RELOAD_HINT)
         except Exception as e:
             return f"Error adding page: {redact_secrets(str(e), [self.client_secret])}"
 
@@ -5550,7 +5828,7 @@ class PowerBIMCPServer:
                     msg += "\nMissing fields: " + ", ".join(result["missing_fields"])
                 return f"Failed to add visual: {msg}"
             return (f"Added {visual_type} '{result['visual_name']}' to page '{result['page']}'.\n"
-                    f"Path: {result['path']}\nReopen Power BI Desktop to see it.")
+                    f"Path: {result['path']}\n" + self._RELOAD_HINT)
         except Exception as e:
             return f"Error adding visual: {redact_secrets(str(e), [self.client_secret])}"
 
@@ -5596,6 +5874,621 @@ class PowerBIMCPServer:
             return out
         except Exception as e:
             return f"Error validating report bindings: {redact_secrets(str(e), [self.client_secret])}"
+
+    @staticmethod
+    def _is_zero(value: Any) -> bool:
+        """True for a numeric zero however the connector delivered it (0, 0.0, "0", "0.00")."""
+        try:
+            return float(value) == 0.0
+        except (TypeError, ValueError):
+            return False
+
+    async def _validate_measure_batch(self, table: str, measures: List[Dict[str, Any]]) -> Optional[str]:
+        """Validate a batch of new measures BEFORE any of them is created. Returns an error
+        message, or None when the batch is valid (or cannot be validated: Desktop not connected).
+
+        All measures of the batch, plus any still pending in an open transaction, are declared
+        with DEFINE MEASURE in one query and evaluated together, so a measure may reference a
+        sibling from the same batch and still be checked up front. When the combined probe
+        fails, each measure is re-checked with only its own dependencies defined, smallest
+        dependency set first, so the message names the measure that is actually broken rather
+        than one that merely depends on it.
+        """
+        batch = [{"table": table, "name": m["name"], "expression": m.get("expression") or ""} for m in measures]
+        defined = list(self._tom_pending_measures) + batch
+        columns = ", ".join(f'"v{i}", {dax_tokens.bracket(m["name"])}' for i, m in enumerate(batch))
+        probe = define_measures_block(defined) + f"EVALUATE ROW({columns})"
+        _rows, _report, error = await self._run_guarded_query(probe, tool="validate", max_rows=1)
+        if error is None or error.startswith("Not connected"):
+            return None
+        if error.startswith(("Refused:", "Query blocked")):
+            return f"[BLOCKED] Batch NOT created. {error}"
+
+        by_name = {m["name"].casefold(): m for m in defined}
+
+        def closure(m: Dict[str, str]) -> List[Dict[str, str]]:
+            seen: Dict[str, Dict[str, str]] = {}
+            stack = [m]
+            while stack:
+                cur = stack.pop()
+                key = cur["name"].casefold()
+                if key in seen:
+                    continue
+                seen[key] = cur
+                for r in dax_tokens.references(cur["expression"]):
+                    dep = by_name.get((r.name or "").casefold()) if r.kind == "bare" else None
+                    if dep is not None:
+                        stack.append(dep)
+            return list(seen.values())
+
+        closures = sorted(((closure(m), m) for m in batch), key=lambda pair: len(pair[0]))
+        for needed, m in closures:
+            single = define_measures_block(needed) + f'EVALUATE ROW("validation", {dax_tokens.bracket(m["name"])})'
+            _rows, _report, err1 = await self._run_guarded_query(single, tool="validate", max_rows=1)
+            if err1:
+                detail = err1[len("Error executing DAX: "):] if err1.startswith("Error executing DAX: ") else err1
+                return (f"[INVALID] Batch NOT created - measure '{m['name']}' failed validation.\n\n"
+                        f"Error: {detail}\n\nFix the DAX and retry (or pass skip_validation=true).")
+        detail = error[len("Error executing DAX: "):] if error.startswith("Error executing DAX: ") else error
+        return ("[INVALID] Batch NOT created - the measures failed validation together.\n\n"
+                f"Error: {detail}\n\nFix the DAX and retry (or pass skip_validation=true).")
+
+    async def _run_workspace_scan(self, rest, args: Dict[str, Any]):
+        """Run (or resume) Admin Scanner scans and merge their results.
+
+        Returns (scan, error, notes). A tenant with more than 100 workspaces needs several
+        scans; they are started together and polled within one time budget. If the budget runs
+        out, the error message carries every scan id so the caller can resume with ``scan_ids``
+        (the service keeps a finished scan's result for 24 hours).
+        """
+        loop = asyncio.get_event_loop()
+        notes: List[str] = []
+        scan_ids = [s for s in (args.get("scan_ids") or []) if s]
+        if not scan_ids:
+            ids = args.get("workspace_ids")
+            if not ids:
+                try:
+                    listed = await loop.run_in_executor(None, rest.admin_list_workspaces)
+                except Exception as e:
+                    return None, ("Error listing workspaces (needs admin / read-only admin APIs enabled): "
+                                  f"{self._redact(str(e))}"), notes
+                ids = [w.get("id") for w in listed if w.get("id")]
+            ids = list(dict.fromkeys(i for i in (ids or []) if i))
+            if not ids:
+                return None, "No workspaces found to scan.", notes
+            try:
+                limit = max(1, int(args.get("max_workspaces", 500) or 500))
+            except (TypeError, ValueError):
+                limit = 500
+            if len(ids) > limit:
+                notes.append(f"Scanned the first {limit} of {len(ids)} workspaces. Raise max_workspaces or "
+                             "pass workspace_ids to cover the rest; the inventory below is partial.")
+                ids = ids[:limit]
+            start_many = getattr(rest, "admin_start_scans", None)
+            if callable(start_many):
+                # dataset_schema=True: without it the Scanner omits roles and every dataset
+                # would read as "RLS unknown".
+                started_ids = await loop.run_in_executor(
+                    None, lambda: start_many(ids, lineage=True, dataset_schema=True))
+                scan_ids.extend(i for i in (started_ids or []) if i)
+                if not scan_ids:
+                    return None, "Error: no scan was started.", notes
+            else:
+                for start in range(0, len(ids), self._SCAN_CHUNK):
+                    started = await loop.run_in_executor(
+                        None, rest.admin_post_workspace_info, ids[start:start + self._SCAN_CHUNK], True)
+                    scan_id = (started or {}).get("id")
+                    if not scan_id:
+                        return None, f"Error: scan did not start ({started}).", notes
+                    scan_ids.append(scan_id)
+
+        try:
+            raw_budget = args.get("max_wait_seconds")
+            budget = 240.0 if raw_budget is None else max(0.0, float(raw_budget))
+        except (TypeError, ValueError):
+            budget = 240.0
+        deadline = time.time() + budget
+        merged: Dict[str, Any] = {"workspaces": []}
+        unfinished = []
+        for scan_id in scan_ids:
+            status = ""
+            last: Dict[str, Any] = {}
+            while True:
+                last = await loop.run_in_executor(None, rest.admin_get_scan_status, scan_id) or {}
+                status = str(last.get("status", "")).lower()
+                if status in ("succeeded", "failed") or time.time() >= deadline:
+                    break
+                await asyncio.sleep(min(self._SCAN_POLL_SECONDS, max(0.0, deadline - time.time())))
+            if status == "succeeded":
+                result = await loop.run_in_executor(None, rest.admin_get_scan_result, scan_id) or {}
+                merged["workspaces"].extend(result.get("workspaces") or [])
+            elif status == "failed":
+                return None, f"Scan {scan_id} failed: {last.get('error') or last}", notes
+            else:
+                unfinished.append(scan_id)
+        if unfinished:
+            return None, (f"{len(unfinished)} of {len(scan_ids)} scan(s) were still running after {budget:.0f}s. "
+                          "Call again with scan_ids set to the list below to pick up the results without "
+                          "starting new scans (results are kept for 24 hours):\n"
+                          f"  scan_ids: {json.dumps(scan_ids)}"), notes
+        return merged, None, notes
+
+    async def _handle_pbip_stage_publish(self, args: Dict[str, Any]):
+        """Stage a report (and optionally its model) for an in-place publish. Returns (text, result)."""
+        try:
+            project = self.pbip_connector.current_project if self.pbip_connector else None
+            report_dir = args.get("report_dir") or (
+                str(project.report_folder) if project and project.report_folder else None)
+            if not report_dir:
+                msg = "No report to stage: load a PBIP project (pbip_load_project) or pass report_dir."
+                return (msg, {"report": {}, "model": None, "error": msg})
+            stage_dir = args.get("stage_dir")
+            if not stage_dir:
+                return ("Error: stage_dir is required", {"report": {}, "model": None, "error": "stage_dir is required"})
+            overwrite = bool(args.get("overwrite", False))
+            loop = asyncio.get_event_loop()
+
+            model_result = None
+            if args.get("include_model"):
+                model_dir = args.get("model_dir") or (
+                    str(project.semantic_model_folder) if project and project.semantic_model_folder else None)
+                if not model_dir:
+                    msg = "include_model was set but there is no model folder: load a project or pass model_dir."
+                    return (msg, {"report": {}, "model": None, "error": msg})
+                model_result = await loop.run_in_executor(None, lambda: publish_stage.stage_model(
+                    model_dir, stage_dir, display_name=args.get("model_name"), overwrite=overwrite))
+
+            report_result = await loop.run_in_executor(None, lambda: publish_stage.stage_report(
+                report_dir, stage_dir, workspace=args.get("workspace"), model_name=args.get("model_name"),
+                model_id=args.get("model_id"), display_name=args.get("display_name"), overwrite=overwrite))
+
+            out = "=== Staged for publish ===\n\n"
+            if model_result:
+                out += "Model:\n  " + publish_stage.describe(model_result).replace("\n", "\n  ") + "\n\n"
+            out += "Report:\n  " + publish_stage.describe(report_result).replace("\n", "\n  ") + "\n\n"
+            out += ("Nothing was sent to the service. Check `fab auth status` shows the intended tenant, import "
+                    "the model first when it changed, then the report. Importing over an existing report "
+                    "keeps its id and its links.")
+            return (out, {"report": report_result, "model": model_result, "error": None})
+        except publish_stage.StageError as e:
+            return (f"Error: {e}", {"report": {}, "model": None, "error": str(e)})
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error staging for publish: {msg}", {"report": {}, "model": None, "error": msg})
+
+    def _pbip_model_fields(self) -> Optional[Dict[str, Any]]:
+        """The loaded project's model fields with kinds and data types, for validating report
+        field references. None when no project (or no model) is loaded."""
+        connector = self.pbip_connector
+        if not connector or not connector.current_project or not connector.current_project.semantic_model_folder:
+            return None
+        index = getattr(connector, "_model_field_index", None)
+        try:
+            return index() if callable(index) else connector.model_field_catalog()
+        except Exception as e:
+            logger.warning(f"Could not read the model's fields: {self._redact(str(e))}")
+            return None
+
+    async def _handle_pbir_apply_spec(self, args: Dict[str, Any]):
+        """Build or update report pages from a declarative spec (report as code). Returns (text, result)."""
+        empty = {"success": False, "written": [], "removed": [], "unchanged": 0, "warnings": [], "errors": []}
+        try:
+            connector = self._get_pbip_connector()
+            project = connector.current_project
+            if not project or not project.report_folder:
+                msg = "No PBIP project with a report is loaded. Use 'pbip_load_project' first."
+                return (msg, dict(empty, errors=[msg]))
+            spec = args.get("spec")
+            spec_path = args.get("spec_path")
+            if spec is None and spec_path:
+                try:
+                    spec = safe_io.read_json(spec_path)
+                except Exception as e:
+                    msg = f"Could not read spec_path: {e}"
+                    return (msg, dict(empty, errors=[msg]))
+            if isinstance(spec, str):
+                try:
+                    spec = json.loads(spec)
+                except ValueError as e:
+                    msg = f"'spec' is not valid JSON: {e}"
+                    return (msg, dict(empty, errors=[msg]))
+            if not isinstance(spec, dict):
+                msg = "Provide 'spec' (an object) or 'spec_path' (a JSON file)."
+                return (msg, dict(empty, errors=[msg]))
+
+            dry_run = bool(args.get("dry_run", False))
+            prune = bool(args.get("prune", False))
+            loop = asyncio.get_event_loop()
+            model_fields = self._pbip_model_fields() if not args.get("skip_field_validation") else None
+
+            backup = None
+            if not dry_run and args.get("backup", True):
+                backup = await loop.run_in_executor(None, connector.create_backup)
+
+            apply_fn = lambda: report_spec.apply_report_spec(  # noqa: E731
+                str(project.report_folder), spec, model_fields=model_fields, prune=prune,
+                dry_run=dry_run, adopt=bool(args.get("adopt", False)))
+            result = await loop.run_in_executor(None, apply_fn)
+
+            if result.get("success") and not dry_run:
+                # The connector caches the list of visual files; pick up what was just written.
+                await loop.run_in_executor(None, connector.load_project, str(project.pbip_file))
+
+            verb = "Would write" if dry_run else "Wrote"
+            out = f"=== Report spec {'(dry run) ' if dry_run else ''}===\n\n"
+            if not result.get("success"):
+                out += f"NOT applied: {len(result.get('errors', []))} problem(s). Nothing was written.\n\n"
+                for e in result.get("errors", [])[:60]:
+                    out += f"  [ERROR] {e}\n"
+            else:
+                out += (f"{verb} {len(result.get('written', []))} file(s), "
+                        f"{'would remove' if dry_run else 'removed'} {len(result.get('removed', []))}, "
+                        f"{result.get('unchanged', 0)} already up to date.\n")
+                for p in result.get("written", [])[:40]:
+                    out += f"  + {p}\n"
+                if len(result.get("written", [])) > 40:
+                    out += f"  ... and {len(result['written']) - 40} more\n"
+                for p in result.get("removed", [])[:40]:
+                    out += f"  - {p}\n"
+            for w in result.get("warnings", [])[:40]:
+                out += f"  [WARN] {w}\n"
+            if backup:
+                out += f"\nBackup of the project before this change: {backup}\n"
+            if result.get("success") and not dry_run and result.get("written"):
+                out += ("\nReload the open report with bridge_reload (never over unsaved changes), then check it "
+                        "with bridge_screenshot or audit_report_design.")
+            result = dict(result)
+            result["backup"] = str(backup) if backup else None
+            return (out, result)
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error applying report spec: {msg}", dict(empty, errors=[msg]))
+
+    @property
+    def _tom_transaction_active(self) -> bool:
+        """True while a TOM transaction is open. The connector owns that state, so a failed
+        commit or a reconnect cannot leave the server and the model disagreeing about it."""
+        tom = self.tom_connector
+        return bool(tom is not None and getattr(tom, "in_transaction", False))
+
+    async def _tom_save(self, tom):
+        """Persist one live edit. Returns (ok, note): inside a transaction nothing is saved and
+        the note says the edit is pending; otherwise the note is empty or carries the error."""
+        if self._tom_transaction_active:
+            return True, " (PENDING - run tom_commit_transaction to save)"
+        result = await asyncio.get_event_loop().run_in_executor(None, tom.save_changes)
+        if getattr(result, "success", False):
+            return True, ""
+        return False, self._redact(getattr(result, "message", "save failed"))
+
+    async def _suite_model_defaults(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill generator options the connected model can answer better than a default: the
+        base measure's own format string, and each dimension's sort-by column (without which
+        a share-of-total or rank over a sorted column silently returns 100% / 1 on every row).
+        Leaves explicit arguments alone and does nothing when no Desktop model is connected."""
+        desktop = self.desktop_connector
+        if desktop is None or not getattr(desktop, "current_port", None):
+            return kwargs
+        needs_format = "base_measure" in kwargs and "date_column" in kwargs and not kwargs.get("base_format")
+        needs_sort = "dimension_columns" in kwargs and not kwargs.get("sort_by_columns")
+        if not (needs_format or needs_sort):
+            return kwargs
+        try:
+            model, err = await self._gather_model_metadata("desktop")
+            if err or not model:
+                return kwargs
+            if needs_format:
+                fmt = dax_generator.measure_format_from_model(model, kwargs["base_measure"])
+                if fmt:
+                    kwargs["base_format"] = fmt
+            if needs_sort:
+                mapping = dax_generator.sort_by_columns_from_model(model)
+                if mapping:
+                    kwargs["sort_by_columns"] = mapping
+        except Exception as e:
+            logger.warning(f"Could not read generator defaults from the model: {self._redact(str(e))}")
+        return kwargs
+
+    async def _handle_generate_payload_measure(self, args: Dict[str, Any]):
+        """Generate a row-packing text measure and its JavaScript parser. Returns (text, result)."""
+        try:
+            name = args.get("name")
+            if not name:
+                return ("Error: name is required", {"error": "name is required"})
+            common = {k: args[k] for k in ("format", "record_sep", "field_sep", "display_folder", "expected_rows")
+                      if args.get(k) is not None}
+            if args.get("dimensions"):
+                result = payload_gen.generate_dimension_payload(name, args["dimensions"], **common)
+            else:
+                if not args.get("table") or not args.get("fields"):
+                    msg = "Provide table and fields (fact payload), or dimensions (lookup tables)."
+                    return (f"Error: {msg}", {"error": msg})
+                extra = {k: args[k] for k in ("order_by", "where", "grain") if args.get(k) is not None}
+                result = payload_gen.generate_payload_measure(name, args["table"], args["fields"], **common, **extra)
+            budget = result.get("budget") or {}
+            out = f"=== Payload measure: {result['name']} ({result.get('format')}) ===\n\n{result['dax']}\n\n"
+            out += f"--- JavaScript parser ({result.get('parser_name')}) ---\n{result['js_parser']}\n\n"
+            if budget:
+                out += (f"Budget: about {budget.get('estimated_chars_per_row')} characters per row; "
+                        f"roughly {budget.get('max_rows_at_ceiling'):,} rows fit under the "
+                        f"{budget.get('ceiling'):,}-character ceiling.\n"
+                        if isinstance(budget.get("max_rows_at_ceiling"), int) else f"Budget: {budget}\n")
+            notes = result.get("notes")
+            for n in (notes if isinstance(notes, list) else [notes] if notes else []):
+                out += f"Note: {n}\n"
+            result = dict(result, error=None)
+            return (out, result)
+        except ValueError as e:
+            return (f"Error: {e}", {"error": str(e)})
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error generating payload measure: {msg}", {"error": msg})
+
+    async def _handle_generate_html_measure(self, args: Dict[str, Any]):
+        """Generate an HTML Content measure (no JavaScript). Returns (text, result)."""
+        try:
+            kind = args.get("kind")
+            if not kind:
+                return ("Error: kind is required", {"error": "kind is required"})
+            params = dict(args.get("params") or {})
+            # Accept the parameters at the top level too, so a caller need not nest them.
+            for key, value in args.items():
+                if key not in ("kind", "name", "params") and value is not None:
+                    params.setdefault(key, value)
+            result = html_measures.generate(kind, name=args.get("name"), **params)
+            out = f"=== HTML measure: {result['name']} ({result['kind']}) ===\n\n{result['dax']}\n\n{result['notes']}\n"
+            return (out, dict(result, expression=result["dax"], error=None))
+        except (ValueError, TypeError) as e:
+            return (f"Error: {e}", {"error": str(e)})
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error generating HTML measure: {msg}", {"error": msg})
+
+    async def _handle_build_js_app_measure(self, args: Dict[str, Any]):
+        """Assemble CSS + JavaScript modules into measures for the HTML Content visual. Returns (text, result)."""
+        empty = {"measures": [], "sizes": {}, "warnings": [], "node_check": "skipped", "written": False}
+        try:
+            prefix = args.get("prefix")
+            if not prefix:
+                return ("Error: prefix is required", dict(empty, error="prefix is required"))
+            target = (args.get("target") or "none").lower()
+            if target not in ("none", "pbip"):
+                return (f"Error: unknown target '{target}'.", dict(empty, error="bad_target"))
+            if target == "pbip" and self._read_only:
+                msg = ("Refused: writing measures is a write operation and the server is in READ-ONLY mode. "
+                       "Use target='none' to build without writing.")
+                return (msg, dict(empty, error="read_only"))
+
+            css = args.get("css")
+            if css is None and args.get("css_path"):
+                css, _fmt = safe_io.read_text(args["css_path"])
+            modules = args.get("js_dir")
+            if not modules:
+                modules = [(m.get("name") or f"module{i}", m.get("source") or "")
+                           for i, m in enumerate(args.get("js_modules") or [])]
+            if not modules:
+                msg = "Provide js_modules ([{name, source}]) or js_dir (a folder of .js files)."
+                return (f"Error: {msg}", dict(empty, error=msg))
+
+            loop = asyncio.get_event_loop()
+            build_fn = lambda: js_app_measure.build_js_app_measures(  # noqa: E731
+                prefix, css=css or "", js_modules=modules, payload_measures=args.get("payload_measures"),
+                root_id=args.get("root_id") or "app-root",
+                empty_message=args.get("empty_message") or "No data for the current filters.",
+                minify=bool(args.get("minify", True)), display_folder=args.get("display_folder"))
+            built = await loop.run_in_executor(None, build_fn)
+
+            written = False
+            write_note = "Not written (target='none')."
+            if target == "pbip":
+                table = args.get("table")
+                if not table:
+                    return ("Error: 'table' is required for target='pbip'.", dict(empty, error="table_required"))
+                connector = self._get_pbip_connector()
+                if not connector.current_project:
+                    return ("No PBIP project loaded. Use 'pbip_load_project' first.", dict(empty, error="no_project"))
+                res = await loop.run_in_executor(
+                    None, lambda: connector.add_measures(table, built["measures"], mode="upsert"))
+                if not res.get("success"):
+                    msg = res.get("message") or "write failed"
+                    return (f"Built but NOT written: {msg}", dict(empty, sizes=built.get("sizes", {}), error=msg))
+                written = True
+                write_note = (f"Written into {res.get('path')}: created {len(res.get('created', []))}, "
+                              f"updated {len(res.get('updated', []))}. Reload the report with bridge_reload.")
+
+            sizes = built.get("sizes") or {}
+            out = f"=== JavaScript app measures: {prefix} ===\n\n"
+            for m in built["measures"]:
+                out += f"  {m['name']}: {len(m['expression']):,} characters\n"
+            if isinstance(sizes.get("total"), int) and sizes.get("ceiling"):
+                out += f"  total: {sizes['total']:,} characters ({100.0 * sizes['total'] / sizes['ceiling']:.1f}% of the ceiling)\n"
+            out += f"\nNode syntax check: {built.get('node_check')}\n"
+            for w in built.get("warnings", []):
+                out += f"  [WARN] {w}\n"
+            out += f"\n{write_note}\n"
+            measures = built["measures"] if args.get("return_expressions") else [
+                {"name": m["name"], "chars": len(m["expression"]), "display_folder": m.get("display_folder")}
+                for m in built["measures"]]
+            return (out, {"measures": measures, "sizes": sizes, "warnings": built.get("warnings", []),
+                          "node_check": built.get("node_check"), "written": written, "error": None})
+        except ValueError as e:
+            return (f"Build failed: {e}", dict(empty, error=str(e)))
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error building the app measures: {msg}", dict(empty, error=msg))
+
+    async def _handle_pbip_embed_data(self, args: Dict[str, Any]):
+        """Embed CSV data into the loaded model's partitions (dry run by default). Returns (text, result)."""
+        empty = {"success": False, "dry_run": True, "tables": [], "self_contained": False, "changed_files": []}
+        try:
+            connector = self._get_pbip_connector()
+            project = connector.current_project
+            if not project or not project.semantic_model_folder:
+                msg = "No PBIP project with a semantic model is loaded. Use 'pbip_load_project' first."
+                return (msg, dict(empty, error=msg))
+            tables = args.get("tables")
+            if not isinstance(tables, dict) or not tables:
+                msg = "tables is required: {table name: path of a CSV file}."
+                return (f"Error: {msg}", dict(empty, error=msg))
+            dry_run = bool(args.get("dry_run", True))
+            options = {"dry_run": dry_run}
+            if args.get("max_bytes"):
+                options["max_bytes"] = int(args["max_bytes"])
+            if args.get("delimiter"):
+                options["delimiter"] = args["delimiter"]
+            loop = asyncio.get_event_loop()
+            backup = None
+            if not dry_run and args.get("backup", True):
+                backup = await loop.run_in_executor(None, connector.create_backup)
+            result = await loop.run_in_executor(
+                None, lambda: model_embed.embed_tables(str(project.semantic_model_folder), tables, **options))
+            if result.get("success") and not dry_run:
+                await loop.run_in_executor(None, connector.load_project, str(project.pbip_file))
+
+            out = f"=== Embed data {'(dry run) ' if dry_run else ''}===\n\n"
+            for t in result.get("tables", []):
+                out += (f"  {t.get('table')}: {t.get('rows'):,} rows, {t.get('columns')} columns, "
+                        f"CSV {t.get('csv_bytes'):,} bytes -> {t.get('embedded_chars'):,} characters embedded\n")
+                for w in t.get("warnings", []):
+                    out += f"      [WARN] {w}\n"
+            for name in result.get("removed_expressions", []):
+                out += f"  parameter removed: {name}\n"
+            for kept in result.get("kept_expressions", []):
+                out += f"  parameter kept: {kept.get('name')} ({kept.get('reason')})\n"
+            for ext in result.get("external_sources", []):
+                out += f"  still reads from outside: {ext.get('object')} ({', '.join(ext.get('functions', []))})\n"
+            out += f"\nSelf-contained after this change: {result.get('self_contained')}\n"
+            if dry_run:
+                out += "Nothing was written. Run again with dry_run=false to apply.\n"
+            else:
+                out += (f"Changed {len(result.get('changed_files', []))} file(s). Publishing a model definition "
+                        "uploads no data: refresh once in the service after importing it.\n")
+                if backup:
+                    out += f"Backup of the project before this change: {backup}\n"
+            notes = result.get("notes")
+            for n in (notes if isinstance(notes, list) else [notes] if notes else []):
+                out += f"Note: {n}\n"
+            return (out, dict(result, error=None))
+        except ValueError as e:
+            return (f"Error: {e}", dict(empty, error=str(e)))
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error embedding data: {msg}", dict(empty, error=msg))
+
+    async def _handle_audit_report_design(self, args: Dict[str, Any]):
+        """Audit the report layer (structure, design, governance). Returns (text, result)."""
+        try:
+            report_dir = args.get("report_dir")
+            model_fields = None
+            if not report_dir:
+                connector = self.pbip_connector
+                project = connector.current_project if connector else None
+                if not project or not project.report_folder:
+                    msg = "No report to audit: load a PBIP project (pbip_load_project) or pass report_dir."
+                    return (msg, {"summary": {}, "findings": [], "error": msg})
+                report_dir = str(project.report_folder)
+                index = self._pbip_model_fields()
+                if index:
+                    model_fields = {table: (list(fields) if not isinstance(fields, dict) else list(fields.keys()))
+                                    for table, fields in index.items()}
+            options = {k: int(args[k]) for k in ("max_data_visuals_per_page", "max_visuals_per_page")
+                       if args.get(k) is not None}
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: report_audit.audit_report(report_dir, model_fields=model_fields, **options))
+            rank = {"info": 1, "warning": 2, "error": 3}
+            floor = rank.get((args.get("min_severity") or "info").lower(), 1)
+            findings = [f for f in result.get("findings", []) if rank.get(f.get("severity"), 1) >= floor]
+            s = result.get("summary", {})
+            counts: Dict[str, int] = {}
+            for f in findings:
+                counts[f.get("severity", "info")] = counts.get(f.get("severity", "info"), 0) + 1
+            out = "=== Report Audit ===\n\n"
+            out += f"Pages: {s.get('pages')}   Visuals: {s.get('visuals')}   Bookmarks: {s.get('bookmarks')}\n"
+            out += (f"Findings: {len(findings)}  (errors: {counts.get('error', 0)}, warnings: "
+                    f"{counts.get('warning', 0)}, info: {counts.get('info', 0)})\n")
+            if s.get("field_check"):
+                out += f"Field check: {s.get('field_check')}\n"
+            out += "\n"
+            for f in findings[:200]:
+                where = " / ".join(str(x) for x in (f.get("page"), f.get("visual")) if x)
+                out += f"  [{str(f.get('severity', 'info')).upper()}] {f.get('code')}{(' ' + where) if where else ''}: {f.get('message')}\n"
+                if f.get("recommendation"):
+                    out += f"      fix: {f['recommendation']}\n"
+            if len(findings) > 200:
+                out += f"\n... and {len(findings) - 200} more (raise min_severity to narrow).\n"
+            if not findings:
+                out += "  No findings at this severity.\n"
+            return (out, {"summary": s, "findings": findings, "error": None})
+        except ValueError as e:
+            return (f"Error: {e}", {"summary": {}, "findings": [], "error": str(e)})
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error auditing the report: {msg}", {"summary": {}, "findings": [], "error": msg})
+
+    def _render_rename_result(self, title: str, result) -> str:
+        """One honest rendering for every rename tool: what was written, or that nothing was."""
+        response = f"=== {title} ===\n\n"
+        if result.success:
+            response += f"{result.message}\n\n"
+            if result.files_modified:
+                response += "--- Files Modified ---\n"
+                for f in result.files_modified[:10]:
+                    response += f"  - {f}\n"
+                if len(result.files_modified) > 10:
+                    response += f"  ... and {len(result.files_modified) - 10} more\n"
+                response += "\n"
+            response += f"Total references updated: {result.references_updated}\n"
+            if result.backup_created:
+                response += f"Backup of the project before this change: {result.backup_created}\n"
+            warnings = list(getattr(result, "warnings", None) or [])
+            if warnings:
+                response += f"\n--- Check these by hand ({len(warnings)}) ---\n"
+                for w in warnings[:20]:
+                    response += f"  ! {w}\n"
+                if len(warnings) > 20:
+                    response += f"  ... and {len(warnings) - 20} more\n"
+            response += ("\nThe model and the report were updated together. Confirm with pbir_validate_report. "
+                         "pbip_undo restores the files as they were before this change.\n" + self._RELOAD_HINT + "\n")
+            return response
+
+        response += f"NOT RENAMED. Nothing was written.\n\n{result.message}\n"
+        if result.validation_errors:
+            response += f"\n--- Why ({len(result.validation_errors)}) ---\n"
+            for err in result.validation_errors[:10]:
+                response += f"  [{err.error_type}] {err.file_path}:{err.line_number}\n    {err.message}\n"
+            if len(result.validation_errors) > 10:
+                response += f"  ... and {len(result.validation_errors) - 10} more\n"
+        return response
+
+    async def _run_pbip_rename(self, title: str, method: str, args: Dict[str, Any]) -> str:
+        try:
+            connector = self._get_pbip_connector()
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+            renames = args.get("renames", [])
+            if not renames:
+                return "Error: 'renames' array is required"
+            batch_fn = lambda: getattr(connector, method)(renames)  # noqa: E731
+            result = await asyncio.get_event_loop().run_in_executor(None, batch_fn)
+            return self._render_rename_result(title, result)
+        except Exception as e:
+            logger.error(f"{title} error: {self._redact(str(e))}")
+            return f"Error: {self._redact(str(e))}"
+
+    async def _handle_pbip_undo(self, args: Dict[str, Any]) -> str:
+        """Undo the last committed rename, repair or quoting fix on the loaded project."""
+        try:
+            connector = self._get_pbip_connector()
+            if not connector.current_project:
+                return "No PBIP project loaded. Use 'pbip_load_project' first."
+            ok = await asyncio.get_event_loop().run_in_executor(None, connector.rollback_changes)
+            if ok:
+                return ("Undone: every file changed by the last rename or repair was restored to its "
+                        "previous bytes.\n" + self._RELOAD_HINT)
+            reason = getattr(connector, "last_error", None)
+            return "Nothing was undone" + (f": {reason}" if reason else ": there is no change to undo in this session.")
+        except Exception as e:
+            return f"Error undoing the last change: {self._redact(str(e))}"
 
     async def run(self):
         """Run the MCP server"""

@@ -1,7 +1,17 @@
 """
 Power BI MCP Security Module
-Provides PII detection, audit logging, and access policy enforcement
+PII detection, audit logging, access policy enforcement and secret redaction.
+
+This is defence in depth for an AI client that is already allowed to query the model. The
+security boundary is row-level and object-level security in the model itself.
 """
+
+from .env import env_flag
+
+from .redaction import (
+    redact_secrets,
+    redact_structure
+)
 
 from .pii_detector import (
     PIIDetector,
@@ -14,6 +24,7 @@ from .audit_logger import (
     AuditLogger,
     AuditEventType,
     AuditSeverity,
+    AuditWriteError,
     get_audit_logger,
     configure_audit_logger
 )
@@ -22,6 +33,7 @@ from .access_policy import (
     AccessPolicyEngine,
     PolicyAction,
     PolicyLevel,
+    PolicyConfigError,
     TablePolicy,
     ColumnPolicy,
     GlobalPolicy,
@@ -36,6 +48,11 @@ from .security_layer import (
 )
 
 __all__ = [
+    # Environment switches
+    'env_flag',
+    # Secret redaction
+    'redact_secrets',
+    'redact_structure',
     # PII Detection
     'PIIDetector',
     'PIIType',
@@ -45,12 +62,14 @@ __all__ = [
     'AuditLogger',
     'AuditEventType',
     'AuditSeverity',
+    'AuditWriteError',
     'get_audit_logger',
     'configure_audit_logger',
     # Access Policies
     'AccessPolicyEngine',
     'PolicyAction',
     'PolicyLevel',
+    'PolicyConfigError',
     'TablePolicy',
     'ColumnPolicy',
     'GlobalPolicy',

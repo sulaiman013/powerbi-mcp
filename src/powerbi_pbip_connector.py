@@ -1,206 +1,103 @@
 """
-Power BI PBIP (Power BI Project) Connector
-Provides file-based editing for PBIP format to safely rename tables, columns, measures
-without breaking report visuals.
+Power BI PBIP (Power BI Project) connector: offline editing of the files on disk.
 
-Supports BOTH report formats:
-  - PBIR-Legacy: Single report.json file (older format)
-  - PBIR: Individual visual.json files (new enhanced format, default from Jan 2026)
+A PBIP project is a folder holding
 
-PBIP Structure:
-  project.pbip
-  ProjectName.SemanticModel/
-    definition.tmdl (or model.tmd)
-    definition/
-      tables/*.tmdl
-      relationships/*.tmdl  <- Individual relationship files
-      relationships.tmdl    <- Or single file
-      cultures/*.tmdl       <- Linguistic schema (ConceptualEntity references)
-      etc.
-  ProjectName.Report/
-    report.json             <- PBIR-Legacy: All visuals in one file
-    definition.pbir         <- Points to semantic model
-    definition/             <- PBIR Enhanced format (new)
-      report.json           <- Report-level settings only
-      pages/
-        pages.json          <- Page listing
-        [page_id]/
-          page.json         <- Page settings
-          visuals/
-            [visual_id]/
-              visual.json   <- Individual visual definition with Entity refs
+    <Name>.pbip                         points at the report folder
+    <Name>.Report/
+      definition.pbir                   points at the semantic model (byPath) or a remote one
+      definition/                       PBIR-Enhanced: report.json, pages/<page>/page.json,
+                                        pages/<page>/visuals/<visual>/visual.json (+ mobile.json),
+                                        bookmarks/*.bookmark.json, reportExtensions.json
+      report.json                       PBIR-Legacy: the whole report in one file
+    <Name>.SemanticModel/
+      definition/                       TMDL: model.tmdl, relationships.tmdl, tables/*.tmdl,
+                                        cultures/*.tmdl, roles/*.tmdl, expressions.tmdl
+      diagramLayout.json
 
-TMDL Name Quoting Rules (Microsoft Spec):
-  - Names with spaces, special chars, or reserved words MUST be quoted with single quotes
-  - Examples:
-    - table 'Customer Appointments'  (spaces - MUST quote)
-    - table Sales                    (no spaces - no quote needed)
-    - fromTable: 'My Table'          (spaces in relationship ref)
+This module is the public face of that editing: project discovery, safe renames, offline
+authoring (measures, date table, calculation group, hierarchy, pages, visuals) and validation.
+The heavy lifting lives in focused modules:
 
-References:
-  - Data Goblins: https://data-goblins.com/power-bi/programmatically-modify-reports
-  - Microsoft PBIR: https://powerbi.microsoft.com/en-us/blog/power-bi-enhanced-report-format-pbir-in-power-bi-desktop-developer-mode-preview/
+    tmdl_scan      object tree and model catalog for TMDL text
+    pbip_report    structural reading / rewriting of report JSON
+    pbip_rename    the transactional rename engine
+    safe_io        atomic, format-preserving file I/O and all-or-nothing commits
+
+Every write goes through safe_io, so a file keeps its encoding (BOM or not) and line endings,
+and an operation that changes several files changes all of them or none.
 """
 import json
 import logging
 import os
 import re
 import shutil
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from dataclasses import dataclass, field
 
+import pbip_json
+import pbip_mquery
+import pbip_rename
+import pbip_report
 import pbir_authoring
+import safe_io
 import tmdl_authoring
+import tmdl_scan
+from pbip_report import RenameOp
 
 logger = logging.getLogger(__name__)
 
+BACKUP_FOLDER = ".pbip-backups"
+# Namespace for the lineage tags given to measures created by an upsert, so that building the
+# same measure in the same table always yields the same tag (and the same bytes on disk).
+LINEAGE_NAMESPACE = uuid.UUID("6f0f2f0e-7c1b-5d8a-9b43-2a5c0e9d4b17")
+MAX_WARNINGS_IN_MESSAGE = 12
 
-# Characters that require quoting in TMDL names
+# Characters that make this module quote a TMDL name. TMDL itself only requires quotes around
+# whitespace, '.', '=', ':' and "'", but quoting more is always valid.
 TMDL_SPECIAL_CHARS = set(' \t\n\r\'\"[]{}().,;:!@#$%^&*+-=<>?/\\|`~')
 TMDL_RESERVED_WORDS = {'table', 'column', 'measure', 'relationship', 'partition', 'hierarchy', 'level',
                        'annotation', 'expression', 'from', 'to', 'true', 'false', 'null'}
 
 
 def needs_tmdl_quoting(name: str) -> bool:
-    """
-    Check if a TMDL name needs single quotes
-
-    Rules:
-    - Names with spaces need quotes
-    - Names with special characters need quotes
-    - Names starting with digits need quotes
-    - Reserved words need quotes
-    """
+    """True when ``name`` should be single-quoted in TMDL or DAX: it has a space or another
+    special character, starts with a digit, or is a reserved word."""
     if not name:
         return False
-
-    # Check for spaces or special chars
     if any(c in TMDL_SPECIAL_CHARS for c in name):
         return True
-
-    # Check if starts with digit
     if name[0].isdigit():
         return True
-
-    # Check reserved words (case insensitive)
-    if name.lower() in TMDL_RESERVED_WORDS:
-        return True
-
-    return False
+    return name.lower() in TMDL_RESERVED_WORDS
 
 
 def quote_tmdl_name(name: str) -> str:
-    """
-    Quote a TMDL name if needed
-
-    Args:
-        name: The name to potentially quote
-
-    Returns:
-        Quoted name if needed, otherwise original name
-    """
+    """``name`` single-quoted (inner quotes doubled) when it needs it, else unchanged."""
     if needs_tmdl_quoting(name):
-        # Escape any existing single quotes
-        escaped = name.replace("'", "''")
-        return f"'{escaped}'"
+        return "'" + name.replace("'", "''") + "'"
     return name
 
 
 def unquote_tmdl_name(name: str) -> str:
-    """Remove TMDL quotes from a name if present"""
-    if name.startswith("'") and name.endswith("'"):
-        # Remove outer quotes and unescape inner quotes
-        return name[1:-1].replace("''", "'")
-    return name
+    """Remove TMDL quotes from a name if present."""
+    return tmdl_scan.unquote_name(name)
 
 
 def quote_mcode_name(name: str) -> str:
-    """
-    Quote a name for M-Code/Power Query if needed.
-
-    M-Code uses #"..." format for names with spaces or special characters.
-    Names without spaces can be used directly.
-
-    Examples:
-        - Salesforce_Data -> Salesforce_Data (no quotes needed)
-        - Leads Sales Data -> #"Leads Sales Data" (quotes required)
-    """
-    # Check if name needs quoting (has spaces or special chars)
-    if ' ' in name or any(c in name for c in '!"#$%&\'()*+,-./:;<=>?@[\\]^`{|}~'):
-        return f'#"{name}"'
-    return name
-
-
-def extract_external_refs(content: str) -> Tuple[str, Dict[str, str]]:
-    """
-    Extract ONLY external dataflow references from M-Code and replace with placeholders.
-
-    External references like {[entity="TableName",version=""]} point to external
-    data sources and should NEVER be modified during renames.
-
-    Internal table references like Source = TableName SHOULD be modified.
-
-    Returns:
-        Tuple of (content_with_placeholders, {placeholder: original_ref})
-    """
-    external_refs = {}
-    placeholder_counter = [0]
-
-    def replace_external(match):
-        placeholder = f"__EXTERNAL_REF_{placeholder_counter[0]}__"
-        placeholder_counter[0] += 1
-        external_refs[placeholder] = match.group(0)
-        return placeholder
-
-    # Pattern to match external dataflow references: {[entity="...",version="..."]}[Data]
-    # This captures the entire external source reference pattern
-    external_pattern = r'\{\[entity="[^"]+",version="[^"]*"\]\}\[Data\]'
-
-    content_with_placeholders = re.sub(external_pattern, replace_external, content)
-
-    return content_with_placeholders, external_refs
-
-
-def restore_external_refs(content: str, external_refs: Dict[str, str]) -> str:
-    """Restore external dataflow references from placeholders (unchanged)"""
-    for placeholder, original in external_refs.items():
-        content = content.replace(placeholder, original)
-    return content
+    """``name`` as a Power Query identifier: bare when it is a regular identifier, otherwise
+    #"..." with inner double quotes doubled."""
+    return pbip_mquery.quote_identifier(name)
 
 
 def fix_dax_table_references(dax_expression: str, table_names: List[str]) -> str:
-    """
-    Fix DAX expressions by quoting table names that have spaces or special chars.
-
-    This handles cases like:
-    - SUM(Leads Sales Data[Amount]) -> SUM('Leads Sales Data'[Amount])
-    - CALCULATE(SUM(My Table[Col])) -> CALCULATE(SUM('My Table'[Col]))
-
-    Args:
-        dax_expression: The DAX expression to fix
-        table_names: List of table names in the model (used for context)
-
-    Returns:
-        Fixed DAX expression with proper table name quoting
-    """
-    result = dax_expression
-
-    for table_name in table_names:
-        if needs_tmdl_quoting(table_name):
-            # Find all unquoted references to this table followed by [
-            # Matches: TableName[Column] but not 'TableName'[Column]
-            pattern = rf"(?<!['\w]){re.escape(table_name)}(?=\s*\[)"
-            replacement = quote_tmdl_name(table_name)
-            result = re.sub(pattern, replacement, result)
-
-            # Also fix function call patterns like: RELATED(TableName
-            # but not: RELATED('TableName
-            pattern2 = rf"(?<=[A-Za-z]\()\s*{re.escape(table_name)}(?=\s*[\[\,\)])"
-            result = re.sub(pattern2, replacement, result)
-
-    return result
+    """Quote table names containing spaces that a DAX expression uses without quotes:
+    ``SUM(Leads Sales Data[Amount])`` becomes ``SUM('Leads Sales Data'[Amount])``. Text inside
+    string literals, comments and already quoted names is never touched."""
+    return pbip_rename.quote_unquoted_tables(dax_expression, table_names)[0]
 
 
 @dataclass
@@ -210,21 +107,22 @@ class PBIPProject:
     pbip_file: Path
     semantic_model_folder: Optional[Path]
     report_folder: Optional[Path]
-    report_json_path: Optional[Path]  # PBIR-Legacy: root report.json
+    report_json_path: Optional[Path]  # legacy: <Report>/report.json; enhanced: definition/report.json
     tmdl_files: List[Path]
     backup_path: Optional[Path] = None
-    # PBIR Enhanced format fields
     is_pbir_enhanced: bool = False
-    pbir_definition_folder: Optional[Path] = None  # Report/definition/ folder
-    visual_json_files: List[Path] = field(default_factory=list)  # All visual.json files
-    cultures_files: List[Path] = field(default_factory=list)  # Linguistic schema files
-    # Additional semantic model files
-    diagram_layout_path: Optional[Path] = None  # diagramLayout.json for model diagram
+    pbir_definition_folder: Optional[Path] = None  # <Report>/definition
+    visual_json_files: List[Path] = field(default_factory=list)
+    cultures_files: List[Path] = field(default_factory=list)
+    diagram_layout_path: Optional[Path] = None
+    # Set when the report is bound to a model that is not in this folder (definition.pbir
+    # byConnection), so no semantic model is edited on its behalf.
+    remote_model: bool = False
 
 
 @dataclass
 class ValidationError:
-    """Represents a validation error found after rename"""
+    """One problem found by a validation pass"""
     file_path: str
     line_number: int
     error_type: str
@@ -234,7 +132,10 @@ class ValidationError:
 
 @dataclass
 class RenameResult:
-    """Result of a PBIP rename operation"""
+    """Result of a PBIP rename operation. ``success`` is True only when the rename was applied
+    in full; when it is False nothing was written. ``warnings`` lists what was applied but
+    could not be guaranteed (ambiguous references left alone, free text that still contains
+    the old name)."""
     success: bool
     message: str
     files_modified: List[str]
@@ -242,335 +143,335 @@ class RenameResult:
     details: Optional[Dict[str, Any]] = None
     validation_errors: List[ValidationError] = field(default_factory=list)
     backup_created: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+def _read_json_file(path: Path) -> Optional[Any]:
+    """Parsed JSON of a small project file, or None when it is missing or unreadable."""
+    try:
+        return safe_io.read_json(path)
+    except (OSError, ValueError):
+        return None
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _merge_paths(found: List[Path], declared: List[Path]) -> List[Path]:
+    """``found`` plus any path in ``declared`` that it lacks (compared case-insensitively
+    where the file system is)."""
+    seen = {os.path.normcase(os.path.abspath(p)) for p in found}
+    out = list(found)
+    for p in declared:
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            out.append(Path(p))
+    return out
 
 
 class PowerBIPBIPConnector:
-    """
-    PBIP Connector for file-based Power BI Project editing
+    """File-based editing of one loaded PBIP project.
 
-    Enables safe bulk renames by editing:
-    - TMDL files (semantic model definitions)
-    - report.json (visual field bindings)
-
-    Key improvements in V2.1:
-    - Proper TMDL quoting for names with spaces
-    - Complete relationship reference updates (fromTable/toTable)
-    - Automatic backup before changes
-    - Post-change validation
+    ``auto_backup`` is opt-in: when True, a copy of the project's own files is taken under
+    <project>/.pbip-backups before each rename or repair that is about to be written, and
+    before the first authoring change of a session. Without it, safety comes from the
+    all-or-nothing commit and rollback_changes(), which undoes the last committed operation.
     """
 
-    def __init__(self, auto_backup: bool = True):
+    def __init__(self, auto_backup: bool = False):
         self.current_project: Optional[PBIPProject] = None
         self.auto_backup = auto_backup
-        self._original_files: Dict[str, str] = {}  # For rollback
-        self._file_encodings: Dict[str, str] = {}  # Remember utf-8 vs utf-8-sig (BOM) per file
+        self.last_error: Optional[str] = None            # why the last load / backup failed
+        self.unreadable_files: List[Tuple[str, str]] = []  # (path, error) from the last scan
+        self._undo: Dict[str, Optional[bytes]] = {}       # file bytes before the last committed edit
+        self._formats: Dict[str, safe_io.TextFormat] = {}
 
-    @staticmethod
-    def find_pbip_project_from_model_name(model_name: str, search_paths: Optional[List[str]] = None) -> Optional[PBIPProject]:
-        """
-        Find a PBIP project that matches the given model name
-
-        Args:
-            model_name: Name of the model (usually the database name from TOM)
-            search_paths: Optional list of paths to search for PBIP projects
-
-        Returns:
-            PBIPProject if found, None otherwise
-        """
-        if not search_paths:
-            # Default search locations
-            search_paths = [
-                os.path.expanduser("~/Documents"),
-                os.path.expanduser("~/Desktop"),
-                os.path.expanduser("~/Downloads"),
-                "C:/",
-            ]
-
-        # Also check common development folders
-        for base in ["C:/Users", os.path.expanduser("~")]:
-            for folder in ["Projects", "Work", "Dev", "GitHub", "Repos"]:
-                path = os.path.join(base, folder)
-                if os.path.exists(path):
-                    search_paths.append(path)
-
-        for search_path in search_paths:
-            if not os.path.exists(search_path):
-                continue
-
-            # Look for .pbip files
-            try:
-                for root, dirs, files in os.walk(search_path):
-                    # Limit depth to avoid searching too deep
-                    depth = root.replace(search_path, '').count(os.sep)
-                    if depth > 5:
-                        continue
-
-                    for file in files:
-                        if file.endswith('.pbip'):
-                            pbip_path = Path(root) / file
-                            project = PowerBIPBIPConnector._parse_pbip_project(pbip_path)
-                            if project:
-                                # Check if model name matches
-                                if project.semantic_model_folder and model_name.lower() in project.semantic_model_folder.name.lower():
-                                    logger.info(f"Found PBIP project for model '{model_name}' at: {pbip_path}")
-                                    return project
-            except PermissionError:
-                continue
-
-        return None
+    # ==================== PROJECT DISCOVERY ====================
 
     @staticmethod
     def find_pbip_from_path(pbip_path: str) -> Optional[PBIPProject]:
-        """
-        Parse a PBIP project from a given path
-
-        Args:
-            pbip_path: Path to the .pbip file or project folder
-
-        Returns:
-            PBIPProject if valid, None otherwise
-        """
+        """Parse the project at ``pbip_path``: a .pbip file, or a folder holding exactly one.
+        A folder with several .pbip files is ambiguous and returns None; pass the file."""
         path = Path(pbip_path)
-
-        # If it's a folder, look for .pbip file inside
         if path.is_dir():
-            pbip_files = list(path.glob("*.pbip"))
-            if pbip_files:
-                path = pbip_files[0]
-            else:
+            candidates = sorted(path.glob("*.pbip"))
+            if len(candidates) != 1:
                 return None
-
-        if not path.exists() or not path.suffix == '.pbip':
+            path = candidates[0]
+        if not path.is_file() or path.suffix.lower() != ".pbip":
             return None
-
         return PowerBIPBIPConnector._parse_pbip_project(path)
 
     @staticmethod
+    def _report_folder_for(pbip_path: Path) -> Optional[Path]:
+        """The report folder a .pbip names in its artifacts; failing that, the folder that
+        shares its name; failing that, the only *.Report folder beside it."""
+        root = pbip_path.parent
+        data = _read_json_file(pbip_path)
+        if isinstance(data, dict):
+            for artifact in data.get("artifacts") or []:
+                rel = artifact.get("report", {}).get("path") if isinstance(artifact, dict) else None
+                if isinstance(rel, str) and (root / rel).is_dir():
+                    return root / rel
+        named = root / f"{pbip_path.stem}.Report"
+        if named.is_dir():
+            return named
+        others = sorted(p for p in root.glob("*.Report") if p.is_dir())
+        return others[0] if len(others) == 1 else None
+
+    @staticmethod
+    def _model_folder_for(pbip_path: Path, report_folder: Optional[Path]) -> Tuple[Optional[Path], bool]:
+        """(semantic model folder, remote). The report's definition.pbir decides: byPath names
+        the local model, byConnection means the model is not in this project at all."""
+        root = pbip_path.parent
+        if report_folder is not None:
+            pbir = _read_json_file(report_folder / "definition.pbir")
+            ref = pbir.get("datasetReference") if isinstance(pbir, dict) else None
+            if isinstance(ref, dict):
+                by_path = ref.get("byPath")
+                if isinstance(by_path, dict) and isinstance(by_path.get("path"), str):
+                    target = (report_folder / by_path["path"]).resolve()
+                    if target.is_dir():
+                        return target, False
+                elif ref.get("byConnection") is not None:
+                    return None, True
+        for suffix in ("SemanticModel", "Dataset"):
+            named = root / f"{pbip_path.stem}.{suffix}"
+            if named.is_dir():
+                return named, False
+        others = sorted(p for s in ("SemanticModel", "Dataset") for p in root.glob(f"*.{s}") if p.is_dir())
+        return (others[0] if len(others) == 1 else None), False
+
+    @staticmethod
     def _parse_pbip_project(pbip_path: Path) -> Optional[PBIPProject]:
-        """Parse a PBIP project structure, detecting both PBIR-Legacy and PBIR Enhanced formats"""
-        try:
-            root = pbip_path.parent
+        """Resolve a .pbip file to its report and semantic model folders and list their files."""
+        pbip_path = Path(os.path.abspath(pbip_path))      # every path reported later is absolute
+        report_folder = PowerBIPBIPConnector._report_folder_for(pbip_path)
+        model_folder, remote = PowerBIPBIPConnector._model_folder_for(pbip_path, report_folder)
+        project = PBIPProject(
+            root_path=pbip_path.parent, pbip_file=pbip_path, semantic_model_folder=model_folder,
+            report_folder=report_folder, report_json_path=None, tmdl_files=[], remote_model=remote)
+        PowerBIPBIPConnector._scan_project_files(project)
+        return project
 
-            # Find semantic model folder (.SemanticModel)
-            semantic_folders = list(root.glob("*.SemanticModel"))
-            semantic_model_folder = semantic_folders[0] if semantic_folders else None
-
-            # Find report folder (.Report)
-            report_folders = list(root.glob("*.Report"))
-            report_folder = report_folders[0] if report_folders else None
-
-            # Initialize PBIR fields
-            report_json_path = None
-            is_pbir_enhanced = False
-            pbir_definition_folder = None
-            visual_json_files = []
-            cultures_files = []
-
-            if report_folder:
-                # Check for PBIR Enhanced format: Report/definition/pages/ structure
-                definition_folder = report_folder / "definition"
-                pages_folder = definition_folder / "pages"
-
-                if pages_folder.exists():
-                    # This is PBIR Enhanced format
-                    is_pbir_enhanced = True
-                    pbir_definition_folder = definition_folder
-
-                    # Find all visual.json files in pages/[id]/visuals/[id]/
-                    visual_json_files = list(pages_folder.glob("**/visuals/*/visual.json"))
-
-                    # Report.json in definition folder (report-level settings only)
-                    report_json = definition_folder / "report.json"
-                    if report_json.exists():
-                        report_json_path = report_json
-
-                    logger.info(f"Detected PBIR Enhanced format with {len(visual_json_files)} visual files")
-                else:
-                    # Check for PBIR-Legacy: single report.json at root
-                    report_json = report_folder / "report.json"
-                    if report_json.exists():
-                        report_json_path = report_json
-                        logger.info("Detected PBIR-Legacy format (single report.json)")
-
-            # Find all TMDL files
-            tmdl_files = []
-            diagram_layout_path = None
-            if semantic_model_folder:
-                tmdl_files = list(semantic_model_folder.glob("**/*.tmdl"))
-                tmdl_files.extend(semantic_model_folder.glob("**/*.tmd"))
-
-                # Find cultures files (linguistic schema with ConceptualEntity)
-                cultures_folder = semantic_model_folder / "definition" / "cultures"
-                if cultures_folder.exists():
-                    cultures_files = list(cultures_folder.glob("*.tmdl"))
-
-                # Find diagramLayout.json (model diagram layout)
-                diagram_layout = semantic_model_folder / "diagramLayout.json"
-                if diagram_layout.exists():
-                    diagram_layout_path = diagram_layout
-                    logger.info("Found diagramLayout.json")
-
-            return PBIPProject(
-                root_path=root,
-                pbip_file=pbip_path,
-                semantic_model_folder=semantic_model_folder,
-                report_folder=report_folder,
-                report_json_path=report_json_path,
-                tmdl_files=tmdl_files,
-                is_pbir_enhanced=is_pbir_enhanced,
-                pbir_definition_folder=pbir_definition_folder,
-                visual_json_files=visual_json_files,
-                cultures_files=cultures_files,
-                diagram_layout_path=diagram_layout_path
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to parse PBIP project: {e}")
-            return None
+    @staticmethod
+    def _scan_project_files(project: PBIPProject) -> None:
+        """(Re)list the project's files. Paths a caller placed on the project by hand are kept."""
+        report = project.report_folder
+        if report is not None:
+            definition = report / "definition"
+            if (definition / "pages").is_dir():
+                project.is_pbir_enhanced = True
+                project.pbir_definition_folder = definition
+                found = sorted((definition / "pages").glob("**/visuals/*/visual.json"))
+                project.visual_json_files = [p for p in _merge_paths(found, project.visual_json_files)
+                                             if p.is_file()]
+                if (definition / "report.json").is_file():
+                    project.report_json_path = definition / "report.json"
+            elif (report / "report.json").is_file():
+                project.report_json_path = report / "report.json"
+        model = project.semantic_model_folder
+        if model is not None:
+            definition = model / "definition"
+            base = definition if definition.is_dir() else model
+            project.tmdl_files = [p for p in _merge_paths(sorted(base.glob("**/*.tmdl")), project.tmdl_files)
+                                  if p.is_file()]
+            cultures = definition / "cultures"
+            if cultures.is_dir():
+                project.cultures_files = sorted(cultures.glob("*.tmdl"))
+            layout = model / "diagramLayout.json"
+            if layout.is_file():
+                project.diagram_layout_path = layout
 
     def load_project(self, pbip_path: str) -> bool:
-        """
-        Load a PBIP project for editing
-
-        Args:
-            pbip_path: Path to .pbip file or project folder
-
-        Returns:
-            True if loaded successfully
-        """
+        """Load a PBIP project for editing. Returns False (with ``last_error`` set) when the
+        path does not resolve to exactly one project."""
+        self.last_error = None
         project = self.find_pbip_from_path(pbip_path)
-        if project:
-            self.current_project = project
-            self._original_files = {}  # Clear any previous backup state
-            logger.info(f"Loaded PBIP project: {project.pbip_file}")
-            return True
-        return False
+        if project is None:
+            path = Path(pbip_path)
+            if path.is_dir():
+                found = sorted(p.name for p in path.glob("*.pbip"))
+                self.last_error = (f"{len(found)} .pbip files in '{path}' ({', '.join(found)}); "
+                                   "pass the path of the one to load" if len(found) > 1
+                                   else f"no .pbip file in '{path}'")
+            else:
+                self.last_error = f"'{pbip_path}' is not a .pbip file"
+            return False
+        self.current_project = project
+        self._undo = {}
+        logger.info(f"Loaded PBIP project: {project.pbip_file}")
+        return True
 
     def get_project_info(self) -> Dict[str, Any]:
         """Get information about the loaded project"""
-        if not self.current_project:
+        p = self.current_project
+        if not p:
             return {"error": "No project loaded"}
-
+        self._scan_project_files(p)
         return {
-            "root_path": str(self.current_project.root_path),
-            "pbip_file": str(self.current_project.pbip_file),
-            "semantic_model_folder": str(self.current_project.semantic_model_folder) if self.current_project.semantic_model_folder else None,
-            "report_folder": str(self.current_project.report_folder) if self.current_project.report_folder else None,
-            "report_json_path": str(self.current_project.report_json_path) if self.current_project.report_json_path else None,
-            "tmdl_file_count": len(self.current_project.tmdl_files),
-            "has_report": self.current_project.report_json_path is not None,
-            # PBIR Enhanced format info
-            "report_format": "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy",
-            "is_pbir_enhanced": self.current_project.is_pbir_enhanced,
-            "visual_json_count": len(self.current_project.visual_json_files),
-            "cultures_file_count": len(self.current_project.cultures_files),
-            "pbir_definition_folder": str(self.current_project.pbir_definition_folder) if self.current_project.pbir_definition_folder else None
+            "root_path": str(p.root_path),
+            "pbip_file": str(p.pbip_file),
+            "semantic_model_folder": str(p.semantic_model_folder) if p.semantic_model_folder else None,
+            "report_folder": str(p.report_folder) if p.report_folder else None,
+            "report_json_path": str(p.report_json_path) if p.report_json_path else None,
+            "tmdl_file_count": len(p.tmdl_files),
+            "has_report": p.report_json_path is not None,
+            "report_format": "PBIR-Enhanced" if p.is_pbir_enhanced else "PBIR-Legacy",
+            "is_pbir_enhanced": p.is_pbir_enhanced,
+            "visual_json_count": len(p.visual_json_files),
+            "cultures_file_count": len(p.cultures_files),
+            "pbir_definition_folder": str(p.pbir_definition_folder) if p.pbir_definition_folder else None,
+            "remote_model": p.remote_model,
         }
 
-    # ==================== BACKUP & ROLLBACK ====================
+    # ==================== FILE I/O ====================
+
+    def _read_text(self, file_path) -> str:
+        """Text of a project file with \\n newlines and no BOM. The file's on-disk format is
+        remembered so _write_text puts it back the same way."""
+        text, fmt = safe_io.read_text(file_path)
+        self._formats[os.path.normcase(os.path.abspath(file_path))] = fmt
+        return text
+
+    def _write_text(self, file_path, content: str) -> None:
+        """Atomically write a project file in the format it was read in (a new file is UTF-8
+        without BOM, LF newlines)."""
+        fmt = self._formats.get(os.path.normcase(os.path.abspath(file_path)))
+        safe_io.write_text(file_path, content, fmt)
+
+    def _tmdl_files(self) -> List[Path]:
+        if self.current_project:
+            self._scan_project_files(self.current_project)
+            return list(self.current_project.tmdl_files)
+        return []
+
+    def _report_files(self) -> List[Path]:
+        p = self.current_project
+        if not p:
+            return []
+        self._scan_project_files(p)
+        found = pbip_report.report_files(p.report_folder, p.is_pbir_enhanced)
+        declared = list(p.visual_json_files)
+        if p.report_json_path is not None:
+            declared.append(p.report_json_path)
+        return _merge_paths(found, declared)
+
+    def _catalog(self) -> tmdl_scan.ModelCatalog:
+        """The model as declared by the project's TMDL files. Unreadable files are recorded in
+        ``unreadable_files`` (and reported by validate_tmdl_syntax) rather than hidden."""
+        catalog = tmdl_scan.ModelCatalog()
+        self.unreadable_files = []
+        for path in self._tmdl_files():
+            try:
+                catalog.add_document(tmdl_scan.scan(self._read_text(path)), str(path))
+            except (OSError, UnicodeError) as e:
+                self.unreadable_files.append((str(path), f"{type(e).__name__}: {e}"))
+        return catalog
+
+    # ==================== BACKUP & UNDO ====================
 
     def create_backup(self) -> Optional[str]:
-        """
-        Create a backup of the entire PBIP project
-
-        Returns:
-            Path to backup folder, or None if failed
-        """
-        if not self.current_project:
+        """Copy the project's own files (the .pbip, its report folder and its semantic model
+        folder, without the local .pbi caches) into <project>/.pbip-backups/<name>-<time>-<id>.
+        Returns the backup folder, or None with ``last_error`` set when the copy failed."""
+        p = self.current_project
+        if not p:
             return None
-
+        self.last_error = None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = p.root_path / BACKUP_FOLDER / f"{p.pbip_file.stem}-{stamp}-{uuid.uuid4().hex[:6]}"
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_name = f"{self.current_project.pbip_file.stem}_backup_{timestamp}"
-            backup_path = self.current_project.root_path.parent / backup_name
-
-            # Copy entire project folder
-            shutil.copytree(self.current_project.root_path, backup_path)
-
-            self.current_project.backup_path = backup_path
-            logger.info(f"Created backup at: {backup_path}")
-            return str(backup_path)
-
-        except Exception as e:
-            logger.error(f"Failed to create backup: {e}")
+            target.mkdir(parents=True)
+            ignore_file = p.root_path / BACKUP_FOLDER / ".gitignore"
+            if not ignore_file.exists():
+                safe_io.write_text(ignore_file, "*\n")     # keep backups out of source control
+            if p.pbip_file.is_file():
+                shutil.copy2(p.pbip_file, target / p.pbip_file.name)
+            for folder in (p.report_folder, p.semantic_model_folder):
+                if folder is not None and folder.is_dir() and _same_path(folder.parent, p.root_path):
+                    shutil.copytree(folder, target / folder.name, ignore=shutil.ignore_patterns(".pbi"))
+        except OSError as e:
+            self.last_error = f"backup failed: {type(e).__name__}: {e}"
+            logger.error(self.last_error)
+            shutil.rmtree(target, ignore_errors=True)
             return None
+        p.backup_path = target
+        logger.info(f"Created backup at: {target}")
+        return str(target)
 
-    @classmethod
-    def _resolve_entity(cls, expr, alias_map) -> Optional[str]:
-        """Resolve the table from a PBIR Expression node: SourceRef.Entity directly, or
-        SourceRef.Source (a From-clause alias) resolved via alias_map, or a nested
-        Hierarchy expression. Resolves from THIS node only (no whole-subtree guessing)."""
-        if not isinstance(expr, dict):
-            return None
-        sr = expr.get("SourceRef")
-        if isinstance(sr, dict):
-            if isinstance(sr.get("Entity"), str):
-                return sr["Entity"]
-            if isinstance(sr.get("Source"), str):
-                return alias_map.get(sr["Source"])
-        h = expr.get("Hierarchy")
-        if isinstance(h, dict):
-            return cls._resolve_entity(h.get("Expression", {}), alias_map)
+    def _backup_once(self) -> Optional[str]:
+        """For authoring tools: make the session's backup before the first change. Returns an
+        error message when a backup was wanted and could not be made."""
+        if self.auto_backup and self.current_project and not self.current_project.backup_path:
+            if self.create_backup() is None:
+                return f"{self.last_error}; nothing was changed"
         return None
+
+    def _backup_before_commit(self, made: List[str]) -> Optional[str]:
+        """Hook for the rename engine: called once the plan is validated and about to be
+        written, so a rename that is refused leaves no backup behind. Returns an error message
+        to stop the commit when a backup was wanted and could not be made."""
+        if not self.auto_backup:
+            return None
+        path = self.create_backup()
+        if path is None:
+            return self.last_error
+        made.append(path)
+        return None
+
+    def rollback_changes(self) -> bool:
+        """Undo the last committed rename / repair / quoting fix by restoring the bytes every
+        changed file had before it. Returns False when there is nothing to undo or a file could
+        not be restored (the reason is in ``last_error``)."""
+        if not self._undo:
+            logger.warning("No changes to rollback")
+            return False
+        try:
+            for path, data in self._undo.items():
+                if data is None:
+                    if os.path.exists(path):
+                        os.remove(path)
+                    continue
+                tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, path)
+        except OSError as e:
+            self.last_error = f"rollback failed: {type(e).__name__}: {e}"
+            logger.error(self.last_error)
+            return False
+        logger.info(f"Rolled back {len(self._undo)} file(s)")
+        self._undo = {}
+        return True
+
+    # ==================== REPORT REFERENCES ====================
 
     @classmethod
     def _walk_report_refs(cls, obj, refs: set, alias_map=None) -> None:
-        """Collect (table, field) references from a PBIR JSON tree.
-
-        Handles Column/Measure (Property), Hierarchy (Hierarchy name), and HierarchyLevel
-        (Level) nodes; resolves From-clause Source aliases used by filters/slicers; and
-        resolves each reference's table from its OWN Expression so compound expressions that
-        touch multiple tables are not mis-attributed."""
-        alias_map = dict(alias_map or {})
-        if isinstance(obj, dict):
-            # A From clause at this scope defines alias -> table for descendant Source refs.
-            frm = obj.get("From")
-            if isinstance(frm, list):
-                for src in frm:
-                    if isinstance(src, dict) and isinstance(src.get("Name"), str) and isinstance(src.get("Entity"), str):
-                        alias_map[src["Name"]] = src["Entity"]
-            for kind, namekey in (("Column", "Property"), ("Measure", "Property"),
-                                  ("Hierarchy", "Hierarchy"), ("HierarchyLevel", "Level")):
-                node = obj.get(kind)
-                if isinstance(node, dict) and isinstance(node.get(namekey), str):
-                    entity = cls._resolve_entity(node.get("Expression", {}), alias_map)
-                    if entity:
-                        refs.add((entity, node[namekey]))
-            ref_name = obj.get("queryRef") or obj.get("NativeReferenceName")
-            # Skip aggregation/function forms like "Sum(Sales.Amount)" - their underlying
-            # column is captured structurally above; partitioning them on "." would invent a
-            # bogus ("Sum(Sales", "Amount)") reference.
-            if (isinstance(ref_name, str) and "." in ref_name
-                    and "(" not in ref_name and ")" not in ref_name):
-                tbl, _, fld = ref_name.partition(".")
-                if tbl and fld:
-                    refs.add((tbl, fld))
-            for v in obj.values():
-                cls._walk_report_refs(v, refs, alias_map)
-        elif isinstance(obj, list):
-            for it in obj:
-                cls._walk_report_refs(it, refs, alias_map)
+        """Collect (table, field) references from a parsed PBIR JSON tree: columns, measures,
+        hierarchies and hierarchy levels, each attributed to the table its own expression
+        resolves to (directly or through a From-clause alias)."""
+        pbip_report.walk_references(obj, refs, None, alias_map)
 
     def collect_report_references_by_file(self) -> Dict[str, set]:
-        """Scan the report layer and return {file_path: set((table, field))} references.
-
-        Covers PBIR-Enhanced (per-visual.json) and PBIR-Legacy (single report.json)."""
+        """{file path: {(table, field)}} for the report layer: visuals, mobile layouts, page
+        and report level filters, bookmarks, and the legacy single report.json. A file that
+        cannot be read or parsed is recorded in ``unreadable_files``."""
         out: Dict[str, set] = {}
-        if not self.current_project:
-            return out
-        files = []
-        if self.current_project.is_pbir_enhanced and self.current_project.visual_json_files:
-            files = list(self.current_project.visual_json_files)
-        elif self.current_project.report_json_path:
-            files = [self.current_project.report_json_path]
-        for fp in files:
+        self.unreadable_files = []
+        for fp in self._report_files():
             refs: set = set()
             try:
-                data = json.loads(self._read_text(fp))
-                self._walk_report_refs(data, refs)
-            except Exception as e:
+                pbip_report.walk_references(pbip_json.parse(self._read_text(fp)), refs)
+            except (OSError, UnicodeError, pbip_json.JsonSyntaxError) as e:
+                self.unreadable_files.append((str(fp), f"{type(e).__name__}: {e}"))
                 logger.warning(f"Could not scan report references in {fp}: {e}")
-            out[str(fp)] = refs
+                continue
+            if refs or fp.name == "visual.json":
+                out[str(fp)] = refs
         return out
 
     def collect_report_references(self) -> set:
@@ -588,70 +489,47 @@ class PowerBIPBIPConnector:
         return None
 
     def _schema_from_sibling(self, filename: str, default_key: str) -> Optional[str]:
-        """Read a $schema URL from an existing PBIR file of the same kind (preferred over
-        hardcoding, since PBIR schemas bump over time). Falls back to a documented default."""
+        """The $schema URL of an existing PBIR file of the same kind (schemas are bumped often,
+        so the project's own version wins over the built-in default)."""
         base = self._pages_folder()
         if base and base.exists():
-            for p in base.glob("**/" + filename):
-                try:
-                    data = json.loads(self._read_text(p))
-                    if isinstance(data.get("$schema"), str):
-                        return data["$schema"]
-                except Exception:
-                    continue
+            for p in sorted(base.glob("**/" + filename)):
+                data = _read_json_file(p)
+                if isinstance(data, dict) and isinstance(data.get("$schema"), str):
+                    return data["$schema"]
         return pbir_authoring.DEFAULT_SCHEMAS.get(default_key)
 
     def _model_field_index(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        """Parse the project's TMDL files into {table: {field: {kind, dataType}}} (one table
-        per file, the PBIP convention). kind is 'column' or 'measure'; dataType is the TMDL
-        data type for columns (None for measures). Drives both binding validation and the
-        measure-vs-aggregated-column decision when authoring visuals."""
+        """{table: {field: {kind, dataType}}} from the project's TMDL. kind is 'column' or
+        'measure'; dataType is the column's TMDL data type (None for measures)."""
         index: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        if not self.current_project:
-            return index
-        for tmdl in self.current_project.tmdl_files:
-            try:
-                content = self._read_text(tmdl)
-            except Exception:
-                continue
-            tmatch = re.search(r"^\s*table\s+(?:'([^']+)'|(\S+))", content, re.MULTILINE)
-            if not tmatch:
-                continue
-            tname = (tmatch.group(1) or tmatch.group(2)).replace("''", "'")
-            fields = index.setdefault(tname, {})
-            current: Optional[str] = None
-            for line in content.splitlines():
-                cm = re.match(r"^\s*(column|measure)\s+(?:'([^']+)'|([^\s=]+))", line)
-                if cm:
-                    fname = (cm.group(2) or cm.group(3)).replace("''", "'")
-                    fields[fname] = {"kind": cm.group(1), "dataType": None}
-                    current = fname
-                    continue
-                if current and fields.get(current, {}).get("kind") == "column":
-                    dm = re.match(r"^\s*dataType:\s*(\S+)", line)
-                    if dm:
-                        fields[current]["dataType"] = dm.group(1).strip()
+        for table in self._catalog().tables.values():
+            fields = index.setdefault(table.name, {})
+            for col in table.columns.values():
+                fields[col.name] = {"kind": "column", "dataType": col.data_type}
+            for name in table.measures.values():
+                fields[name] = {"kind": "measure", "dataType": None}
         return index
 
     def model_field_catalog(self) -> Dict[str, Set[str]]:
-        """{table_name: {column/measure names}} - the name-only view used to validate that
-        report field bindings exist. Derived from the richer _model_field_index."""
+        """{table name: {column and measure names}}."""
         return {t: set(fs.keys()) for t, fs in self._model_field_index().items()}
 
     # TMDL numeric data types whose default value-well aggregation is Sum (others Count).
     _NUMERIC_DATATYPES = {"int64", "double", "decimal", "int", "integer", "number"}
 
-    def _resolve_roles(self, fields_by_role: Dict[str, Any]) -> Dict[str, Any]:
-        """Turn {role: 'Table.Field' | [...]} into enriched per-field projection specs that
-        match how Power BI Desktop writes them: explicit Measure vs Column, a nativeQueryRef,
-        and - for a plain numeric/text COLUMN dropped on an aggregating well (Y/Values/...) -
+    def _resolve_roles(self, fields_by_role: Dict[str, Any],
+                       visual_type: Optional[str] = None) -> Dict[str, Any]:
+        """Turn {role: 'Table.Field' | [...]} into projection specs the way Power BI Desktop
+        writes them: explicit Measure vs Column, a nativeQueryRef and, for a plain column on a
+        well that summarizes (see pbir_authoring.aggregates: decided by visual type AND role),
         an Aggregation (Sum for numeric, else CountNonNull). Dicts are passed through as-is so
-        an advanced caller can specify a projection exactly."""
+        a caller can specify a projection exactly."""
         index = self._model_field_index()
         lut = {t.lower(): {f.lower(): (f, meta) for f, meta in fs.items()} for t, fs in index.items()}
         resolved: Dict[str, Any] = {}
         for role, val in (fields_by_role or {}).items():
-            aggregating = role.lower() in pbir_authoring.AGGREGATING_ROLES
+            aggregating = pbir_authoring.aggregates(visual_type, role)
             out: List[Any] = []
             for ref in (val if isinstance(val, list) else [val]):
                 if not ref:
@@ -671,7 +549,7 @@ class PowerBIPBIPConnector:
                         spec["aggregation"] = (pbir_authoring.AGG_SUM if dt in self._NUMERIC_DATATYPES
                                                else pbir_authoring.AGG_COUNT_NONNULL)
                 else:
-                    # Unknown field (e.g. skip_validation): fall back to the role heuristic.
+                    # Unknown field (skip_validation): a summarizing well most likely takes a measure.
                     spec["kind"] = "Measure" if aggregating else "Column"
                 out.append(spec)
             if out:
@@ -680,66 +558,67 @@ class PowerBIPBIPConnector:
 
     def _check_fields(self, fields_by_role: Dict[str, Any]) -> List[str]:
         """Return a list of 'Table[Field]' refs that do NOT exist in the model catalog."""
-        catalog = self.model_field_catalog()
-        tables_lower = {t.lower() for t in catalog}
-        fields_lower = {t.lower(): {f.lower() for f in fs} for t, fs in catalog.items()}
+        catalog = self._catalog()
         missing = []
-        for role, val in (fields_by_role or {}).items():
+        for _role, val in (fields_by_role or {}).items():
             for ref in (val if isinstance(val, list) else [val]):
                 if not ref:
                     continue
                 if isinstance(ref, dict):
                     table = ref.get("table") or ref.get("entity") or ""
-                    fld = ref.get("field") or ref.get("property") or ref.get("column") or ref.get("measure") or ""
+                    fld = (ref.get("field") or ref.get("property") or ref.get("column")
+                           or ref.get("measure") or "")
                 else:
                     table, fld = pbir_authoring.split_table_field(str(ref))
-                if table.lower() not in tables_lower or fld.lower() not in fields_lower.get(table.lower(), set()):
+                if not catalog.has_field(table, fld):
                     missing.append(f"{table}[{fld}]")
         return missing
 
     def _find_page_folder(self, ref: str) -> Optional[Path]:
+        """A page folder by folder name, internal name or display name. ``ref`` is never used
+        as a path: only a direct child of the pages folder can match."""
         pages = self._pages_folder()
-        if not pages or not pages.exists():
+        if not pages or not pages.exists() or not isinstance(ref, str) or not ref:
             return None
-        direct = pages / ref
-        if direct.exists() and (direct / "page.json").exists():
-            return direct
-        for pj in pages.glob("*/page.json"):
-            try:
-                data = json.loads(self._read_text(pj))
-                if data.get("displayName") == ref or data.get("name") == ref:
-                    return pj.parent
-            except Exception:
-                continue
+        if Path(ref).name == ref and ref not in (".", ".."):
+            direct = pages / ref
+            if direct.is_dir() and (direct / "page.json").exists():
+                return direct
+        for pj in sorted(pages.glob("*/page.json")):
+            data = _read_json_file(pj)
+            if isinstance(data, dict) and (data.get("displayName") == ref or data.get("name") == ref):
+                return pj.parent
         return None
 
     def add_page(self, display_name: str, width: int = 1280, height: int = 720,
                  set_active: bool = False) -> Dict[str, Any]:
-        """Create a new report page (PBIR-Enhanced) and register it in pages.json."""
+        """Create a new report page (PBIR-Enhanced) and register it in pages.json. Both files
+        are written together or not at all."""
         if not self.current_project or not self.current_project.is_pbir_enhanced:
             return {"success": False, "message": "Requires a loaded PBIR-Enhanced PBIP project"}
         pages = self._pages_folder()
         if not pages:
             return {"success": False, "message": "No PBIR definition/pages folder found"}
-        if self.auto_backup and not self.current_project.backup_path:
-            self.create_backup()
-
-        name = pbir_authoring.new_name()
-        page_dir = pages / name
-        page_dir.mkdir(parents=True, exist_ok=True)
-        page_path = page_dir / "page.json"
-        page_json = pbir_authoring.build_page(name, display_name, width, height,
-                                              self._schema_from_sibling("page.json", "page"))
-        self._write_text(page_path, json.dumps(page_json, indent=2))
-
-        # Update (or create) pages.json, preserving any existing keys.
         meta_path = pages / "pages.json"
+        tx = safe_io.FileTransaction()
         meta: Dict[str, Any] = {}
         if meta_path.exists():
             try:
-                meta = json.loads(self._read_text(meta_path))
-            except Exception:
-                meta = {}
+                meta = tx.read_json(meta_path)
+            except (OSError, ValueError) as e:
+                return {"success": False,
+                        "message": f"pages.json could not be read ({e}); fix it before adding pages"}
+            if not isinstance(meta, dict):
+                return {"success": False, "message": "pages.json is not a JSON object; not modified"}
+        backup_error = self._backup_once()
+        if backup_error:
+            return {"success": False, "message": backup_error}
+
+        name = pbir_authoring.new_name()
+        page_path = pages / name / "page.json"
+        page_json = pbir_authoring.build_page(name, display_name, width, height,
+                                              self._schema_from_sibling("page.json", "page"))
+        tx.write_json(page_path, page_json)
         if "$schema" not in meta:
             meta["$schema"] = pbir_authoring.DEFAULT_SCHEMAS["pagesMetadata"]
         order = list(meta.get("pageOrder", []))
@@ -748,8 +627,11 @@ class PowerBIPBIPConnector:
         meta["pageOrder"] = order
         if set_active or not meta.get("activePageName"):
             meta["activePageName"] = name
-        self._write_text(meta_path, json.dumps(meta, indent=2))
-
+        tx.write_json(meta_path, meta)
+        try:
+            tx.commit()
+        except OSError as e:
+            return {"success": False, "message": f"Could not write the page ({e}); nothing was changed"}
         return {"success": True, "page_name": name, "display_name": display_name, "path": str(page_path)}
 
     def add_visual(self, page: str, visual_type: str, position: Optional[Dict[str, Any]] = None,
@@ -767,19 +649,18 @@ class PowerBIPBIPConnector:
             if missing:
                 return {"success": False, "message": "Field(s) not found in the model; not created",
                         "missing_fields": missing}
-        if self.auto_backup and not self.current_project.backup_path:
-            self.create_backup()
+        backup_error = self._backup_once()
+        if backup_error:
+            return {"success": False, "message": backup_error}
 
         name = pbir_authoring.new_name()
-        vdir = page_dir / "visuals" / name
-        vdir.mkdir(parents=True, exist_ok=True)
-        vpath = vdir / "visual.json"
+        vpath = page_dir / "visuals" / name / "visual.json"
         visual_json = pbir_authoring.build_visual(
             name, visual_type, position or {"x": 0, "y": 0, "width": 400, "height": 300},
-            self._resolve_roles(fields_by_role), self._schema_from_sibling("visual.json", "visual"))
-        self._write_text(vpath, json.dumps(visual_json, indent=2))
+            self._resolve_roles(fields_by_role, visual_type),
+            self._schema_from_sibling("visual.json", "visual"))
+        safe_io.write_json(vpath, visual_json)
         self.current_project.visual_json_files.append(vpath)
-
         return {"success": True, "visual_name": name, "page": page_dir.name,
                 "visual_type": visual_type, "path": str(vpath)}
 
@@ -788,25 +669,35 @@ class PowerBIPBIPConnector:
         """Add/replace field projections on an existing visual's query (mode: 'add' or 'replace')."""
         if not self.current_project or not self.current_project.is_pbir_enhanced:
             return {"success": False, "message": "Requires a loaded PBIR-Enhanced PBIP project"}
+        if mode not in ("add", "replace"):
+            return {"success": False, "message": f"Unknown mode '{mode}' (use 'add' or 'replace')"}
         page_dir = self._find_page_folder(page)
         if not page_dir:
             return {"success": False, "message": f"Page '{page}' not found"}
+        if (not isinstance(visual_name, str) or Path(visual_name).name != visual_name
+                or visual_name in (".", "..")):
+            return {"success": False, "message": f"'{visual_name}' is not a visual name"}
         vpath = page_dir / "visuals" / visual_name / "visual.json"
         if not vpath.exists():
             return {"success": False, "message": f"Visual '{visual_name}' not found on page"}
         if not skip_validation:
             missing = self._check_fields(fields_by_role)
             if missing:
-                return {"success": False, "message": "Field(s) not found in the model", "missing_fields": missing}
-        if self.auto_backup and not self.current_project.backup_path:
-            self.create_backup()
-
+                return {"success": False, "message": "Field(s) not found in the model",
+                        "missing_fields": missing}
         try:
             data = json.loads(self._read_text(vpath))
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return {"success": False, "message": f"Could not parse visual.json: {e}"}
-        qs = data.setdefault("visual", {}).setdefault("query", {}).setdefault("queryState", {})
-        resolved = self._resolve_roles(fields_by_role)
+        if not isinstance(data, dict) or not isinstance(data.get("visual", {}), dict):
+            return {"success": False, "message": "visual.json does not describe a visual; not modified"}
+        backup_error = self._backup_once()
+        if backup_error:
+            return {"success": False, "message": backup_error}
+
+        visual = data.setdefault("visual", {})
+        qs = visual.setdefault("query", {}).setdefault("queryState", {})
+        resolved = self._resolve_roles(fields_by_role, visual.get("visualType"))
         if mode == "replace":
             qs.update(pbir_authoring.build_query_state(resolved))
         else:
@@ -819,26 +710,32 @@ class PowerBIPBIPConnector:
                     if proj["queryRef"] not in existing_refs:
                         projections.append(proj)
                         existing_refs.add(proj["queryRef"])
-        self._write_text(vpath, json.dumps(data, indent=2))
+        self._write_text(vpath, safe_io.dumps_json(data))
         return {"success": True, "visual_name": visual_name, "page": page_dir.name, "mode": mode}
 
     def validate_report_bindings(self) -> List[ValidationError]:
-        """Check that every (table, field) referenced by the report exists in the model.
-        This is the #1 cause of blank visuals / 'repair' prompts after external edits."""
+        """Check that every (table, field) the report refers to exists in the model: the usual
+        cause of blank visuals and 'repair' prompts after external edits. Covers visuals, page
+        and report filters, bookmarks and the legacy report.json; hierarchies and their levels
+        count as fields."""
         errors: List[ValidationError] = []
-        catalog = self.model_field_catalog()
-        tables_lower = {t.lower() for t in catalog}
-        fields_lower = {t.lower(): {f.lower() for f in fs} for t, fs in catalog.items()}
-        for fp, refs in self.collect_report_references_by_file().items():
-            for (table, field) in sorted(refs):
-                tl = table.lower()
-                if tl not in tables_lower:
+        if self.current_project and self.current_project.remote_model and not self._tmdl_files():
+            return [ValidationError("", 0, "NO_LOCAL_MODEL", "Bindings cannot be checked offline: "
+                                    + self._no_local_model(), "")]
+        by_file = self.collect_report_references_by_file()
+        unreadable = list(self.unreadable_files)
+        catalog = self._catalog()
+        for path, reason in unreadable + self.unreadable_files:
+            errors.append(ValidationError(path, 0, "FILE_ERROR", f"Could not read {path}: {reason}", ""))
+        for fp, refs in by_file.items():
+            for (table, name) in sorted(refs):
+                if not catalog.has_table(table):
                     errors.append(ValidationError(fp, 0, "MISSING_TABLE",
-                        f"Report references table '{table}' that is not in the model", f"{table}[{field}]"))
-                elif field.lower() not in fields_lower.get(tl, set()):
+                        f"Report references table '{table}' that is not in the model", f"{table}[{name}]"))
+                elif not catalog.has_member(table, name):
                     errors.append(ValidationError(fp, 0, "MISSING_FIELD",
-                        f"Report references '{table}[{field}]' but '{field}' is not in table '{table}'",
-                        f"{table}[{field}]"))
+                        f"Report references '{table}[{name}]' but '{name}' is not in table '{table}'",
+                        f"{table}[{name}]"))
         return errors
 
     # ==================== TMDL MODEL AUTHORING (offline) ====================
@@ -872,29 +769,38 @@ class PowerBIPBIPConnector:
         return path, None
 
     def _find_table_file(self, table_name: str) -> Optional[Path]:
-        """Locate the .tmdl file that declares the given table (one table per file).
-        Handles quoted names with escaped inner quotes ('O''Brien')."""
-        want = table_name.strip().lower()
-        for tmdl in (self.current_project.tmdl_files if self.current_project else []):
-            try:
-                content = self._read_text(tmdl)
-            except Exception:
-                continue
-            m = re.search(r"^\s*table\s+(?:'((?:[^']|'')+)'|(\S+))", content, re.MULTILINE)
-            if m and (m.group(1) or m.group(2)).replace("''", "'").strip().lower() == want:
-                return tmdl
-        return None
+        """The .tmdl file that declares the given table (names compare case-insensitively)."""
+        info = self._catalog().table((table_name or "").strip())
+        return Path(info.file) if info is not None and info.file else None
 
-    def add_measures(self, table: str, measures: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Bulk-append measures to a table's .tmdl (offline). The whole batch is checked for
-        name collisions (model-wide and within the batch) BEFORE anything is written."""
+    @staticmethod
+    def _one_line(value: Any) -> bool:
+        return not (isinstance(value, str) and any(c in value for c in "\r\n"))
+
+    def add_measures(self, table: str, measures: List[Dict[str, Any]], mode: str = "add") -> Dict[str, Any]:
+        """Write measures into a table's .tmdl (offline). The whole batch is checked before
+        anything is written.
+
+        mode="add"     every measure must be new: a name that already exists anywhere in the
+                       model is a collision error.
+        mode="upsert"  a measure of the same name in THIS table is replaced in place (its
+                       description, expression and properties come from the new definition;
+                       its lineageTag is kept), the rest are added with a lineageTag derived
+                       from the table and measure name. Running the same upsert again leaves
+                       the file byte-identical. A measure of that name in another table, or a
+                       column of that name, is still a collision error.
+
+        Returns {"success", "path", "created": [...], "updated": [...]}.
+        """
         if not self.current_project:
             return {"success": False, "message": "No PBIP project loaded. Use 'pbip_load_project' first."}
-        path = self._find_table_file(table)
-        if not path:
+        if mode not in ("add", "upsert"):
+            return {"success": False, "message": f"Unknown mode '{mode}' (use 'add' or 'upsert')"}
+        catalog = self._catalog()
+        info = catalog.table((table or "").strip())
+        if info is None or not info.file:
             return {"success": False, "message": f"Table '{table}' not found in the model"}
-        index = self._model_field_index()
-        existing = {f.lower() for fields in index.values() for f in fields}
+        path = Path(info.file)
         problems, seen = [], set()
         for i, m in enumerate(measures):
             name = (m.get("name") or "").strip()
@@ -902,24 +808,54 @@ class PowerBIPBIPConnector:
                 problems.append(f"#{i + 1}: needs both a name and an expression")
                 continue
             # Single-line TMDL fields must not carry line breaks (they would corrupt the file).
-            for field in ("name", "format_string", "display_folder"):
-                val = m.get(field)
-                if isinstance(val, str) and ("\n" in val or "\r" in val):
-                    problems.append(f"'{name}': {field} must not contain line breaks")
-            if name.lower() in existing:
-                problems.append(f"'{name}': already exists in the model")
-            if name.lower() in seen:
+            for key in ("name", "format_string", "display_folder"):
+                if not self._one_line(m.get(key)):
+                    problems.append(f"'{name}': {key} must not contain line breaks")
+            key = name.casefold()
+            replaceable = mode == "upsert" and key in info.measures
+            if not replaceable:
+                owners = [t.name for t in catalog.tables.values() if t.has_field(name)]
+                if owners:
+                    where = "the model" if mode == "add" else f"'{owners[0]}'"
+                    problems.append(f"'{name}': already exists in {where}")
+            if key in seen:
                 problems.append(f"'{name}': duplicated within the batch")
-            seen.add(name.lower())
+            seen.add(key)
         if problems:
             return {"success": False,
                     "message": "Batch rejected; nothing was written:\n  - " + "\n  - ".join(problems)}
-        if self.auto_backup and not self.current_project.backup_path:
-            self.create_backup()
-        content = self._read_text(path)
-        block = tmdl_authoring.render_measures(measures)
-        self._write_text(path, tmdl_authoring.append_block(content, block))
-        return {"success": True, "created": [m["name"] for m in measures], "path": str(path)}
+        backup_error = self._backup_once()
+        if backup_error:
+            return {"success": False, "message": backup_error}
+
+        original = self._read_text(path)
+        content = original
+        created: List[str] = []
+        updated: List[str] = []
+        if mode == "add":
+            content = tmdl_authoring.append_block(content, tmdl_authoring.render_measures(measures))
+            created = [m["name"] for m in measures]
+        else:
+            for m in measures:
+                name = m["name"].strip()
+                spec = dict(m, name=name)
+                block = tmdl_authoring.find_measure_block(content, info.name, name)
+                if block is not None:
+                    spec["lineage_tag"] = block.lineage_tag or self._lineage_tag(info.name, name)
+                    rendered = tmdl_authoring.render_measure(spec)
+                    content = content[:block.start] + rendered + content[block.end:]
+                    updated.append(name)
+                else:
+                    spec["lineage_tag"] = self._lineage_tag(info.name, name)
+                    content = tmdl_authoring.append_block(content, tmdl_authoring.render_measure(spec))
+                    created.append(name)
+        if content != original:
+            self._write_text(path, content)
+        return {"success": True, "created": created, "updated": updated, "path": str(path)}
+
+    @staticmethod
+    def _lineage_tag(table: str, measure: str) -> str:
+        return str(uuid.uuid5(LINEAGE_NAMESPACE, f"{table.casefold()}\n{measure.casefold()}"))
 
     def create_date_table(self, name: str = "Date", start_date: str = "2015-01-01",
                           end_date: str = "2030-12-31",
@@ -937,20 +873,21 @@ class PowerBIPBIPConnector:
             content = tmdl_authoring.build_date_table(name, start_date, end_date, fiscal_year_start_month)
         except ValueError as e:
             return {"success": False, "message": str(e)}
-        tables_dir.mkdir(parents=True, exist_ok=True)
         path, path_err = self._safe_new_table_path(tables_dir, name)
         if path_err:
             return {"success": False, "message": path_err}
-        if self.auto_backup and not self.current_project.backup_path:
-            self.create_backup()
-        self._write_text(path, content)
+        backup_error = self._backup_once()
+        if backup_error:
+            return {"success": False, "message": backup_error}
+        safe_io.write_text(path, content)
         self.current_project.tmdl_files.append(path)
         n_cols = len(re.findall(r"^\tcolumn ", content, re.MULTILINE))
         return {"success": True, "table": name, "path": str(path), "columns": n_cols}
 
     def add_calculation_group(self, name: str, items: List[Dict[str, Any]],
                               column_name: str = "Calculation", precedence: int = 1) -> Dict[str, Any]:
-        """Create a calculation-group table as a new .tmdl file (offline)."""
+        """Create a calculation-group table as a new .tmdl file (offline). The table file and
+        the model.tmdl flag it needs are written together or not at all."""
         if not self.current_project:
             return {"success": False, "message": "No PBIP project loaded. Use 'pbip_load_project' first."}
         tables_dir = self._tables_folder()
@@ -962,50 +899,50 @@ class PowerBIPBIPConnector:
         if bad:
             return {"success": False, "message": "Every calculation item needs a name and an expression"}
         crooked = [it["name"] for it in items
-                   if any(isinstance(it.get(f), str) and ("\n" in it[f] or "\r" in it[f])
-                          for f in ("name", "format_string_expression"))]
+                   if not (self._one_line(it.get("name"))
+                           and self._one_line(it.get("format_string_expression")))]
         if crooked:
             return {"success": False,
                     "message": f"Item name/format must not contain line breaks: {', '.join(crooked)}"}
-        tables_dir.mkdir(parents=True, exist_ok=True)
+        if not column_name or not self._one_line(column_name):
+            return {"success": False, "message": "column_name must be a single line of text"}
         path, path_err = self._safe_new_table_path(tables_dir, name)
         if path_err:
             return {"success": False, "message": path_err}
-        if self.auto_backup and not self.current_project.backup_path:
-            self.create_backup()
-        content = tmdl_authoring.build_calculation_group(name, items, column_name, precedence)
-        self._write_text(path, content)
-        self.current_project.tmdl_files.append(path)
-        # Calculation groups require discourageImplicitMeasures on the model; the engine
-        # refuses a calc group without it. Set the flag in model.tmdl if absent.
+        backup_error = self._backup_once()
+        if backup_error:
+            return {"success": False, "message": backup_error}
+
+        tx = safe_io.FileTransaction()
+        tx.write(path, tmdl_authoring.build_calculation_group(name, items, column_name, precedence))
+        # The engine refuses a calculation group unless the model discourages implicit measures.
         flag_set = False
-        model_tmdl = self.current_project.semantic_model_folder / "definition" / "model.tmdl"
+        definition = self.current_project.semantic_model_folder / "definition"
+        model_tmdl = definition / "model.tmdl"
+        if model_tmdl.exists():
+            mcontent = tx.read(model_tmdl)
+            doc = tmdl_scan.scan(mcontent)
+            model_node = next((n for n in doc.roots if n.keyword == "model"), None)
+            if model_node is not None and model_node.child("discourageImplicitMeasures") is None:
+                tx.write(model_tmdl, mcontent[:model_node.end] + "\n\tdiscourageImplicitMeasures"
+                         + mcontent[model_node.end:])
+                flag_set = True
         try:
-            if model_tmdl.exists():
-                mcontent = self._read_text(model_tmdl)
-                if "discourageImplicitMeasures" not in mcontent:
-                    mm = re.search(r"^model\s+\S+.*$", mcontent, re.MULTILINE)
-                    if mm:
-                        insert_at = mm.end()
-                        mcontent = (mcontent[:insert_at] + "\n\tdiscourageImplicitMeasures"
-                                    + mcontent[insert_at:])
-                        self._write_text(model_tmdl, mcontent)
-                        flag_set = True
-        except Exception as e:
-            logger.warning(f"Could not set discourageImplicitMeasures in model.tmdl: {e}")
-        # Calculation groups need compatibilityLevel >= 1470; warn (never auto-upgrade,
-        # since a level bump is irreversible).
+            tx.commit()
+        except OSError as e:
+            return {"success": False, "message": f"Could not write the calculation group ({e}); "
+                                                 "nothing was changed"}
+        self.current_project.tmdl_files.append(path)
+        # Calculation groups need compatibilityLevel >= 1470; warn rather than upgrade, since a
+        # level bump cannot be undone.
         compat_warning = None
-        try:
-            db_tmdl = self.current_project.semantic_model_folder / "definition" / "database.tmdl"
-            if db_tmdl.exists():
-                dm = re.search(r"compatibilityLevel:\s*(\d+)", self._read_text(db_tmdl))
-                if dm and int(dm.group(1)) < 1470:
-                    compat_warning = (f"database.tmdl compatibilityLevel is {dm.group(1)}; calculation "
-                                      "groups need >= 1470 (Desktop writes 1550). Upgrade the model in "
-                                      "Power BI Desktop before relying on this group.")
-        except Exception:
-            pass
+        db_tmdl = definition / "database.tmdl"
+        if db_tmdl.exists():
+            dm = re.search(r"compatibilityLevel:\s*(\d+)", self._read_text(db_tmdl))
+            if dm and int(dm.group(1)) < 1470:
+                compat_warning = (f"database.tmdl compatibilityLevel is {dm.group(1)}; calculation "
+                                  "groups need >= 1470 (Desktop writes 1550). Upgrade the model in "
+                                  "Power BI Desktop before relying on this group.")
         return {"success": True, "table": name, "path": str(path), "items": len(items),
                 "discourage_implicit_measures_set": flag_set, "compat_warning": compat_warning}
 
@@ -1013,1612 +950,309 @@ class PowerBIPBIPConnector:
         """Append a hierarchy to a table's .tmdl (offline). Level columns must exist."""
         if not self.current_project:
             return {"success": False, "message": "No PBIP project loaded. Use 'pbip_load_project' first."}
-        path = self._find_table_file(table)
-        if not path:
+        if not name or not self._one_line(name):
+            return {"success": False, "message": "The hierarchy name must be a single line of text"}
+        info = self._catalog().table((table or "").strip())
+        if info is None or not info.file:
             return {"success": False, "message": f"Table '{table}' not found in the model"}
-        index = self._model_field_index()
-        cols = {f.lower() for f, meta in index.get(table, {}).items() if meta.get("kind") == "column"}
-        # _model_field_index keys by declared table name; find case-insensitively
-        for tname, fields in index.items():
-            if tname.lower() == table.lower():
-                cols = {f.lower() for f, meta in fields.items() if meta.get("kind") == "column"}
-                break
-        missing = [c for c in levels if c.lower() not in cols]
+        missing = [c for c in levels if c.casefold() not in info.columns]
         if missing:
             return {"success": False,
                     "message": f"Column(s) not found in '{table}': {', '.join(missing)}"}
-        content = self._read_text(path)
-        if re.search(rf"^\s*hierarchy\s+(?:'{re.escape(name)}'|{re.escape(name)})\s*$",
-                     content, re.MULTILINE | re.IGNORECASE):
+        if name.casefold() in info.hierarchy_names:
             return {"success": False, "message": f"Hierarchy '{name}' already exists on '{table}'"}
-        if self.auto_backup and not self.current_project.backup_path:
-            self.create_backup()
-        block = tmdl_authoring.render_hierarchy(name, levels)
+        backup_error = self._backup_once()
+        if backup_error:
+            return {"success": False, "message": backup_error}
+        path = Path(info.file)
+        content = self._read_text(path)
+        block = tmdl_authoring.render_hierarchy(name, [info.columns[c.casefold()].name for c in levels])
         self._write_text(path, tmdl_authoring.append_block(content, block))
         return {"success": True, "table": table, "hierarchy": name, "levels": levels, "path": str(path)}
-
-    def _read_text(self, file_path) -> str:
-        """Read a text file, remembering its encoding (utf-8 vs utf-8-sig/BOM) so it can be
-        written back faithfully. Returns text with any BOM stripped."""
-        with open(file_path, 'rb') as f:
-            raw = f.read()
-        if raw.startswith(b'\xef\xbb\xbf'):
-            self._file_encodings[str(file_path)] = 'utf-8-sig'
-            return raw.decode('utf-8-sig')
-        self._file_encodings[str(file_path)] = 'utf-8'
-        return raw.decode('utf-8')
-
-    def _write_text(self, file_path, content: str) -> None:
-        """Atomically write text (temp file + os.replace) using the file's remembered
-        encoding and without translating newlines, so a crash mid-write cannot corrupt
-        the original and CRLF/LF and BOM are preserved."""
-        encoding = self._file_encodings.get(str(file_path), 'utf-8')
-        path = Path(file_path)
-        tmp = path.with_name(path.name + '.tmp')
-        with open(tmp, 'w', encoding=encoding, newline='') as f:
-            f.write(content)
-        os.replace(tmp, path)
-
-    def _cache_file_content(self, file_path: Path) -> None:
-        """Cache original file content for potential rollback (records encoding too)"""
-        if str(file_path) not in self._original_files:
-            try:
-                self._original_files[str(file_path)] = self._read_text(file_path)
-            except Exception as e:
-                logger.warning(f"Could not cache file {file_path}: {e}")
-
-    def rollback_changes(self) -> bool:
-        """
-        Rollback all changes made in this session (atomic, encoding-preserving)
-
-        Returns:
-            True if rollback successful
-        """
-        if not self._original_files:
-            logger.warning("No changes to rollback")
-            return False
-
-        try:
-            for file_path, content in self._original_files.items():
-                self._write_text(file_path, content)
-
-            logger.info(f"Rolled back {len(self._original_files)} file(s)")
-            self._original_files = {}
-            return True
-
-        except Exception as e:
-            logger.error(f"Rollback failed: {e}")
-            return False
 
     # ==================== VALIDATION ====================
 
     def validate_tmdl_syntax(self) -> List[ValidationError]:
-        """
-        Validate TMDL files for common syntax errors
-
-        Returns:
-            List of validation errors found
-        """
-        errors = []
-
-        if not self.current_project or not self.current_project.tmdl_files:
-            return errors
-
-        # Build set of table names that need quoting
-        tables_needing_quotes = set()
-        try:
-            for tmdl_file in self.current_project.tmdl_files:
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                # Find all table declarations (handle both quoted and unquoted names)
-                # Pattern 1: table 'Name With Spaces'
-                for match in re.finditer(r"^table\s+'([^']+)'", content, re.MULTILINE):
-                    table_name = match.group(1).replace("''", "'")  # Unescape quotes
-                    if needs_tmdl_quoting(table_name):
-                        tables_needing_quotes.add(table_name)
-                # Pattern 2: table UnquotedName
-                for match in re.finditer(r"^table\s+(\w+)\s*$", content, re.MULTILINE):
-                    table_name = match.group(1)
-                    if needs_tmdl_quoting(table_name):
-                        tables_needing_quotes.add(table_name)
-        except Exception:
-            pass
-
-        for tmdl_file in self.current_project.tmdl_files:
+        """Check the model's TMDL for structural problems an offline edit can introduce:
+        names that need quotes, relationship endpoints that are not Table.Column, table names
+        with spaces used unquoted in DAX, duplicate objects, and references (relationships,
+        sortByColumn, hierarchy levels, table-qualified DAX) to objects that do not exist."""
+        errors: List[ValidationError] = []
+        docs: Dict[str, tmdl_scan.TmdlDocument] = {}
+        for path in self._tmdl_files():
             try:
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-
-                for i, line in enumerate(lines, 1):
-                    stripped = line.strip()
-
-                    # Check for unquoted names with spaces in declarations
-                    # Pattern: "table Name With Spaces" (without quotes)
-                    if stripped.startswith('table '):
-                        name_part = stripped[6:].strip()
-                        if ' ' in name_part and not name_part.startswith("'"):
-                            errors.append(ValidationError(
-                                file_path=str(tmdl_file),
-                                line_number=i,
-                                error_type="UNQUOTED_NAME",
-                                message=f"Table name with spaces must be quoted: {name_part}",
-                                context=stripped
-                            ))
-
-                    # Check fromTable/toTable references
-                    for prefix in ['fromTable:', 'toTable:']:
-                        if prefix in stripped:
-                            # Extract the name after the prefix
-                            match = re.search(rf'{prefix}\s*(.+?)(?:\s*$|\s+\w+:)', stripped)
-                            if match:
-                                name_part = match.group(1).strip()
-                                if ' ' in name_part and not name_part.startswith("'"):
-                                    errors.append(ValidationError(
-                                        file_path=str(tmdl_file),
-                                        line_number=i,
-                                        error_type="UNQUOTED_REFERENCE",
-                                        message=f"Relationship reference with spaces must be quoted: {name_part}",
-                                        context=stripped
-                                    ))
-
-                    # Check for unquoted table references in DAX (measure/column expressions)
-                    if 'expression:' in stripped or '=' in stripped:
-                        # Check for unquoted table references that need quoting
-                        for table_name in tables_needing_quotes:
-                            # Pattern: unquoted TableName[Column] where table has spaces
-                            if re.search(rf"(?<!['\w]){re.escape(table_name)}(?=\s*\[)", stripped):
-                                errors.append(ValidationError(
-                                    file_path=str(tmdl_file),
-                                    line_number=i,
-                                    error_type="UNQUOTED_TABLE_IN_DAX",
-                                    message=f"Table '{table_name}' in DAX expression must be quoted: use '{quote_tmdl_name(table_name)}' instead of '{table_name}'",
-                                    context=stripped
-                                ))
-                                break  # Only report once per line
-
-            except Exception as e:
-                errors.append(ValidationError(
-                    file_path=str(tmdl_file),
-                    line_number=0,
-                    error_type="FILE_ERROR",
-                    message=str(e),
-                    context=""
-                ))
-
+                docs[str(path)] = tmdl_scan.scan(self._read_text(path))
+            except (OSError, UnicodeError) as e:
+                errors.append(ValidationError(str(path), 0, "FILE_ERROR", f"{type(e).__name__}: {e}", ""))
+        catalog = tmdl_scan.ModelCatalog()
+        for path, doc in docs.items():
+            catalog.add_document(doc, path)
+        table_names = [t.name for t in catalog.tables.values()]
+        for path, doc in docs.items():
+            for node in doc.walk():
+                context = doc.text[node.start:node.end].strip()
+                if node.malformed:
+                    kind = "UNQUOTED_NAME" if "object name" in node.malformed else "MALFORMED_LINE"
+                    errors.append(ValidationError(path, node.line, kind, f"{node.malformed}: {context}",
+                                                  context))
+                if node.value is not None and node.keyword in ("fromColumn", "toColumn"):
+                    if len(tmdl_scan.split_object_path(node.value)) != 2:
+                        errors.append(ValidationError(
+                            path, node.line, "UNQUOTED_REFERENCE",
+                            "Relationship endpoint must be Table.Column, with single quotes around a "
+                            f"name that has spaces: {node.value}", context))
+                if doc.language(node) == "dax":
+                    expr = doc.expression(node)
+                    n = pbip_rename.quote_unquoted_tables(expr, table_names)[1]
+                    if n:
+                        errors.append(ValidationError(
+                            path, node.line, "UNQUOTED_TABLE_IN_DAX",
+                            f"{n} table reference(s) with spaces must be quoted in this DAX expression, "
+                            "for example 'My Table'[Column]", context))
+        for (kind, table, name), where in pbip_rename.model_problems(docs, catalog).items():
+            target = f"'{table}'[{name}]" if name else f"'{table}'"
+            file_path, _, line = where.rpartition(":")
+            errors.append(ValidationError(
+                file_path, int(line) if line.isdigit() else 0, "UNRESOLVED_REFERENCE",
+                f"{kind} {target} does not exist in the model", target))
+        for dup in catalog.duplicates:
+            errors.append(ValidationError("", 0, "DUPLICATE_NAME", dup, ""))
         return errors
 
-    def fix_all_dax_quoting(self) -> Dict[str, Any]:
+    def fix_all_dax_quoting(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Quote table names containing spaces that DAX expressions in the model use without
+        quotes. Only DAX is touched (never M code, descriptions or annotations), and every
+        file is written or none. With ``dry_run`` nothing is written and ``files_modified``
+        lists the files that would change.
+
+        Returns {"files_modified", "count", "tables_fixed", "errors", "dry_run"}.
         """
-        Fix all DAX expressions in TMDL files by properly quoting table names with spaces.
-
-        This scans all measures and expressions and quotes table names that have spaces
-        but are referenced without quotes.
-
-        Returns:
-            Dict with files_modified, references_fixed count, and validation_errors
-        """
-        if not self.current_project or not self.current_project.tmdl_files:
-            return {"files_modified": [], "count": 0, "errors": []}
-
-        files_modified = []
-        total_fixes = 0
-        errors = []
-
-        # First, collect all table names in the project
-        table_names = set()
+        result: Dict[str, Any] = {"files_modified": [], "count": 0, "tables_fixed": [], "errors": [],
+                                  "dry_run": dry_run}
+        if not self.current_project:
+            return result
+        tx = safe_io.FileTransaction()
         try:
-            for tmdl_file in self.current_project.tmdl_files:
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                # Find all table declarations - both quoted and unquoted
-                # Pattern 1: table 'Name With Spaces'
-                for match in re.finditer(r"^(?:\s*)table\s+'([^']+)'", content, re.MULTILINE):
-                    table_name = match.group(1).replace("''", "'")  # Unescape quotes
-                    table_names.add(table_name)
-                # Pattern 2: table UnquotedName
-                for match in re.finditer(r"^(?:\s*)table\s+(\w+)\s*$", content, re.MULTILINE):
-                    table_names.add(match.group(1))
-        except Exception as e:
-            logger.warning(f"Could not extract table names: {e}")
+            texts = {p: tx.read(p) for p in self._tmdl_files()}
+        except (OSError, UnicodeError) as e:
+            result["errors"].append({"file": getattr(e, "filename", None) or "",
+                                     "error": f"{type(e).__name__}: {e}"})
+            return result
+        catalog = tmdl_scan.ModelCatalog.from_texts({str(p): t for p, t in texts.items()})
+        names = [t.name for t in catalog.tables.values() if any(c.isspace() for c in t.name)]
+        fixed_tables: Set[str] = set()
+        for path, text in texts.items():
+            doc = tmdl_scan.scan(text)
+            edits = pbip_json.Edits(text)
+            for node in doc.walk():
+                if doc.language(node) != "dax":
+                    continue
+                expr = doc.expression(node)
+                new_expr, n = pbip_rename.quote_unquoted_tables(expr, names)
+                if n:
+                    edits.replace_span(node.expr_span[0], node.expr_span[1], new_expr)
+                    result["count"] += n
+                    fixed_tables.update(
+                        t for t in names
+                        if new_expr.count(quote_tmdl_name(t)) > expr.count(quote_tmdl_name(t)))
+            if len(edits):
+                tx.write(path, edits.apply())
+        result["tables_fixed"] = sorted(fixed_tables)
+        changed = tx.paths
+        if dry_run or not changed:
+            result["files_modified"] = changed
+            return result
+        undo = self._snapshot(changed)
+        try:
+            result["files_modified"] = tx.commit()
+        except OSError as e:
+            return {"files_modified": [], "count": 0, "tables_fixed": [], "dry_run": dry_run,
+                    "errors": [{"file": getattr(e, "filename", None) or "",
+                                "error": f"{type(e).__name__}: {e}"}]}
+        self._undo = undo
+        return result
 
-        # Filter to only tables that need quoting
-        tables_needing_quotes = [t for t in table_names if needs_tmdl_quoting(t)]
-
-        if not tables_needing_quotes:
-            return {"files_modified": [], "count": 0, "errors": []}
-
-        # Now process each file and fix DAX expressions
-        for tmdl_file in self.current_project.tmdl_files:
+    @staticmethod
+    def _snapshot(paths: List[str]) -> Dict[str, Optional[bytes]]:
+        out: Dict[str, Optional[bytes]] = {}
+        for path in paths:
             try:
-                self._cache_file_content(tmdl_file)
-
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_fixes = 0
-
-                # Fix each table that needs quoting
-                for table_name in tables_needing_quotes:
-                    table_quoted = quote_tmdl_name(table_name)
-                    escaped_name = re.escape(table_name)
-
-                    # Pattern 1: TableName[Column] -> 'TableName'[Column]
-                    pattern1 = rf"(?<!['\w]){escaped_name}(?=\s*\[)"
-                    content_before = content
-                    content = re.sub(pattern1, table_quoted, content)
-                    file_fixes += len(re.findall(pattern1, content_before))
-
-                    # Pattern 2: Handle function calls like CALCULATE(SUM(TableName[Col]))
-                    # This pattern matches unquoted table names in DAX contexts
-                    pattern2 = rf"(\()\s*{escaped_name}(?=\s*[\[\,\)])"
-                    content_before = content
-                    content = re.sub(pattern2, rf"\1{table_quoted}", content)
-                    file_fixes += len(re.findall(pattern2, content_before))
-
-                if content != original_content:
-                    with open(tmdl_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(tmdl_file))
-                    total_fixes += file_fixes
-                    logger.info(f"Fixed {file_fixes} DAX quote references in {tmdl_file}")
-
-            except Exception as e:
-                logger.error(f"Error fixing DAX in {tmdl_file}: {e}")
-                errors.append({"file": str(tmdl_file), "error": str(e)})
-
-        return {
-            "files_modified": files_modified,
-            "count": total_fixes,
-            "tables_fixed": tables_needing_quotes,
-            "errors": errors
-        }
+                with open(path, "rb") as f:
+                    out[path] = f.read()
+            except FileNotFoundError:
+                out[path] = None
+        return out
 
     # ==================== RENAME OPERATIONS ====================
 
-    def rename_table_in_files(self, old_name: str, new_name: str) -> RenameResult:
-        """
-        Rename a table across all PBIP files (TMDL + report visuals)
+    def _engine(self) -> pbip_rename.RenameEngine:
+        p = self.current_project
+        return pbip_rename.RenameEngine(p.root_path, self._tmdl_files(), self._report_files(),
+                                        p.diagram_layout_path)
 
-        This is a COMPREHENSIVE rename that:
-        1. Updates table declarations in TMDL files
-        2. Updates ALL DAX references with proper quoting (if new name has spaces)
-        3. Updates report layer (PBIR-Legacy or PBIR-Enhanced visual.json files)
-        4. Updates cultures files (linguistic schema)
+    def _report_format(self) -> str:
+        return "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
 
-        Supports both PBIR-Legacy (report.json) and PBIR-Enhanced (visual.json files) formats.
+    def _no_local_model(self) -> Optional[str]:
+        """Why this project has no model that can be read offline, or None when it has one."""
+        if self._tmdl_files():
+            return None
+        if self.current_project.remote_model:
+            return "the report is bound to a semantic model that is not part of this project"
+        return ("the project has no TMDL model files (a model stored as model.bim cannot be read "
+                "or edited here; save it as TMDL from Power BI Desktop)")
 
-        Args:
-            old_name: Current table name
-            new_name: New table name
-
-        Returns:
-            RenameResult with details
-        """
+    def _rename(self, ops: List[RenameOp], noun: str, details: Dict[str, Any]) -> RenameResult:
+        """Run renames as one transaction and describe the outcome truthfully."""
         if not self.current_project:
             return RenameResult(False, "No project loaded", [], 0)
-
-        files_modified = []
-        total_replacements = 0
-        backup_path = None
-
-        # Create backup if enabled
-        if self.auto_backup and not self.current_project.backup_path:
-            backup_path = self.create_backup()
-
-        # Transactional cascade: if any step fails, roll every file back so the model
-        # and report can never be left half-renamed (inconsistent). The rollback cache is
-        # scoped to THIS operation - a stale cache from an earlier operation would otherwise
-        # roll files back past changes made in between (e.g. measures added by add_measures).
-        self._original_files = {}
-        try:
-            # 1. Update TMDL files (semantic model) - auto-quoting is built-in
-            tmdl_replacements = self._rename_table_in_tmdl_files(old_name, new_name)
-            files_modified.extend(tmdl_replacements["files"])
-            total_replacements += tmdl_replacements["count"]
-
-            # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
-            if self.current_project.is_pbir_enhanced:
-                # PBIR Enhanced: Update individual visual.json files
-                visual_replacements = self._rename_table_in_visual_files(old_name, new_name)
-                files_modified.extend(visual_replacements["files"])
-                total_replacements += visual_replacements["count"]
-            elif self.current_project.report_json_path:
-                # PBIR Legacy: Update single report.json
-                report_replacements = self._rename_table_in_report_json(old_name, new_name)
-                if report_replacements["count"] > 0:
-                    files_modified.append(str(self.current_project.report_json_path))
-                    total_replacements += report_replacements["count"]
-
-            # 3. Update cultures files (linguistic schema)
-            if self.current_project.cultures_files:
-                cultures_replacements = self._rename_table_in_cultures_files(old_name, new_name)
-                files_modified.extend(cultures_replacements["files"])
-                total_replacements += cultures_replacements["count"]
-
-            # 4. Update diagramLayout.json (model diagram)
-            if self.current_project.diagram_layout_path:
-                diagram_replacements = self._rename_table_in_diagram_layout(old_name, new_name)
-                files_modified.extend(diagram_replacements["files"])
-                total_replacements += diagram_replacements["count"]
-
-            # 5. Validate after changes
-            validation_errors = self.validate_tmdl_syntax()
-        except Exception as e:
-            logger.error(f"Table rename cascade failed, rolling back: {e}")
-            self.rollback_changes()
+        details = dict(details, report_format=self._report_format())
+        no_model = self._no_local_model()
+        if no_model:
+            return RenameResult(False, f"Nothing was changed: {no_model}.", [], 0,
+                                details=dict(details, nothing_written=True))
+        backup: List[str] = []
+        outcome = self._engine().rename(ops, before_commit=lambda: self._backup_before_commit(backup))
+        backup_path = backup[0] if backup else None
+        details["operations"] = outcome.operations
+        if not outcome.success:
+            # A failed commit that could not put every file back hands over what those files
+            # held, so rollback_changes() can retry the restore.
+            self._undo = outcome.originals or self._undo
+            details["nothing_written"] = not outcome.originals
             return RenameResult(
-                False,
-                f"Rename of table '{old_name}' failed and all changes were rolled back: {e}",
-                [], 0,
-                details={"old_name": old_name, "new_name": new_name, "rolled_back": True},
-                backup_created=backup_path,
-            )
+                False, outcome.message, [], 0, details=details,
+                validation_errors=[ValidationError(i.file, i.line, i.kind, i.message, i.context)
+                                   for i in outcome.issues],
+                backup_created=backup_path, warnings=outcome.warnings)
+        self._undo = outcome.originals
+        self._scan_project_files(self.current_project)
+        what = ", ".join(f"'{o['old']}' -> '{o['new']}'" for o in outcome.operations)
+        message = (f"Renamed {len(outcome.operations)} {noun}(s): {what}. Updated "
+                   f"{outcome.references_updated} reference(s) in {len(outcome.files_modified)} file(s) "
+                   f"({details['report_format']}).")
+        message += self._warning_text(outcome.warnings)
+        return RenameResult(True, message, outcome.files_modified, outcome.references_updated,
+                            details=details, backup_created=backup_path, warnings=outcome.warnings)
 
-        report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
+    @staticmethod
+    def _warning_text(warnings: List[str]) -> str:
+        if not warnings:
+            return ""
+        shown = warnings[:MAX_WARNINGS_IN_MESSAGE]
+        more = len(warnings) - len(shown)
+        return (f"\n{len(warnings)} warning(s) - review these, they were not changed automatically:\n  - "
+                + "\n  - ".join(shown) + (f"\n  ... and {more} more" if more else ""))
 
-        return RenameResult(
-            success=len(validation_errors) == 0,
-            message=f"Renamed table '{old_name}' to '{new_name}' in {len(files_modified)} file(s) ({report_format})" +
-                    (f" with {len(validation_errors)} validation error(s)" if validation_errors else ""),
-            files_modified=files_modified,
-            references_updated=total_replacements,
-            details={"old_name": old_name, "new_name": new_name, "report_format": report_format},
-            validation_errors=validation_errors,
-            backup_created=backup_path
-        )
+    def rename_table_in_files(self, old_name: str, new_name: str) -> RenameResult:
+        """Rename a table everywhere: its declaration, DAX, M queries that read it,
+        relationships, model.tmdl, perspectives, roles, linguistic metadata, the diagram layout
+        and every report reference. All files change together or none does."""
+        return self._rename([RenameOp("table", old_name, new_name)], "table",
+                            {"old_name": old_name, "new_name": new_name})
 
     def rename_column_in_files(self, table_name: str, old_name: str, new_name: str) -> RenameResult:
-        """
-        Rename a column across all PBIP files
+        """Rename a column of ``table_name`` everywhere it is referenced, and nowhere else: a
+        same-named column of another table is not touched."""
+        return self._rename([RenameOp("column", old_name, new_name, table_name)], "column",
+                            {"table_name": table_name, "old_name": old_name, "new_name": new_name})
 
-        Supports both PBIR-Legacy and PBIR-Enhanced formats.
+    def rename_measure_in_files(self, old_name: str, new_name: str,
+                                table_name: Optional[str] = None) -> RenameResult:
+        """Rename a measure everywhere it is referenced. Same-named columns are left alone."""
+        return self._rename([RenameOp("measure", old_name, new_name, table_name)], "measure",
+                            {"old_name": old_name, "new_name": new_name})
 
-        Args:
-            table_name: Table containing the column
-            old_name: Current column name
-            new_name: New column name
-
-        Returns:
-            RenameResult with details
-        """
+    def _batch(self, renames: List[Dict[str, str]], kind: str) -> RenameResult:
         if not self.current_project:
             return RenameResult(False, "No project loaded", [], 0)
-
-        files_modified = []
-        total_replacements = 0
-        backup_path = None
-
-        # Create backup if enabled
-        if self.auto_backup and not self.current_project.backup_path:
-            backup_path = self.create_backup()
-
-        # Transactional cascade: roll back every file if any step fails. Scope the
-        # rollback cache to THIS operation (see rename_table_in_files).
-        self._original_files = {}
-        try:
-            # 1. Update TMDL files (semantic model)
-            tmdl_replacements = self._rename_column_in_tmdl_files(table_name, old_name, new_name)
-            files_modified.extend(tmdl_replacements["files"])
-            total_replacements += tmdl_replacements["count"]
-
-            # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
-            if self.current_project.is_pbir_enhanced:
-                # PBIR Enhanced: Update individual visual.json files
-                visual_replacements = self._rename_column_in_visual_files(table_name, old_name, new_name)
-                files_modified.extend(visual_replacements["files"])
-                total_replacements += visual_replacements["count"]
-            elif self.current_project.report_json_path:
-                # PBIR Legacy: Update single report.json
-                report_replacements = self._rename_column_in_report_json(table_name, old_name, new_name)
-                if report_replacements["count"] > 0:
-                    files_modified.append(str(self.current_project.report_json_path))
-                    total_replacements += report_replacements["count"]
-        except Exception as e:
-            logger.error(f"Column rename cascade failed, rolling back: {e}")
-            self.rollback_changes()
-            return RenameResult(
-                False,
-                f"Rename of column '{table_name}'[{old_name}] failed and all changes were rolled back: {e}",
-                [], 0,
-                details={"table_name": table_name, "old_name": old_name, "new_name": new_name, "rolled_back": True},
-                backup_created=backup_path,
-            )
-
-        report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
-
-        return RenameResult(
-            success=True,
-            message=f"Renamed column '{table_name}'[{old_name}] to [{new_name}] in {len(files_modified)} file(s) ({report_format})",
-            files_modified=files_modified,
-            references_updated=total_replacements,
-            details={"table_name": table_name, "old_name": old_name, "new_name": new_name, "report_format": report_format},
-            backup_created=backup_path
-        )
-
-    def rename_measure_in_files(self, old_name: str, new_name: str) -> RenameResult:
-        """
-        Rename a measure across all PBIP files
-
-        Supports both PBIR-Legacy and PBIR-Enhanced formats.
-
-        Args:
-            old_name: Current measure name
-            new_name: New measure name
-
-        Returns:
-            RenameResult with details
-        """
-        if not self.current_project:
-            return RenameResult(False, "No project loaded", [], 0)
-
-        files_modified = []
-        total_replacements = 0
-        backup_path = None
-
-        # Create backup if enabled
-        if self.auto_backup and not self.current_project.backup_path:
-            backup_path = self.create_backup()
-
-        # Transactional cascade: roll back every file if any step fails. Scope the
-        # rollback cache to THIS operation (see rename_table_in_files).
-        self._original_files = {}
-        try:
-            # 1. Update TMDL files (semantic model)
-            tmdl_replacements = self._rename_measure_in_tmdl_files(old_name, new_name)
-            files_modified.extend(tmdl_replacements["files"])
-            total_replacements += tmdl_replacements["count"]
-
-            # 2. Update report layer (PBIR-Legacy or PBIR-Enhanced)
-            if self.current_project.is_pbir_enhanced:
-                # PBIR Enhanced: Update individual visual.json files
-                visual_replacements = self._rename_measure_in_visual_files(old_name, new_name)
-                files_modified.extend(visual_replacements["files"])
-                total_replacements += visual_replacements["count"]
-            elif self.current_project.report_json_path:
-                # PBIR Legacy: Update single report.json
-                report_replacements = self._rename_measure_in_report_json(old_name, new_name)
-                if report_replacements["count"] > 0:
-                    files_modified.append(str(self.current_project.report_json_path))
-                    total_replacements += report_replacements["count"]
-        except Exception as e:
-            logger.error(f"Measure rename cascade failed, rolling back: {e}")
-            self.rollback_changes()
-            return RenameResult(
-                False,
-                f"Rename of measure '{old_name}' failed and all changes were rolled back: {e}",
-                [], 0,
-                details={"old_name": old_name, "new_name": new_name, "rolled_back": True},
-                backup_created=backup_path,
-            )
-
-        report_format = "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy"
-
-        return RenameResult(
-            success=True,
-            message=f"Renamed measure '{old_name}' to '{new_name}' in {len(files_modified)} file(s) ({report_format})",
-            files_modified=files_modified,
-            references_updated=total_replacements,
-            details={"old_name": old_name, "new_name": new_name, "report_format": report_format},
-            backup_created=backup_path
-        )
-
-    # ==================== TMDL FILE OPERATIONS ====================
-
-    def _rename_table_in_tmdl_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """
-        Rename table references in TMDL files with proper quoting
-
-        Handles:
-        1. Table declarations: table OldName -> table 'New Name'
-        2. DAX references: 'OldName'[Column] -> 'New Name'[Column]
-        3. Relationship refs: fromTable: OldName -> fromTable: 'New Name'
-        4. Relationship names: 'OldName to Table' -> 'New Name to Table'
-        """
-        files_modified = []
-        total_count = 0
-
-        if not self.current_project or not self.current_project.tmdl_files:
-            return {"files": files_modified, "count": total_count}
-
-        # Properly quoted new name for TMDL
-        new_name_quoted = quote_tmdl_name(new_name)
-
-        # Build regex patterns for old name (handle both quoted and unquoted)
-        old_name_escaped = re.escape(old_name)
-        old_name_quoted_escaped = re.escape(f"'{old_name}'")
-
-        # Build patterns list
-        patterns = []
-
-        # Pattern 1: Table declaration (both quoted and unquoted old names)
-        # table OldName -> table 'New Name'
-        patterns.append((
-            rf'^(\s*)table\s+{old_name_escaped}\s*$',
-            rf'\1table {new_name_quoted}',
-            re.MULTILINE
-        ))
-        # table 'OldName' -> table 'New Name'
-        patterns.append((
-            rf"^(\s*)table\s+'{old_name_escaped}'\s*$",
-            rf'\1table {new_name_quoted}',
-            re.MULTILINE
-        ))
-
-        # Pattern 2: DAX references - 'TableName'[Column]
-        patterns.append((
-            rf"'{old_name_escaped}'\s*\[",
-            f"{new_name_quoted}[",
-            0
-        ))
-
-        # Pattern 3: DAX references - unquoted TableName[Column]
-        # IMPORTANT: Always use the properly quoted version for the new name
-        patterns.append((
-            rf"(?<!['\w]){old_name_escaped}(?=\s*\[)",
-            new_name_quoted,
-            0
-        ))
-
-        # Pattern 4: 'TableName' in function calls (RELATED, ALL, VALUES, etc.)
-        patterns.append((
-            rf"'{old_name_escaped}'(?=\s*[,\)\]])",
-            new_name_quoted,
-            0
-        ))
-
-        # Pattern 4b: Unquoted TableName in function calls
-        # This catches: FUNCTION(OldTable[, FUNCTION(OldTable,, FUNCTION(OldTable)
-        # Examples: COUNTROWS(TableName), SUM(TableName[Col]), FILTER(TableName, ...)
-        patterns.append((
-            rf"([A-Z]+\s*\(\s*){old_name_escaped}(?=\s*[\[\,\)])",
-            rf"\1{new_name_quoted}",
-            re.IGNORECASE
-        ))
-
-        # Pattern 4c: Relationship names containing table name (CRITICAL for relationships)
-        # Handle: relationship 'OldName to SomeTable' -> relationship 'NewName to SomeTable'
-        # The entire name is in quotes, so we need to replace just the table name part inside quotes
-        patterns.append((
-            rf"(relationship\s+')({old_name_escaped})(\s+to\s+[^']*)'",
-            rf"\1{new_name}\3'",
-            re.IGNORECASE
-        ))
-        # Handle: relationship 'SomeTable to OldName' -> relationship 'SomeTable to NewName'
-        patterns.append((
-            rf"(relationship\s+')([^']*\s+to\s+)({old_name_escaped})'",
-            rf"\1\2{new_name}'",
-            re.IGNORECASE
-        ))
-        # Handle unquoted: relationship OldName to SomeTable -> relationship 'NewName' to SomeTable
-        patterns.append((
-            rf"(relationship\s+){old_name_escaped}(\s+to\s+)",
-            rf"\1{new_name_quoted}\2",
-            re.IGNORECASE
-        ))
-        # Handle unquoted: relationship SomeTable to OldName -> relationship SomeTable to 'NewName'
-        patterns.append((
-            rf"(relationship\s+)(\S+\s+to\s+){old_name_escaped}(?=\s|$)",
-            rf"\1\2{new_name_quoted}",
-            re.IGNORECASE | re.MULTILINE
-        ))
-
-        # Pattern 5: fromTable reference (CRITICAL for relationships)
-        # fromTable: OldName -> fromTable: 'New Name'
-        patterns.append((
-            rf'(fromTable\s*:\s*){old_name_escaped}(?=\s*(?:$|\n|\r|toTable|fromColumn|toColumn))',
-            rf'\1{new_name_quoted}',
-            re.MULTILINE | re.IGNORECASE
-        ))
-        # fromTable: 'OldName' -> fromTable: 'New Name'
-        patterns.append((
-            rf"(fromTable\s*:\s*)'{old_name_escaped}'",
-            rf'\1{new_name_quoted}',
-            re.IGNORECASE
-        ))
-
-        # Pattern 6: toTable reference (CRITICAL for relationships)
-        # toTable: OldName -> toTable: 'New Name'
-        patterns.append((
-            rf'(toTable\s*:\s*){old_name_escaped}(?=\s*(?:$|\n|\r|fromTable|fromColumn|toColumn))',
-            rf'\1{new_name_quoted}',
-            re.MULTILINE | re.IGNORECASE
-        ))
-        # toTable: 'OldName' -> toTable: 'New Name'
-        patterns.append((
-            rf"(toTable\s*:\s*)'{old_name_escaped}'",
-            rf'\1{new_name_quoted}',
-            re.IGNORECASE
-        ))
-
-        # Pattern 7: Partition name (partition OldName = m)
-        # partition OldName -> partition 'New Name'
-        patterns.append((
-            rf'^(\s*)partition\s+{old_name_escaped}\s*=',
-            rf'\1partition {new_name_quoted} =',
-            re.MULTILINE
-        ))
-        # partition 'OldName' -> partition 'New Name'
-        patterns.append((
-            rf"^(\s*)partition\s+'{old_name_escaped}'\s*=",
-            rf'\1partition {new_name_quoted} =',
-            re.MULTILINE
-        ))
-
-        # Pattern 8: fromColumn with table prefix (CRITICAL for relationships)
-        # Format: fromColumn: TableName.ColumnName or fromColumn: TableName.'Column Name'
-        # fromColumn: OldTable.Column -> fromColumn: 'NewTable'.Column
-        patterns.append((
-            rf'(fromColumn\s*:\s*){old_name_escaped}\.(\w+)',
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-        # fromColumn: OldTable.'Column Name' -> fromColumn: 'NewTable'.'Column Name'
-        patterns.append((
-            rf"(fromColumn\s*:\s*){old_name_escaped}\.('[^']+')",
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-        # fromColumn: 'OldTable'.Column -> fromColumn: 'NewTable'.Column
-        patterns.append((
-            rf"(fromColumn\s*:\s*)'{old_name_escaped}'\.(\w+)",
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-        # fromColumn: 'OldTable'.'Column Name' -> fromColumn: 'NewTable'.'Column Name'
-        patterns.append((
-            rf"(fromColumn\s*:\s*)'{old_name_escaped}'\.('[^']+')",
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-
-        # Pattern 9: toColumn with table prefix (CRITICAL for relationships)
-        # Same patterns as fromColumn but for toColumn
-        # toColumn: OldTable.Column -> toColumn: 'NewTable'.Column
-        patterns.append((
-            rf'(toColumn\s*:\s*){old_name_escaped}\.(\w+)',
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-        # toColumn: OldTable.'Column Name' -> toColumn: 'NewTable'.'Column Name'
-        patterns.append((
-            rf"(toColumn\s*:\s*){old_name_escaped}\.('[^']+')",
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-        # toColumn: 'OldTable'.Column -> toColumn: 'NewTable'.Column
-        patterns.append((
-            rf"(toColumn\s*:\s*)'{old_name_escaped}'\.(\w+)",
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-        # toColumn: 'OldTable'.'Column Name' -> toColumn: 'NewTable'.'Column Name'
-        patterns.append((
-            rf"(toColumn\s*:\s*)'{old_name_escaped}'\.('[^']+')",
-            rf'\1{new_name_quoted}.\2',
-            re.MULTILINE
-        ))
-
-        # Pattern 10: ref table in model.tmdl
-        # ref table OldName -> ref table 'NewName'
-        patterns.append((
-            rf'^(\s*)ref\s+table\s+{old_name_escaped}\s*$',
-            rf'\1ref table {new_name_quoted}',
-            re.MULTILINE
-        ))
-        # ref table 'OldName' -> ref table 'NewName'
-        patterns.append((
-            rf"^(\s*)ref\s+table\s+'{old_name_escaped}'\s*$",
-            rf'\1ref table {new_name_quoted}',
-            re.MULTILINE
-        ))
-
-        # Pattern 11: PBI_QueryOrder annotation (list of table names in JSON array format)
-        # IMPORTANT: Must be specific to PBI_QueryOrder to avoid matching M-Code entity= references
-        # Format: annotation PBI_QueryOrder = ["Table1","Table2",...]
-        # DO NOT match: {[entity="TableName",version=""]} (M-Code/Power Query source references)
-        patterns.append((
-            rf'(PBI_QueryOrder\s*=\s*\[.*?")({old_name_escaped})(".*?\])',
-            rf'\1{new_name}\3',
-            0
-        ))
-
-        # Pattern 12: M-Code internal table references
-        # These are references to other tables in the same model within Power Query
-        # Format: VariableName = TableName, (inside let ... in blocks)
-        # Uses #"..." quoting for names with spaces
-        new_name_mcode = quote_mcode_name(new_name)
-
-        # = OldName, (assignment with comma - most common in let blocks)
-        patterns.append((
-            rf'(=\s*){old_name_escaped}(\s*,)',
-            rf'\1{new_name_mcode}\2',
-            0
-        ))
-        # = #"OldName", (quoted assignment with comma)
-        patterns.append((
-            rf'(=\s*)#"{old_name_escaped}"(\s*,)',
-            rf'\1{new_name_mcode}\2',
-            0
-        ))
-        # = OldName at end of line (no comma - last line in let block or simple query)
-        patterns.append((
-            rf'(=\s*){old_name_escaped}(\s*)$',
-            rf'\1{new_name_mcode}\2',
-            re.MULTILINE
-        ))
-        # = #"OldName" at end of line
-        patterns.append((
-            rf'(=\s*)#"{old_name_escaped}"(\s*)$',
-            rf'\1{new_name_mcode}\2',
-            re.MULTILINE
-        ))
-
-        for tmdl_file in self.current_project.tmdl_files:
-            try:
-                # Cache original content for rollback
-                self._cache_file_content(tmdl_file)
-
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_count = 0
-
-                # CRITICAL: Extract ONLY external dataflow references
-                # External refs like {[entity="...",version=""]}[Data] must NEVER change
-                # Internal table refs like Source = TableName SHOULD change
-                content, external_refs = extract_external_refs(content)
-
-                for pattern, replacement, flags in patterns:
-                    content, count = re.subn(pattern, replacement, content, flags=flags)
-                    file_count += count
-
-                # Restore external references (unchanged)
-                content = restore_external_refs(content, external_refs)
-
-                if content != original_content:
-                    with open(tmdl_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(tmdl_file))
-                    total_count += file_count
-                    logger.info(f"Updated {file_count} references in {tmdl_file}")
-
-            except Exception as e:
-                logger.error(f"Error updating TMDL file {tmdl_file}: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    def _rename_column_in_tmdl_files(self, table_name: str, old_name: str, new_name: str) -> Dict[str, Any]:
-        """Rename column references in TMDL files with proper quoting"""
-        files_modified = []
-        total_count = 0
-
-        if not self.current_project or not self.current_project.tmdl_files:
-            return {"files": files_modified, "count": total_count}
-
-        # Quote names if needed
-        table_name_quoted = quote_tmdl_name(table_name)
-        new_name_quoted = quote_tmdl_name(new_name)
-
-        # For DAX, columns inside brackets don't need external quotes but may need them if they have spaces
-        new_col_in_bracket = new_name if not needs_tmdl_quoting(new_name) else new_name
-
-        # Escape for regex
-        table_escaped = re.escape(table_name)
-        old_escaped = re.escape(old_name)
-
-        # Patterns for column references
-        patterns = [
-            # 'TableName'[OldColumn] -> 'TableName'[NewColumn]
-            (rf"'{table_escaped}'\s*\[\s*{old_escaped}\s*\]", f"{table_name_quoted}[{new_col_in_bracket}]", 0),
-            # TableName[OldColumn] -> TableName[NewColumn]
-            (rf"(?<!['\w]){table_escaped}\s*\[\s*{old_escaped}\s*\]", f"{table_name}[{new_col_in_bracket}]", 0),
-            # TMDL column definition: column OldName -> column NewName
-            (rf'^(\s*)column\s+{old_escaped}\s*$', rf'\1column {new_name_quoted}', re.MULTILINE),
-            (rf"^(\s*)column\s+'{old_escaped}'\s*$", rf'\1column {new_name_quoted}', re.MULTILINE),
-            # fromColumn/toColumn with TableName.ColumnName format (CRITICAL for relationships)
-            # fromColumn: TableName.OldColumn -> fromColumn: TableName.NewColumn
-            (rf'(fromColumn\s*:\s*{table_escaped}\.)({old_escaped})(?=\s|$)', rf'\1{new_name_quoted}', re.MULTILINE),
-            # fromColumn: TableName.'OldColumn' -> fromColumn: TableName.'NewColumn'
-            (rf"(fromColumn\s*:\s*{table_escaped}\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
-            # fromColumn: 'TableName'.OldColumn -> fromColumn: 'TableName'.NewColumn
-            (rf"(fromColumn\s*:\s*'{table_escaped}'\.)({old_escaped})(?=\s|$)", rf'\1{new_name_quoted}', re.MULTILINE),
-            # fromColumn: 'TableName'.'OldColumn' -> fromColumn: 'TableName'.'NewColumn'
-            (rf"(fromColumn\s*:\s*'{table_escaped}'\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
-            # toColumn: TableName.OldColumn -> toColumn: TableName.NewColumn
-            (rf'(toColumn\s*:\s*{table_escaped}\.)({old_escaped})(?=\s|$)', rf'\1{new_name_quoted}', re.MULTILINE),
-            # toColumn: TableName.'OldColumn' -> toColumn: TableName.'NewColumn'
-            (rf"(toColumn\s*:\s*{table_escaped}\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
-            # toColumn: 'TableName'.OldColumn -> toColumn: 'TableName'.NewColumn
-            (rf"(toColumn\s*:\s*'{table_escaped}'\.)({old_escaped})(?=\s|$)", rf'\1{new_name_quoted}', re.MULTILINE),
-            # toColumn: 'TableName'.'OldColumn' -> toColumn: 'TableName'.'NewColumn'
-            (rf"(toColumn\s*:\s*'{table_escaped}'\.)'{old_escaped}'", rf'\1{new_name_quoted}', 0),
-        ]
-
-        # Constructs that live ONLY inside the owning table's file (hierarchy levels,
-        # sortByColumn wiring, calculated-table sourceColumn). Applying these globally would
-        # rename same-named columns of OTHER tables, so they are scoped to this file.
-        owning_file = self._find_table_file(table_name)
-        owner_patterns = [
-            # sortByColumn: OldName  (bare or quoted)
-            (rf"^(\s*)sortByColumn:\s*{old_escaped}\s*$", rf"\1sortByColumn: {new_name_quoted}", re.MULTILINE),
-            (rf"^(\s*)sortByColumn:\s*'{old_escaped}'\s*$", rf"\1sortByColumn: {new_name_quoted}", re.MULTILINE),
-            # hierarchy level reference: column: OldName
-            (rf"^(\s*)column:\s*{old_escaped}\s*$", rf"\1column: {new_name_quoted}", re.MULTILINE),
-            (rf"^(\s*)column:\s*'{old_escaped}'\s*$", rf"\1column: {new_name_quoted}", re.MULTILINE),
-            # NOTE: sourceColumn: [Name] is deliberately NOT rewritten - for calculated tables
-            # it maps to the DAX output alias, which does not change when the column is renamed.
-        ]
-
-        for tmdl_file in self.current_project.tmdl_files:
-            try:
-                self._cache_file_content(tmdl_file)
-
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_count = 0
-
-                # Column rename patterns are specific to DAX/TMDL syntax
-                # They won't accidentally match M-Code patterns
-                for pattern, replacement, flags in patterns:
-                    content, count = re.subn(pattern, replacement, content, flags=flags)
-                    file_count += count
-                if owning_file is not None and Path(tmdl_file) == Path(owning_file):
-                    for pattern, replacement, flags in owner_patterns:
-                        content, count = re.subn(pattern, replacement, content, flags=flags)
-                        file_count += count
-
-                if content != original_content:
-                    with open(tmdl_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(tmdl_file))
-                    total_count += file_count
-
-            except Exception as e:
-                logger.error(f"Error updating TMDL file {tmdl_file}: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    def _rename_measure_in_tmdl_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """Rename measure references in TMDL files with proper quoting"""
-        files_modified = []
-        total_count = 0
-
-        if not self.current_project or not self.current_project.tmdl_files:
-            return {"files": files_modified, "count": total_count}
-
-        new_name_quoted = quote_tmdl_name(new_name)
-        old_escaped = re.escape(old_name)
-
-        # Patterns for measure references. The bracket pattern must NOT touch a
-        # calculated-table column mapping line (sourceColumn: [Name]) when a measure happens
-        # to share a column's name - that mapping refers to the DAX-produced column, not the
-        # measure. The fixed-width lookbehind covers the exact emitted/exported form.
-        patterns = [
-            # [MeasureName] references in DAX
-            (rf"(?<!sourceColumn: )\[\s*{old_escaped}\s*\]", f"[{new_name}]", 0),
-            # TMDL measure definition: measure OldName = -> measure NewName =
-            (rf'^(\s*)measure\s+{old_escaped}\s*=', rf'\1measure {new_name_quoted} =', re.MULTILINE),
-            (rf"^(\s*)measure\s+'{old_escaped}'\s*=", rf'\1measure {new_name_quoted} =', re.MULTILINE),
-        ]
-
-        for tmdl_file in self.current_project.tmdl_files:
-            try:
-                self._cache_file_content(tmdl_file)
-
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_count = 0
-
-                # Measure rename patterns are specific to DAX/TMDL syntax
-                # They won't accidentally match M-Code patterns
-                for pattern, replacement, flags in patterns:
-                    content, count = re.subn(pattern, replacement, content, flags=flags)
-                    file_count += count
-
-                if content != original_content:
-                    with open(tmdl_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(tmdl_file))
-                    total_count += file_count
-
-            except Exception as e:
-                logger.error(f"Error updating TMDL file {tmdl_file}: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    # ==================== PBIR VISUAL.JSON OPERATIONS ====================
-
-    def _rename_table_in_visual_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """
-        Rename table references in PBIR Enhanced format visual.json files.
-
-        Each visual.json contains Entity references like:
-        {
-            "SourceRef": {
-                "Entity": "Salesforce_Data"  <- This needs updating
-            }
-        }
-
-        Returns:
-            Dict with files modified and count of updates
-        """
-        if not self.current_project or not self.current_project.visual_json_files:
-            return {"files": [], "count": 0}
-
-        files_modified = []
-        total_count = 0
-
-        for visual_file in self.current_project.visual_json_files:
-            try:
-                self._cache_file_content(visual_file)
-
-                with open(visual_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_count = 0
-
-                # Pattern 1: "Entity": "OldTableName"
-                pattern1 = rf'"Entity"\s*:\s*"{re.escape(old_name)}"'
-                replacement1 = f'"Entity": "{new_name}"'
-                content, c = re.subn(pattern1, replacement1, content)
-                file_count += c
-
-                # Pattern 2: queryRef patterns like "OldTableName.ColumnName"
-                pattern2 = rf'"queryRef"\s*:\s*"{re.escape(old_name)}\.([^"]+)"'
-                replacement2 = rf'"queryRef": "{new_name}.\1"'
-                content, c = re.subn(pattern2, replacement2, content)
-                file_count += c
-
-                # Pattern 3: nativeQueryRef with table prefix
-                pattern3 = rf'"nativeQueryRef"\s*:\s*"{re.escape(old_name)}\.([^"]+)"'
-                replacement3 = rf'"nativeQueryRef": "{new_name}.\1"'
-                content, c = re.subn(pattern3, replacement3, content)
-                file_count += c
-
-                # Pattern 4: metadata selector patterns
-                pattern4 = rf'"metadata"\s*:\s*"{re.escape(old_name)}\.([^"]+)"'
-                replacement4 = rf'"metadata": "{new_name}.\1"'
-                content, c = re.subn(pattern4, replacement4, content)
-                file_count += c
-
-                if content != original_content:
-                    with open(visual_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(visual_file))
-                    total_count += file_count
-                    logger.info(f"Updated {file_count} Entity references in {visual_file.name}")
-
-            except Exception as e:
-                logger.error(f"Error updating visual file {visual_file}: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    def _rename_column_in_visual_files(self, table_name: str, old_name: str, new_name: str) -> Dict[str, Any]:
-        """Rename column references in PBIR Enhanced format visual.json files"""
-        if not self.current_project or not self.current_project.visual_json_files:
-            return {"files": [], "count": 0}
-
-        files_modified = []
-        total_count = 0
-
-        for visual_file in self.current_project.visual_json_files:
-            try:
-                self._cache_file_content(visual_file)
-
-                with open(visual_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_count = 0
-
-                # Pattern 1: "Property": "ColumnName" (when Entity context is table_name)
-                # This is tricky - we use JSON parsing for accuracy
-                try:
-                    visual_data = json.loads(content)
-                    modified = self._deep_rename_column_in_json(visual_data, table_name, old_name, new_name)
-                    if modified > 0:
-                        content = json.dumps(visual_data, indent=2, ensure_ascii=False)
-                        file_count += modified
-                except json.JSONDecodeError:
-                    pass
-
-                # Pattern 2: queryRef patterns like "TableName.OldColumn"
-                pattern2 = rf'"{re.escape(table_name)}\.{re.escape(old_name)}"'
-                replacement2 = f'"{table_name}.{new_name}"'
-                content, c = re.subn(pattern2, replacement2, content)
-                file_count += c
-
-                if content != original_content:
-                    with open(visual_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(visual_file))
-                    total_count += file_count
-
-            except Exception as e:
-                logger.error(f"Error updating visual file {visual_file}: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    def _rename_measure_in_visual_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """Rename measure references in PBIR Enhanced format visual.json files"""
-        if not self.current_project or not self.current_project.visual_json_files:
-            return {"files": [], "count": 0}
-
-        files_modified = []
-        total_count = 0
-
-        for visual_file in self.current_project.visual_json_files:
-            try:
-                self._cache_file_content(visual_file)
-
-                with open(visual_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_count = 0
-
-                # Pattern 1: "Property": "MeasureName"
-                pattern1 = rf'"Property"\s*:\s*"{re.escape(old_name)}"'
-                replacement1 = f'"Property": "{new_name}"'
-                content, c = re.subn(pattern1, replacement1, content)
-                file_count += c
-
-                # Pattern 2: queryRef ending with measure name
-                pattern2 = rf'\.{re.escape(old_name)}"'
-                replacement2 = f'.{new_name}"'
-                content, c = re.subn(pattern2, replacement2, content)
-                file_count += c
-
-                # Pattern 3: nativeQueryRef with measure name
-                pattern3 = rf'"nativeQueryRef"\s*:\s*"{re.escape(old_name)}"'
-                replacement3 = f'"nativeQueryRef": "{new_name}"'
-                content, c = re.subn(pattern3, replacement3, content)
-                file_count += c
-
-                if content != original_content:
-                    with open(visual_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(visual_file))
-                    total_count += file_count
-
-            except Exception as e:
-                logger.error(f"Error updating visual file {visual_file}: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    def fix_broken_visual_references(self, old_table_name: str, new_table_name: str) -> Dict[str, Any]:
-        """
-        Fix broken visual references after a table rename.
-
-        This is a targeted fix for the common scenario where:
-        - TOM/API renamed the table in the semantic model
-        - But report visuals still reference the old table name
-
-        Works with both PBIR-Legacy and PBIR-Enhanced formats.
-
-        Args:
-            old_table_name: The old table name that visuals are still referencing
-            new_table_name: The correct new table name
-
-        Returns:
-            Dict with fix results
-        """
-        if not self.current_project:
-            return {"success": False, "error": "No project loaded"}
-
-        files_modified = []
-        total_count = 0
-        errors = []
-
-        # Fix PBIR-Legacy report.json
-        if self.current_project.report_json_path and not self.current_project.is_pbir_enhanced:
-            result = self._rename_table_in_report_json(old_table_name, new_table_name)
-            if result.get("count", 0) > 0:
-                files_modified.append(str(self.current_project.report_json_path))
-                total_count += result["count"]
-
-        # Fix PBIR-Enhanced visual.json files
-        if self.current_project.is_pbir_enhanced and self.current_project.visual_json_files:
-            result = self._rename_table_in_visual_files(old_table_name, new_table_name)
-            files_modified.extend(result.get("files", []))
-            total_count += result.get("count", 0)
-
-        # Also fix cultures files (linguistic schema)
-        if self.current_project.cultures_files:
-            result = self._rename_table_in_cultures_files(old_table_name, new_table_name)
-            files_modified.extend(result.get("files", []))
-            total_count += result.get("count", 0)
-
-        # Also fix diagramLayout.json
-        if self.current_project.diagram_layout_path:
-            result = self._rename_table_in_diagram_layout(old_table_name, new_table_name)
-            files_modified.extend(result.get("files", []))
-            total_count += result.get("count", 0)
-
-        return {
-            "success": total_count > 0,
-            "files_modified": files_modified,
-            "references_fixed": total_count,
-            "format": "PBIR-Enhanced" if self.current_project.is_pbir_enhanced else "PBIR-Legacy",
-            "errors": errors
-        }
-
-    def _rename_table_in_cultures_files(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """
-        Rename table references in cultures/linguistic schema files.
-
-        These files contain:
-        - "ConceptualEntity": "TableName" references used for Q&A
-        - JSON keys like "TableName": { for linguistic entities
-        """
-        if not self.current_project or not self.current_project.cultures_files:
-            return {"files": [], "count": 0}
-
-        files_modified = []
-        total_count = 0
-
-        for cultures_file in self.current_project.cultures_files:
-            try:
-                self._cache_file_content(cultures_file)
-
-                with open(cultures_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                original_content = content
-                file_count = 0
-
-                # Pattern 1: "ConceptualEntity": "TableName"
-                pattern1 = rf'"ConceptualEntity"\s*:\s*"{re.escape(old_name)}"'
-                replacement1 = f'"ConceptualEntity": "{new_name}"'
-                content, c = re.subn(pattern1, replacement1, content)
-                file_count += c
-
-                # Pattern 2: JSON key "TableName": { (linguistic entity definition)
-                pattern2 = rf'"{re.escape(old_name)}"\s*:\s*\{{'
-                replacement2 = f'"{new_name}": {{'
-                content, c = re.subn(pattern2, replacement2, content)
-                file_count += c
-
-                if content != original_content:
-                    with open(cultures_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_modified.append(str(cultures_file))
-                    total_count += file_count
-                    logger.info(f"Updated {file_count} linguistic schema references in {cultures_file.name}")
-
-            except Exception as e:
-                logger.error(f"Error updating cultures file {cultures_file}: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    def _rename_table_in_diagram_layout(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """
-        Rename table references in diagramLayout.json.
-
-        This file contains nodeIndex properties that reference table names for the model diagram.
-        """
-        if not self.current_project or not self.current_project.diagram_layout_path:
-            return {"files": [], "count": 0}
-
-        files_modified = []
-        total_count = 0
-        diagram_file = self.current_project.diagram_layout_path
-
-        try:
-            self._cache_file_content(diagram_file)
-
-            with open(diagram_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            original_content = content
-            file_count = 0
-
-            # Pattern: "nodeIndex": "TableName"
-            pattern = rf'"nodeIndex"\s*:\s*"{re.escape(old_name)}"'
-            replacement = f'"nodeIndex": "{new_name}"'
-            content, c = re.subn(pattern, replacement, content)
-            file_count += c
-
-            if content != original_content:
-                with open(diagram_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                files_modified.append(str(diagram_file))
-                total_count += file_count
-                logger.info(f"Updated {file_count} nodeIndex references in diagramLayout.json")
-
-        except Exception as e:
-            logger.error(f"Error updating diagramLayout.json: {e}")
-
-        return {"files": files_modified, "count": total_count}
-
-    def scan_broken_references(self) -> Dict[str, Any]:
-        """
-        Scan the project for potentially broken references.
-
-        Compares table names in semantic model vs references in report layer.
-
-        Returns:
-            Dict with broken references found
-        """
-        if not self.current_project:
-            return {"error": "No project loaded"}
-
-        # Get table names from semantic model
-        model_tables = set()
-        for tmdl_file in self.current_project.tmdl_files:
-            try:
-                with open(tmdl_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                # Find table declarations
-                for match in re.finditer(r"^(?:\s*)table\s+'([^']+)'", content, re.MULTILINE):
-                    model_tables.add(match.group(1).replace("''", "'"))
-                for match in re.finditer(r"^(?:\s*)table\s+(\w+)\s*$", content, re.MULTILINE):
-                    model_tables.add(match.group(1))
-            except Exception:
-                pass
-
-        # Get table references from report layer
-        report_tables = set()
-        broken_refs = []
-
-        # Check visual files (PBIR Enhanced)
-        for visual_file in self.current_project.visual_json_files:
-            try:
-                with open(visual_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                for match in re.finditer(r'"Entity"\s*:\s*"([^"]+)"', content):
-                    entity = match.group(1)
-                    report_tables.add(entity)
-                    if entity not in model_tables:
-                        broken_refs.append({
-                            "file": str(visual_file),
-                            "entity": entity,
-                            "type": "visual"
-                        })
-            except Exception:
-                pass
-
-        # Check report.json (PBIR Legacy)
-        if self.current_project.report_json_path:
-            try:
-                with open(self.current_project.report_json_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                for match in re.finditer(r'"Entity"\s*:\s*"([^"]+)"', content):
-                    entity = match.group(1)
-                    report_tables.add(entity)
-                    if entity not in model_tables:
-                        broken_refs.append({
-                            "file": str(self.current_project.report_json_path),
-                            "entity": entity,
-                            "type": "report.json"
-                        })
-            except Exception:
-                pass
-
-        # Find orphaned tables (in report but not in model)
-        orphaned = report_tables - model_tables
-
-        return {
-            "model_tables": list(model_tables),
-            "report_tables": list(report_tables),
-            "broken_references": broken_refs,
-            "orphaned_table_names": list(orphaned),
-            "has_broken_refs": len(broken_refs) > 0
-        }
-
-    # ==================== REPORT.JSON OPERATIONS (PBIR-Legacy) ====================
-
-    def _rename_table_in_report_json(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """
-        Rename table references in report.json (PBIR-Legacy format)
-
-        report.json contains visual field bindings like:
-        - "Entity": "TableName"
-        - "Property": "ColumnName"
-        - queryRef patterns
-        """
-        if not self.current_project or not self.current_project.report_json_path:
-            return {"count": 0}
-
-        try:
-            self._cache_file_content(self.current_project.report_json_path)
-
-            with open(self.current_project.report_json_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            original_content = content
-            count = 0
-
-            # Pattern 1: "Entity": "TableName" (exact match for Entity field)
-            pattern1 = rf'"Entity"\s*:\s*"{re.escape(old_name)}"'
-            replacement1 = f'"Entity": "{new_name}"'
-            content, c = re.subn(pattern1, replacement1, content)
-            count += c
-
-            # Pattern 2: "Table": "TableName"
-            pattern2 = rf'"Table"\s*:\s*"{re.escape(old_name)}"'
-            replacement2 = f'"Table": "{new_name}"'
-            content, c = re.subn(pattern2, replacement2, content)
-            count += c
-
-            # Pattern 3: queryRef with table name (e.g., "TableName.ColumnName")
-            pattern3 = rf'"{re.escape(old_name)}\.([^"]+)"'
-            replacement3 = rf'"{new_name}.\1"'
-            content, c = re.subn(pattern3, replacement3, content)
-            count += c
-
-            # Pattern 4: NativeReferenceName with table
-            pattern4 = rf'"NativeReferenceName"\s*:\s*"{re.escape(old_name)}"'
-            replacement4 = f'"NativeReferenceName": "{new_name}"'
-            content, c = re.subn(pattern4, replacement4, content)
-            count += c
-
-            if content != original_content:
-                with open(self.current_project.report_json_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                logger.info(f"Updated {count} table references in report.json")
-
-            return {"count": count}
-
-        except Exception as e:
-            logger.error(f"Error updating report.json: {e}")
-            return {"count": 0, "error": str(e)}
-
-    def _rename_column_in_report_json(self, table_name: str, old_name: str, new_name: str) -> Dict[str, Any]:
-        """Rename column references in report.json"""
-        if not self.current_project or not self.current_project.report_json_path:
-            return {"count": 0}
-
-        try:
-            self._cache_file_content(self.current_project.report_json_path)
-
-            with open(self.current_project.report_json_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            original_content = content
-            count = 0
-
-            # Pattern 1: Table.Column pattern in queryRef
-            pattern1 = rf'"{re.escape(table_name)}\.{re.escape(old_name)}"'
-            replacement1 = f'"{table_name}.{new_name}"'
-            content, c = re.subn(pattern1, replacement1, content)
-            count += c
-
-            # Pattern 2: Use JSON parsing for Property fields with Entity context
-            try:
-                report_data = json.loads(content)
-                modified = self._deep_rename_column_in_json(report_data, table_name, old_name, new_name)
-                if modified > 0:
-                    content = json.dumps(report_data, indent=2, ensure_ascii=False)
-                    count += modified
-            except json.JSONDecodeError:
-                # Fall back to regex if JSON parsing fails
-                pass
-
-            if content != original_content:
-                with open(self.current_project.report_json_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                logger.info(f"Updated {count} column references in report.json")
-
-            return {"count": count}
-
-        except Exception as e:
-            logger.error(f"Error updating report.json: {e}")
-            return {"count": 0, "error": str(e)}
-
-    def _deep_rename_column_in_json(self, obj: Any, table_name: str, old_name: str, new_name: str) -> int:
-        """Recursively rename column references in JSON structure"""
-        count = 0
-
-        if isinstance(obj, dict):
-            # Check if this dict has Entity=table_name and Property=old_name
-            if obj.get("Entity") == table_name and obj.get("Property") == old_name:
-                obj["Property"] = new_name
-                count += 1
-
-            # Also check for NativeReferenceName pattern
-            if "NativeReferenceName" in obj:
-                ref = obj["NativeReferenceName"]
-                if isinstance(ref, str) and ref == f"{table_name}.{old_name}":
-                    obj["NativeReferenceName"] = f"{table_name}.{new_name}"
-                    count += 1
-
-            # Recurse into nested dicts
-            for key, value in obj.items():
-                count += self._deep_rename_column_in_json(value, table_name, old_name, new_name)
-
-        elif isinstance(obj, list):
-            for item in obj:
-                count += self._deep_rename_column_in_json(item, table_name, old_name, new_name)
-
-        return count
-
-    def _rename_measure_in_report_json(self, old_name: str, new_name: str) -> Dict[str, Any]:
-        """Rename measure references in report.json"""
-        if not self.current_project or not self.current_project.report_json_path:
-            return {"count": 0}
-
-        try:
-            self._cache_file_content(self.current_project.report_json_path)
-
-            with open(self.current_project.report_json_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            original_content = content
-            count = 0
-
-            # Measures are referenced similarly to columns
-            # Pattern: "Property": "MeasureName"
-            pattern1 = rf'"Property"\s*:\s*"{re.escape(old_name)}"'
-            replacement1 = f'"Property": "{new_name}"'
-            content, c = re.subn(pattern1, replacement1, content)
-            count += c
-
-            # Pattern: Table.MeasureName in queryRef
-            pattern2 = rf'\.{re.escape(old_name)}"'
-            replacement2 = f'.{new_name}"'
-            content, c = re.subn(pattern2, replacement2, content)
-            count += c
-
-            if content != original_content:
-                with open(self.current_project.report_json_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                logger.info(f"Updated {count} measure references in report.json")
-
-            return {"count": count}
-
-        except Exception as e:
-            logger.error(f"Error updating report.json: {e}")
-            return {"count": 0, "error": str(e)}
-
-    # ==================== BATCH OPERATIONS ====================
+        ops: List[RenameOp] = []
+        for i, item in enumerate(renames or []):
+            old, new = (item or {}).get("old_name"), (item or {}).get("new_name")
+            table = (item or {}).get("table_name")
+            if not old or not new or (kind == "column" and not table):
+                need = "table_name, old_name and new_name" if kind == "column" else "old_name and new_name"
+                return RenameResult(False, f"Nothing was changed: rename #{i + 1} needs {need}.", [], 0,
+                                    details={"nothing_written": True})
+            ops.append(RenameOp(kind, old, new, table if kind != "table" else None))
+        if not ops:
+            return RenameResult(False, "Nothing was changed: no renames were given.", [], 0,
+                                details={"nothing_written": True})
+        return self._rename(ops, kind, {"renames": [dict(r) for r in renames]})
 
     def batch_rename_tables(self, renames: List[Dict[str, str]]) -> RenameResult:
-        """
-        Batch rename multiple tables in PBIP files
-
-        Args:
-            renames: List of {"old_name": "...", "new_name": "..."} dicts
-
-        Returns:
-            RenameResult with combined results
-        """
-        if not self.current_project:
-            return RenameResult(False, "No project loaded", [], 0)
-
-        all_files: Set[str] = set()
-        total_refs = 0
-        results = []
-        all_validation_errors: List[ValidationError] = []
-        backup_path = None
-
-        # Create backup before any changes
-        if self.auto_backup:
-            backup_path = self.create_backup()
-
-        for rename in renames:
-            old_name = rename.get("old_name")
-            new_name = rename.get("new_name")
-
-            if not old_name or not new_name:
-                continue
-
-            result = self.rename_table_in_files(old_name, new_name)
-            results.append(result)
-            all_files.update(result.files_modified)
-            total_refs += result.references_updated
-            all_validation_errors.extend(result.validation_errors)
-
-        # Final validation
-        final_validation = self.validate_tmdl_syntax()
-        all_validation_errors.extend(final_validation)
-
-        success = len(all_validation_errors) == 0
-
-        message = f"Renamed {len(renames)} table(s) in PBIP files. Updated {total_refs} references in {len(all_files)} file(s)."
-        if not success:
-            message += f" WARNING: {len(all_validation_errors)} validation error(s) found!"
-
-        return RenameResult(
-            success=success,
-            message=message,
-            files_modified=list(all_files),
-            references_updated=total_refs,
-            details={"individual_results": [r.__dict__ for r in results]},
-            validation_errors=all_validation_errors,
-            backup_created=backup_path
-        )
+        """Rename several tables ([{"old_name", "new_name"}]) as ONE transaction: if any of
+        them cannot be applied, none is."""
+        return self._batch(renames, "table")
 
     def batch_rename_columns(self, renames: List[Dict[str, str]]) -> RenameResult:
-        """
-        Batch rename multiple columns in PBIP files
-
-        Args:
-            renames: List of {"table_name": "...", "old_name": "...", "new_name": "..."} dicts
-
-        Returns:
-            RenameResult with combined results
-        """
-        if not self.current_project:
-            return RenameResult(False, "No project loaded", [], 0)
-
-        all_files: Set[str] = set()
-        total_refs = 0
-        results = []
-        backup_path = None
-
-        # Create backup before any changes
-        if self.auto_backup:
-            backup_path = self.create_backup()
-
-        for rename in renames:
-            table_name = rename.get("table_name")
-            old_name = rename.get("old_name")
-            new_name = rename.get("new_name")
-
-            if not all([table_name, old_name, new_name]):
-                continue
-
-            result = self.rename_column_in_files(table_name, old_name, new_name)
-            results.append(result)
-            all_files.update(result.files_modified)
-            total_refs += result.references_updated
-
-        return RenameResult(
-            success=True,
-            message=f"Renamed {len(renames)} column(s) in PBIP files. Updated {total_refs} references in {len(all_files)} file(s).",
-            files_modified=list(all_files),
-            references_updated=total_refs,
-            details={"individual_results": [r.__dict__ for r in results]},
-            backup_created=backup_path
-        )
+        """Rename several columns ([{"table_name", "old_name", "new_name"}]) as one transaction."""
+        return self._batch(renames, "column")
 
     def batch_rename_measures(self, renames: List[Dict[str, str]]) -> RenameResult:
-        """
-        Batch rename multiple measures in PBIP files
+        """Rename several measures ([{"old_name", "new_name"}], optional "table_name") as one
+        transaction."""
+        return self._batch(renames, "measure")
 
-        Args:
-            renames: List of {"old_name": "...", "new_name": "..."} dicts
+    # ==================== REPORT REPAIR & SCANS ====================
 
-        Returns:
-            RenameResult with combined results
-        """
+    def fix_broken_visual_references(self, old_table_name: str, new_table_name: str) -> Dict[str, Any]:
+        """Repair the report after a model-only table rename: every report reference to
+        ``old_table_name`` (a table the model no longer has) is pointed at ``new_table_name``
+        (which must exist). Also updates linguistic metadata and the diagram layout. Nothing is
+        written unless everything can be."""
         if not self.current_project:
-            return RenameResult(False, "No project loaded", [], 0)
+            return {"success": False, "error": "No project loaded"}
+        fmt = self._report_format()
+        backup: List[str] = []
+        outcome = self._engine().repair_report_table(
+            old_table_name, new_table_name, before_commit=lambda: self._backup_before_commit(backup))
+        backup_path = backup[0] if backup else None
+        if outcome.success:
+            self._undo = outcome.originals
+        return {
+            "success": outcome.success,
+            "files_modified": outcome.files_modified,
+            "references_fixed": outcome.references_updated,
+            "format": fmt,
+            "errors": [] if outcome.success else [outcome.message],
+            "message": outcome.message,
+            "warnings": outcome.warnings,
+            "backup_created": backup_path,
+        }
 
-        all_files: Set[str] = set()
-        total_refs = 0
-        results = []
-        backup_path = None
-
-        # Create backup before any changes
-        if self.auto_backup:
-            backup_path = self.create_backup()
-
-        for rename in renames:
-            old_name = rename.get("old_name")
-            new_name = rename.get("new_name")
-
-            if not old_name or not new_name:
+    def scan_broken_references(self) -> Dict[str, Any]:
+        """Compare the report layer with the model: tables and fields the report refers to that
+        the model does not have."""
+        if not self.current_project:
+            return {"error": "No project loaded"}
+        catalog = self._catalog()
+        model_tables = [t.name for t in catalog.tables.values()]
+        report_tables: Set[str] = set()
+        broken_refs: List[Dict[str, str]] = []
+        broken_fields: List[Dict[str, str]] = []
+        unreadable: List[Dict[str, str]] = [{"file": f, "error": e} for f, e in self.unreadable_files]
+        for fp in self._report_files():
+            try:
+                refs, tables = pbip_report.references_in_text(self._read_text(fp))
+            except (OSError, UnicodeError, pbip_json.JsonSyntaxError) as e:
+                unreadable.append({"file": str(fp), "error": f"{type(e).__name__}: {e}"})
                 continue
-
-            result = self.rename_measure_in_files(old_name, new_name)
-            results.append(result)
-            all_files.update(result.files_modified)
-            total_refs += result.references_updated
-
-        return RenameResult(
-            success=True,
-            message=f"Renamed {len(renames)} measure(s) in PBIP files. Updated {total_refs} references in {len(all_files)} file(s).",
-            files_modified=list(all_files),
-            references_updated=total_refs,
-            details={"individual_results": [r.__dict__ for r in results]},
-            backup_created=backup_path
-        )
+            kind = "visual" if fp.name == "visual.json" else fp.name
+            for table in sorted(tables):
+                report_tables.add(table)
+                if not catalog.has_table(table):
+                    broken_refs.append({"file": str(fp), "entity": table, "type": kind})
+            for table, name in sorted(refs):
+                if catalog.has_table(table) and not catalog.has_member(table, name):
+                    broken_fields.append({"file": str(fp), "table": table, "field": name, "type": kind})
+        orphaned = sorted({t for t in report_tables if not catalog.has_table(t)})
+        return {
+            "model_tables": model_tables,
+            "report_tables": sorted(report_tables),
+            "broken_references": broken_refs,
+            "broken_field_references": broken_fields,
+            "orphaned_table_names": orphaned,
+            "unreadable_files": unreadable,
+            "has_broken_refs": bool(broken_refs or broken_fields),
+        }
