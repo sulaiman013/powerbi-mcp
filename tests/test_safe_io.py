@@ -174,6 +174,25 @@ def test_file_name_case_is_preserved():
         check("a single write does not rename the file either", "NewFile.Json" in os.listdir(d), str(os.listdir(d)))
 
 
+def test_write_bytes():
+    print("\n== binary files are written whole or not at all ==")
+    with tempfile.TemporaryDirectory() as d:
+        target = os.path.join(d, "visual.pbiviz")
+        payload = bytes([80, 75, 3, 4]) + b" second " + bytes([13, 10, 0, 255])
+        safe_io.write_bytes(target, bytes([80, 75, 3, 4]) + b" first")
+        safe_io.write_bytes(target, bytearray(payload))
+        with open(target, "rb") as f:
+            check("bytes are written exactly, with no newline or encoding handling", f.read() == payload)
+        check("no temporary file is left beside the target", sorted(os.listdir(d)) == ["visual.pbiviz"],
+              str(sorted(os.listdir(d))))
+        try:
+            safe_io.write_bytes(os.path.join(d, "missing-folder", "x.bin"), b"x")
+            check("a missing folder is an error", False)
+        except OSError:
+            check("a missing folder is an error", True)
+        check("and leaves nothing behind", sorted(os.listdir(d)) == ["visual.pbiviz"])
+
+
 def test_mixed_line_endings_are_kept():
     print("\n== mixed line endings ==")
     d = tempfile.mkdtemp()
@@ -205,7 +224,7 @@ def test_mixed_line_endings_are_kept():
 
 if __name__ == "__main__":
     for fn in (test_format_fidelity, test_transaction, test_transaction_restores_on_failure,
-               test_file_name_case_is_preserved, test_mixed_line_endings_are_kept):
+               test_file_name_case_is_preserved, test_write_bytes, test_mixed_line_endings_are_kept):
         fn()
     print()
     if _failures:

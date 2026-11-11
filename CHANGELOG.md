@@ -3,6 +3,94 @@
 All notable changes to the Power BI MCP Server. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped milestones.
 
+## [3.9.0] - 2026-11-11 — Native report features, custom visuals, and a live pass against Desktop
+
+The report spec now covers Power BI's own report features, the server can build custom visuals
+that behave like native ones, and everything was run against a real Power BI Desktop (2.159).
+The server grew from **90 to 94 tools** and from 50 to 53 test suites. Each part was reviewed by
+a reviewer that did not write it, and the findings were fixed before release.
+
+### Added — native report features in the report spec (`pbir_apply_spec`)
+- **Filters** on the report, a page or a visual: `in` / `not_in`, comparisons with an optional
+  second condition, `between`, blank / not blank, text tests, top and bottom N by a measure,
+  relative dates; hidden, locked, single-select. Values are checked against the column's type.
+- **Drillthrough pages** with a back button, and drillthrough buttons.
+- **Report-page tooltips**: tooltip pages, and `tooltip_page` on a visual.
+- **Visual interactions**: which visual filters, highlights or ignores which.
+- **Phone layout**: a `mobile` position per element.
+- **Bookmark groups.**
+- **Custom visuals built in the same spec**: a `custom_visuals` entry can name a definition and
+  the spec builds and registers the visual.
+- A field in a drill role can be marked `active`; a `group` can sit anywhere on the page; the
+  `html` element takes `"edition": "secure" | "regular"`.
+- What a person adds in Desktop to a file the spec writes (a filter, an interaction, a
+  drillthrough field) is kept when the spec is applied again.
+
+### Added — custom visuals without the toolchain
+- **`build_custom_visual`** packages a real `.pbiviz` from a compact definition (data roles, a
+  format pane, CSS and a JavaScript render function) with the server's own runtime; no pbiviz
+  toolchain, TypeScript or webpack. The built visual selects on click and cross-filters the page,
+  is cross-highlighted by other visuals, opens the Power BI context menu (drill through, drill,
+  include, exclude), shows Power BI tooltips including report-page tooltips, and has a format
+  pane, keyboard support, theme colours and a landing page. The render code marks a data point
+  with `data-row`; the runtime does the rest. A JavaScript app written for a measure builds
+  unchanged. The package is deterministic and the guid follows the name. Author code is checked
+  and syntax-checked, never run; files are read only from the definition's own folder.
+- **`inspect_custom_visual`** describes any `.pbiviz` or unpacked visual: roles, format pane,
+  privileges, and which native behaviours its capabilities and script support.
+- **`generate_deneb_spec`** returns a Deneb (Vega-Lite) spec for ten chart kinds and small
+  multiples with cross-filter, cross-highlight, Power BI tooltips and the context menu wired in,
+  using the theme's colours and the model's format strings, plus a ready `deneb` element.
+- Four example visuals under `examples/custom_visuals/`.
+
+### Added — Desktop
+- **`bridge_open`** opens a `.pbip` or `.pbix` in Power BI Desktop and waits until its bridge is
+  ready. It checks every project path against the Windows limit first, never starts a second
+  window on a project whose window is merely busy, and can start minimized.
+- **`bridge_screenshot`** can capture one visual (by name, parent groups included) or one
+  rectangle of a page.
+- **`audit_report_design`** reads the new constructs: drillthrough pages nothing can reach or
+  with no back button, tooltip pages that are visible, oversized or unused, interactions naming a
+  missing visual, partial phone layouts, bookmark-group mistakes, hidden filters, paths too long
+  for Windows, and, for each private custom visual, what its package declares and its script
+  calls. It states which visuals are certified.
+
+### Fixed — found by running against Power BI Desktop 2.159
+- **The Desktop Bridge tools failed on current Desktop.** Desktop 2.159 takes every method's
+  arguments in an envelope; the client sent the earlier shape and got "Request arguments are
+  required". The client now reads the bridge's manifest and sends what the running build
+  declares, waits while Desktop answers "not ready", and retries a first capture that timed out.
+- **The live connection failed on a machine with only the .NET (Core) builds of the client
+  libraries**, with a message that asked whether Desktop was running. The loader now starts the
+  runtime that can load what is installed, unless the runtime or a library path was set by
+  hand, and the message gives the real reason.
+- **A project path of 260 characters or more stops Desktop with a dialog** nothing can see from
+  outside. `bridge_open` and the audit check for it.
+- **Renaming a measure left a Deneb spec's highlight and format fields on the old name**
+  (`Sales__highlight`, `Sales__format`), so cross-highlight silently stopped working.
+- Transaction messages repeated their first sentence.
+
+### Changed
+- **A tooltip page defaults to 320 x 240**, Power BI's own tooltip size, when the page gives no
+  size. A 3.8 spec whose tooltip page relied on the report's default size must now give its
+  `width` and `height`; the error says so.
+- Input that 3.8 wrote as given is now refused: an aggregation number that is no function, NaN
+  or Infinity, an unknown `display_option`, `max_selected` outside 1 to 250, `objects.vega` on a
+  Deneb element.
+- Deneb visuals are stamped with Vega-Lite 6.4.3, the version Deneb 2.0 writes.
+- The docs no longer call Deneb and HTML Content uncertified: Deneb's AppSource edition and HTML
+  Content Secure are certified; HTML Content Regular (the only edition that runs a JavaScript
+  app) and private `.pbiviz` visuals are not.
+
+### Verified, and not
+- Against Desktop 2.159: the main live tools, a transaction with rollback, the bridge, generated
+  reports with every native feature (filters by their effect on the numbers), generated Deneb
+  charts, and built custom visuals, whose selection, highlight, tooltip and context-menu calls
+  were answered by the real host.
+- Not observed: the bridge cannot click or hover, so clicking to filter, drilling through, a
+  tooltip page on hover, the phone view and the format pane were not seen in Desktop. Nothing was
+  run against a tenant. See docs/TESTING.md.
+
 ## [3.8.1] - 2026-11-11 — Supported SDK range, backups through another path
 
 Found by the first run of the suites on GitHub's Windows and Linux runners.

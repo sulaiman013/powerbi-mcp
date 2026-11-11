@@ -341,9 +341,93 @@ def test_load_and_probe_with_a_fake_clr():
                 sys.modules["clr"] = saved_clr
 
 
+class FakePythonnet:
+    """Stands in for the pythonnet module: records load() and reports a runtime once loaded."""
+
+    def __init__(self, loaded=None, fail=False):
+        self.loaded, self.fail, self.calls = loaded, fail, []
+
+    def get_runtime_info(self):
+        return types.SimpleNamespace(kind=self.loaded) if self.loaded else None
+
+    def load(self, runtime):
+        self.calls.append(runtime)
+        if self.fail:
+            raise RuntimeError("Could not find a suitable hostfxr library\n   at somewhere")
+        self.loaded = runtime
+
+
+def test_runtime_is_chosen_from_what_is_installed():
+    print("\n== the .NET runtime is picked from the builds that are installed ==")
+    with tempfile.TemporaryDirectory() as d:
+        core_a = stub(Path(d) / "a" / "netcoreapp3.0", NETCORE_BYTES)
+        core_t = stub(Path(d) / "t" / "netcoreapp3.0", NETCORE_BYTES)
+        fx_a = stub(Path(d) / "a" / "net45", NETFX_BYTES)
+        fx_t = stub(Path(d) / "t" / "net45", NETFX_BYTES)
+        eq("both libraries only as .NET (Core) builds", L.choose_runtime([core_a], [core_t]), L.CORECLR)
+        eq("one only as .NET (Core), the other as both, nothing pinned (a NuGet .netcore setup)",
+           L.choose_runtime([core_a], [fx_t, core_t]), L.CORECLR)
+        eq("Framework builds of both: stay on .NET Framework", L.choose_runtime([fx_a, core_a], [fx_t]), L.NETFX)
+        eq("each runtime can load exactly one: stay on the default", L.choose_runtime([fx_a], [core_t]), L.NETFX)
+        eq("nothing installed: stay on the default", L.choose_runtime([], []), L.NETFX)
+
+        user_vars = ("PYTHONNET_RUNTIME", "ADOMD_DLL_PATH", "TOM_DLL_PATH")
+        saved = (L.adomd_candidates, L.tom_candidates, L._RUNTIME_SETTLED, {v: os.environ.pop(v, None) for v in user_vars},
+                 sys.modules.get("pythonnet"), L.os.name)
+
+        def settle(fake, adomd, tom, env=None, os_name="nt"):
+            """Run ensure_runtime as on Windows (or ``os_name``) with ``env`` ({variable: value}) set."""
+            L._RUNTIME_SETTLED = False
+            L.adomd_candidates = lambda runtime=None: adomd
+            L.tom_candidates = lambda runtime=None: tom
+            sys.modules["pythonnet"] = fake
+            L.os.name = os_name
+            os.environ.update(env or {})
+            try:
+                return L.ensure_runtime()
+            finally:
+                for v in user_vars:
+                    os.environ.pop(v, None)
+                L.os.name = saved[5]
+        try:
+            fake = FakePythonnet()
+            check("only .NET (Core) builds: CoreCLR is started before anything loads",
+                  settle(fake, [core_a], [core_t]) == L.CORECLR and fake.calls == ["coreclr"], str(fake.calls))
+            check("it is decided once per process", L.ensure_runtime() is None and fake.calls == ["coreclr"])
+            fake = FakePythonnet()
+            check("Framework builds available: pythonnet's default is left alone",
+                  settle(fake, [fx_a], [fx_t]) is None and fake.calls == [])
+            fake = FakePythonnet()
+            check("PYTHONNET_RUNTIME set: the user's choice stands",
+                  settle(fake, [core_a], [core_t], env={"PYTHONNET_RUNTIME": "netfx"}) is None and fake.calls == [])
+            # A library pinned to its .NET Framework build is tried first whatever else is installed, and
+            # stops working on CoreCLR: with either variable set the runtime is the user's business.
+            for var in ("TOM_DLL_PATH", "ADOMD_DLL_PATH"):
+                fake = FakePythonnet()
+                check(f"{var} set: the runtime is left alone even when CoreCLR would cover more",
+                      settle(fake, [core_a], [fx_t, core_t], env={var: str(fx_t.parent)}) is None and fake.calls == [])
+            fake = FakePythonnet(loaded="netfx")
+            check(".NET already running: nothing to choose", settle(fake, [core_a], [core_t]) is None and fake.calls == [])
+            fake = FakePythonnet()
+            check("not Windows: left alone", settle(fake, [core_a], [core_t], os_name="posix") is None and fake.calls == [])
+            fake = FakePythonnet(fail=True)
+            check("no .NET runtime to start: stays on the default, and the probes will say why",
+                  settle(fake, [core_a], [core_t]) is None and fake.calls == ["coreclr"])
+            check("pythonnet not installed: nothing to do, and no error",
+                  settle(None, [core_a], [core_t]) is None)      # None in sys.modules: the import raises
+        finally:
+            L.adomd_candidates, L.tom_candidates, L._RUNTIME_SETTLED = saved[:3]
+            os.environ.update({v: value for v, value in saved[3].items() if value is not None})
+            if saved[4] is None:
+                sys.modules.pop("pythonnet", None)
+            else:
+                sys.modules["pythonnet"] = saved[4]
+
+
 def test_load_adomd_is_cached_and_reports():
     print("\n== load_adomd / load_tom: one attempt per process, result reported ==")
     saved = (L.adomd_candidates, L._probe_adomd, L.tom_candidates, L._probe_tom, dict(L._LOADED))
+    L._RUNTIME_SETTLED = True              # this test is about caching; the runtime is not its subject
     calls = []
     with tempfile.TemporaryDirectory() as d:
         bad = stub(Path(d) / "netcoreapp3.0", NETCORE_BYTES)
@@ -391,6 +475,7 @@ if __name__ == "__main__":
     test_explicit_override_stays_first()
     test_load_falls_through()
     test_load_and_probe_with_a_fake_clr()
+    test_runtime_is_chosen_from_what_is_installed()
     test_load_adomd_is_cached_and_reports()
     print("\n" + "=" * 70)
     if _failures:

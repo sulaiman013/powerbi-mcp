@@ -5,7 +5,7 @@ Read it before driving Power BI tasks.
 
 ## What this server does
 
-A Model Context Protocol server (90 tools) that lets an agent inspect, query, validate,
+A Model Context Protocol server (94 tools) that lets an agent inspect, query, validate,
 optimize, govern, safely refactor and build Power BI semantic models and reports. It connects to:
 
 - **Power BI Desktop** (local Analysis Services) - read + write, RLS testing
@@ -38,7 +38,8 @@ building, Best Practice Analyzer, linters, security) even without ADOMD/.NET.
 5. **Respect the safety hints.** Every tool is annotated (`readOnlyHint`,
    `destructiveHint`). Confirm destructive operations with the user.
 6. **After any offline edit, reload and look.** `bridge_status` (never reload over unsaved
-   changes) -> `bridge_reload` -> `bridge_screenshot`. Do not ask the user to close and reopen.
+   changes) -> `bridge_reload` -> `bridge_screenshot`. Do not ask the user to close and reopen;
+   if the report is not open, `bridge_open` opens it and waits for the bridge.
 7. **Dry-run first** where a tool offers it: `pbir_apply_spec`, `pbip_embed_data`,
    `pbip_fix_dax_quoting`.
 8. **Report results as they are.** A tool that says nothing was written means nothing was
@@ -76,25 +77,63 @@ The server can build a designed report the way a build script would, from one sp
    - micro-charts as SVG: `generate_svg_measure`;
    - a JavaScript app: `generate_payload_measure` for the data (rows packed into one text
      measure, with the parser to read them) and `build_js_app_measure` for the app itself.
-3. Describe the report in a spec (see `docs/REPORT_SPEC.md`): theme, pages, elements with stable
-   names, navigation buttons, synced slicers, pop-ups, elements shared across pages.
-4. `pbir_apply_spec` with `dry_run: true`, fix what it reports, then apply. Re-applying the same
+3. Get the bespoke visuals the report needs (see "Choosing a visual technique" below):
+   - `generate_deneb_spec` returns a ready `deneb` element with the interactivity wired in;
+   - `build_custom_visual` packages a real `.pbiviz` from a definition, or let the spec build it:
+     `"custom_visuals": [{"definition": "visuals/bar_list/definition.json", "alias": "bars"}]`.
+4. Describe the report in a spec (see `docs/REPORT_SPEC.md`): theme, pages, elements with stable
+   names, navigation buttons, synced slicers, pop-ups, elements shared across pages, and the
+   native report features: `filters` on the report, a page or a visual; `drillthrough` pages and
+   drillthrough buttons; report-page tooltips (`tooltip` on the page, `tooltip_page` on the
+   visual); `interactions` between visuals; `mobile` positions for the phone layout;
+   `bookmark_groups`.
+5. `pbir_apply_spec` with `dry_run: true`, fix what it reports, then apply. Re-applying the same
    spec changes nothing; `prune: true` removes what an earlier apply created and the spec
-   dropped.
-5. `audit_report_design` -> `bridge_reload` -> `bridge_screenshot` -> look, fix the spec, repeat.
-6. To publish: `pbip_embed_data` if the model reads local files (dry run first), then
+   dropped. Filters, interactions and drillthrough fields a person added in Desktop are kept.
+6. `audit_report_design` -> `bridge_open` (if the report is not open yet; `minimized: true` keeps
+   the window out of the way) -> `bridge_reload` -> `bridge_screenshot` -> look, fix the spec,
+   repeat. `bridge_screenshot` with `visual: "<element name>"` captures one visual, which is far
+   cheaper to read than a page.
+7. To publish: `pbip_embed_data` if the model reads local files (dry run first), then
    `pbip_stage_publish`. It prepares the folder and prints the import command; it never
    contacts the service.
 
-Things to know when you choose a technique:
-- A native visual cross-filters other visuals. An HTML Content visual, a JavaScript app in a
-  measure, and most bespoke custom visuals do not: a click inside them filters nothing outside.
-  Report slicers still filter them, because slicers change what the measure returns.
-- HTML Content, Deneb and private custom visuals are not certified. A tenant that only allows
-  certified visuals will not render them. `audit_report_design` lists them.
+### Choosing a visual technique
+
+What a reader can do with the visual decides the technique, not how it looks.
+
+| Technique | Click cross-filters the page | Is cross-highlighted | Tooltips, report-page tooltips | Right-click menu, drillthrough | Certified |
+|---|---|---|---|---|---|
+| Native visual | yes | yes | yes | yes | yes |
+| Deneb, spec from `generate_deneb_spec` | yes | yes | yes | yes | yes (AppSource edition) |
+| Custom visual from `build_custom_visual` | yes, when it has a grouping role | yes | yes | yes | no (private `.pbiviz`) |
+| HTML measure in HTML Content, Secure edition | no | no | one plain tooltip | no | yes |
+| JavaScript app in a measure (HTML Content, Regular edition) | no | no | one plain tooltip | no | no |
+
+- Need the visual to take part in the page (cross-filter, drillthrough, tooltip pages)? Use a
+  native visual, Deneb, or `build_custom_visual`. A JavaScript app written for a measure
+  (`function main(app)`) builds unchanged as a custom visual: its data then arrives from data
+  roles and its rows become real data points.
+- An HTML measure is still the lightest way to draw a designed card or sentence, and report
+  slicers still filter it, because slicers change what the measure returns. A click inside it
+  filters nothing. HTML Content can cross-filter only when a column sits in its Context role and
+  the option is on, which a single-measure design does not have.
+- The `html` element takes `"edition": "secure"` (certified; scripts and inline handlers are
+  removed) or `"regular"` (the default; runs scripts, not certified). A static HTML measure works
+  in both; a JavaScript app only in Regular.
+- A tenant that allows only certified visuals renders Deneb and HTML Content Secure, and blocks
+  HTML Content Regular and private custom visuals. `audit_report_design` says which a report
+  uses, and what each private custom visual can and cannot do on a click
+  (`inspect_custom_visual` for one package).
+- In a custom visual's render code, mark each data point with `data-row="<row index>"`: the
+  runtime then handles click, Ctrl-click, right-click, hover and keyboard for it.
 - A payload measure returns one string. The practical ceiling is about 2.1 million characters
   (an empirical figure); `generate_payload_measure` estimates how many rows fit.
-- Never put a secret or an API key in a measure: everything in a measure is readable.
+- Never put a secret or an API key in a measure or a visual: everything in them is readable.
+- What was verified how: generated reports, Deneb specs and built visuals were loaded and
+  rendered in Power BI Desktop, and a built visual's selection, highlight, tooltip and context
+  menu calls were answered by the real host. Mouse clicks and hovering cannot be driven through
+  the Desktop Bridge, so ask the user to click through a new interaction once.
 
 ## Prompts (guided workflows)
 

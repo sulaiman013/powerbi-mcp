@@ -601,7 +601,7 @@ class ReportRewriter:
                     if inner_text is None or inner_text.lstrip()[:1] not in ("{", "["):
                         continue
                     if not any(o in inner_text for o in fields):
-                        continue
+                        continue      # every supporting name contains its field's name
                     try:
                         inner = pbip_json.parse(inner_text)
                     except pbip_json.JsonSyntaxError:
@@ -617,7 +617,7 @@ class ReportRewriter:
                             _warn(result, f"{label}: {group}.{prop_name} creates its own field named "
                                           f"'{defined}'; the spec was left unchanged, check it by hand")
                             continue
-                        n = _rewrite_vega(inner, inner_edits, fields)
+                        n = _rewrite_vega(inner, inner_edits, _with_supporting_fields(fields))
                     if n:
                         result.count += n
                         edits.set_string(token, pbip_json.literal_wrap(inner_edits.apply()))
@@ -655,6 +655,22 @@ def _visual_calculations(container: Dict[Any, Any]) -> Iterator[Dict[Any, Any]]:
 def deneb_field_name(name: str) -> str:
     """The dataset field name Deneb gives a Power BI field."""
     return _DENEB_SPECIAL.sub("_", name)
+
+
+# Fields Deneb adds to the dataset beside a field of the visual (cross-highlight values and
+# the model's format string). A spec that reads Sales__highlight has to follow a rename of
+# Sales, or it silently falls back to the unhighlighted value. Deneb reserves these suffixes.
+DENEB_SUPPORTING_SUFFIXES = ("__highlight", "__highlightStatus", "__highlightComparator", "__format",
+                             "__formatted")
+
+
+def _with_supporting_fields(fields: Dict[str, str]) -> Dict[str, str]:
+    """``fields`` plus the rename of each field's Deneb supporting fields."""
+    out = dict(fields)
+    for old, new in fields.items():
+        for suffix in DENEB_SUPPORTING_SUFFIXES:
+            out.setdefault(old + suffix, new + suffix)
+    return out
 
 
 def _rename_keys(doc: Any, edits: Edits, fields: Dict[str, str]) -> int:

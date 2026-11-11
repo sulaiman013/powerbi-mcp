@@ -1,0 +1,13 @@
+.cl-heading { padding: 2px 4px 8px; font-size: 11pt; font-weight: 600; }
+.cl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--cl-min, 150px), 1fr)); gap: 10px; padding: 4px; }
+.cl-card { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid rgba(0, 0, 0, 0.12); border-left: 4px solid var(--cl-accent, var(--vk-accent)); border-radius: 6px; background: var(--vk-background, #fff); }
+.cl-card:hover { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12); }
+.cl-card.vk-selected { border-color: var(--cl-accent, var(--vk-accent)); box-shadow: 0 0 0 1px var(--cl-accent, var(--vk-accent)); }
+.cl-title { font-size: 9pt; opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cl-figure { font-size: 16pt; font-weight: 600; font-variant-numeric: tabular-nums; }
+.cl-figure small { font-size: 8pt; font-weight: 400; opacity: 0.7; }
+.cl-details { display: flex; flex-direction: column; gap: 2px; margin-top: 2px; }
+.cl-detail { display: flex; justify-content: space-between; gap: 8px; }
+.cl-detail span { opacity: 0.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cl-detail b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.vk-high-contrast .cl-card { border-color: var(--vk-foreground); }

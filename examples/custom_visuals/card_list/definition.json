@@ -1,0 +1,30 @@
+{
+  "name": "cardList",
+  "display_name": "Card list",
+  "description": "One card per category: a headline measure and up to three detail measures. Cards are data points: click to cross-filter, Ctrl+click for several, right-click for drillthrough.",
+  "version": "1.0.0.0",
+  "roles": [
+    {"name": "category", "display_name": "Category", "kind": "grouping", "max": 1, "description": "One card per value"},
+    {"name": "value", "display_name": "Headline", "kind": "measure", "max": 1, "description": "The large number on each card"},
+    {"name": "details", "display_name": "Details", "kind": "measure", "max": 3, "description": "Up to three smaller figures under the headline"}
+  ],
+  "format": [
+    {"name": "cards", "display_name": "Cards", "properties": [
+      {"name": "accent", "display_name": "Accent colour", "type": "color"},
+      {"name": "minWidth", "display_name": "Minimum card width", "type": "number", "default": 150, "min": 80, "max": 400},
+      {"name": "units", "display_name": "Headline units", "type": "dropdown", "default": "auto", "items": [
+        {"value": "auto", "display_name": "Auto"},
+        {"value": "none", "display_name": "None"}]}
+    ]},
+    {"name": "details", "display_name": "Details", "properties": [
+      {"name": "show", "type": "toggle", "default": true},
+      {"name": "fontSize", "display_name": "Text size", "type": "font_size", "default": 8}
+    ]},
+    {"name": "heading", "display_name": "Heading", "properties": [
+      {"name": "text", "display_name": "Text", "type": "text", "default": "", "placeholder": "Optional heading above the cards"}
+    ]}
+  ],
+  "landing": {"text": "Add a column to Category and a measure to Headline."},
+  "css_file": "style.css",
+  "js_files": ["render.js"]
+}

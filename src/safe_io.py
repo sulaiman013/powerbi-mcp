@@ -122,6 +122,12 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+def write_bytes(path: PathLike, data: bytes) -> None:
+    """Atomically write a binary file (a package, an image): the target is either the old
+    content or all of the new one, never a truncated file."""
+    _atomic_write_bytes(Path(path), bytes(data))
+
+
 def write_text(path: PathLike, text: str, fmt: Optional[TextFormat] = None) -> TextFormat:
     """Atomically write ``text``. With no ``fmt``, an existing file keeps its own format and a
     new file is written as UTF-8 without BOM with LF newlines. Returns the format used."""
