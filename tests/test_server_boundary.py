@@ -294,12 +294,28 @@ def test_boundary_structured_and_redaction():
     check("only session-scoped tools escape the read-only gate",
           set(writers) <= {"desktop_connect", "desktop_set_rls_role", "generate_measure_suite",
                            "build_js_app_measure", "cross_workspace_lineage", "tom_begin_transaction",
-                           "tom_rollback_transaction"},
+                           "tom_rollback_transaction", "build_custom_visual"},
           str(writers))
     for name in ("generate_measure_suite", "build_js_app_measure"):
         res = call_tool(ro, name, {"kind": "column_stats", "column": "Sales[Amount]", "target": "pbip", "table": "T",
                                    "prefix": "App", "js_modules": [{"name": "m", "source": "function main(app) {}"}]})
         check(f"{name} refuses its write target in lockdown", "READ-ONLY" in res.content[0].text, res.content[0].text[:90])
+
+    visual = {"name": "Probe", "roles": [{"name": "category", "kind": "grouping"}],
+              "js": "function render(ctx) { return ''; }"}
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "probe.pbiviz")
+        res = call_tool(ro, "build_custom_visual", {"definition": visual, "output_path": target})
+        check("build_custom_visual refuses to write a package in lockdown",
+              "READ-ONLY" in res.content[0].text and not os.path.exists(target)
+              and res.structuredContent.get("error") == "read_only", res.content[0].text[:120])
+        res = call_tool(ro, "build_custom_visual", {"definition": visual})
+        check("but still checks a definition when nothing is to be written",
+              res.structuredContent.get("success") is True and res.structuredContent.get("written") is False,
+              res.content[0].text[:160])
+        res = call_tool(ro, "bridge_open", {"path": target})
+        check("opening a file in Desktop is refused in lockdown",
+              res.structuredContent == {"error": "read_only_mode", "refused": True}, str(res.structuredContent))
 
 
 def test_validation_probes():
@@ -556,6 +572,37 @@ def test_identity():
     check("version is a semantic version string", server.__version__.count(".") == 2)
 
 
+def test_deneb_tool():
+    print("\n== generate_deneb_spec: nothing is dropped, and names follow the loaded model ==")
+    srv = make_server()
+    schema = next(t for t in srv._tools if t.name == "generate_deneb_spec").inputSchema
+    check("the tool's schema lists exactly the generator's arguments and nothing else",
+          sorted(schema["properties"]) == sorted(server.deneb_specs.ARGUMENTS)
+          and schema.get("additionalProperties") is False,
+          str(sorted(set(schema["properties"]) ^ set(server.deneb_specs.ARGUMENTS))))
+    fields = {"category": "SALES.Region", "value": {"measure": "_measures.revenue"}}
+    text, res = run(srv._handle_generate_deneb_spec({"kind": "bar", "fields": fields, "topN": 3}))
+    check("an option the generator does not know is an error, not silently dropped",
+          bool(res.get("error")) and "topN" in text, text[:120])
+    text, res = run(srv._handle_generate_deneb_spec({"kind": "bar", "fields": fields}))
+    check("with no project loaded the names are used as given, and a note says they were not checked",
+          res.get("error") is None and res["fields"][0] == {"column": "SALES.Region"}
+          and any("check" in n.lower() for n in res["notes"]), str(res.get("fields")))
+    srv._pbip_model_fields = lambda: {"Sales": {"Region": {"kind": "column"}},
+                                      "_Measures": {"Revenue": {"kind": "measure"}}}
+    text, res = run(srv._handle_generate_deneb_spec({"kind": "bar", "fields": fields}))
+    check("with a project loaded the names take the model's spelling (Deneb's names are case-sensitive)",
+          res.get("error") is None and res["fields"] == [{"column": "Sales.Region"}, {"measure": "_Measures.Revenue"}],
+          str(res.get("fields") or text[:200]))
+    text, res = run(srv._handle_generate_deneb_spec(
+        {"kind": "bar", "fields": {"category": "Sales.Nope", "value": {"measure": "_Measures.Revenue"}}}))
+    check("and a field that is not in the model is refused", bool(res.get("error")) and "not in the model" in text,
+          text[:160])
+    text, res = run(srv._handle_generate_deneb_spec({"kind": "bar", "fields": fields, "model_fields": {"X": ["Y"]}}))
+    check("a caller cannot substitute its own model for the loaded one",
+          res.get("error") is None and res["fields"][0] == {"column": "Sales.Region"}, text[:160])
+
+
 def test_sdk_version_guard():
     print("\n== the mcp SDK version is checked at start-up ==")
     check("the SDK line this server is written for is accepted, and so is an unreadable version",
@@ -592,7 +639,8 @@ if __name__ == "__main__":
                test_policy_sees_through_measures_and_aliases, test_locked_policy_file_refuses_queries,
                test_boundary_structured_and_redaction, test_validation_probes, test_batch_validation,
                test_lineage_scan, test_fleet_monitor_reports_unknowns, test_rls_harness_restores_role,
-               test_unused_objects_and_cache, test_transactions, test_identity, test_sdk_version_guard):
+               test_unused_objects_and_cache, test_transactions, test_identity, test_deneb_tool,
+               test_sdk_version_guard):
         fn()
     print()
     if _failures:

@@ -42,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("powerbi-mcp")
 
-__version__ = "3.8.1"
+__version__ = "3.9.0"
 
 # The mcp SDK line this server is written for. 2.0 replaced the low-level Server's handler
 # decorators and renamed every model field, so it needs a port, not a version bump.
@@ -154,6 +154,9 @@ import pbix_tools
 import publish_stage
 import report_spec
 import report_audit
+import custom_visual
+import deneb_specs
+import pbir_packages
 import html_measures
 import js_app_measure
 import model_embed
@@ -247,8 +250,9 @@ class PowerBIMCPServer:
         # therefore gated by default instead of depending on someone remembering to list it.
         session_only = {"desktop_connect", "desktop_set_rls_role", "tom_begin_transaction",
                         "tom_rollback_transaction"}
-        # These three stay available in lockdown and refuse only their own write option.
-        session_only |= {"generate_measure_suite", "build_js_app_measure", "cross_workspace_lineage"}
+        # These stay available in lockdown and refuse only their own write option.
+        session_only |= {"generate_measure_suite", "build_js_app_measure", "cross_workspace_lineage",
+                         "build_custom_visual"}
         self._write_tools |= {n for n, a in self._tool_annotations.items()
                               if not a.readOnlyHint and n not in session_only}
         # generate_measure_suite is generation-only by default; its write targets
@@ -450,6 +454,10 @@ class PowerBIMCPServer:
             "pbip_embed_data": lambda a: self._handle_pbip_embed_data(a),
             "audit_report_design": lambda a: self._handle_audit_report_design(a),
             "pbip_undo": lambda a: self._handle_pbip_undo(a),
+            "bridge_open": lambda a: self._handle_bridge_open(a),
+            "build_custom_visual": lambda a: self._handle_build_custom_visual(a),
+            "inspect_custom_visual": lambda a: self._handle_inspect_custom_visual(a),
+            "generate_deneb_spec": lambda a: self._handle_generate_deneb_spec(a),
         }
 
     def _build_tool_annotations(self):
@@ -581,6 +589,10 @@ class PowerBIMCPServer:
             "pbip_embed_data": local_destructive,  # rewrites partition sources (dry_run by default)
             "audit_report_design": local_read,  # reads report files only
             "pbip_undo": local_destructive,  # restores files changed by the last rename or repair
+            "bridge_open": ann(False, destructive=False, idempotent=True, open_world=False),  # starts Power BI Desktop; changes no file
+            "build_custom_visual": ann(False, destructive=False, idempotent=True, open_world=False),  # writes a .pbiviz when output_path is given; refused in the handler when read-only
+            "inspect_custom_visual": local_read,  # reads a package
+            "generate_deneb_spec": ann(True, open_world=False),  # generates a Vega-Lite spec; writes nothing
         }
 
     def _setup_handlers(self):
@@ -1769,11 +1781,14 @@ class PowerBIMCPServer:
                 ),
                 Tool(
                     name="bridge_screenshot",
-                    description="Capture PNG screenshots of report pages from the RUNNING Power BI Desktop via the Desktop Bridge - the agent can literally see the rendered report. Pass a page id or display name, or 'all' for every page. Images are saved to output_dir and the file paths returned. The heart of the edit-and-verify loop: author with pbir_*/pbip_* tools, bridge_reload, then screenshot to verify.",
+                    description="Capture PNG screenshots of report pages from the RUNNING Power BI Desktop via the Desktop Bridge - the agent can literally see the rendered report. Pass a page id or display name, or 'all' for every page. With 'visual' (a visual's name on that page) or 'region' ({x, y, width, height} in page coordinates) only that part of one page is captured, which is smaller and quicker to read; this needs a Desktop build whose bridge has report.snapshot.capture/v2. Images are saved to output_dir and the file paths returned. The heart of the edit-and-verify loop: author with pbir_*/pbip_* tools, bridge_reload, then screenshot to verify.",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "page": {"type": "string", "description": "Page id, page display name, or 'all' (default 'all')"},
+                            "visual": {"type": "string", "description": "Capture only this visual (its name, as in the report spec or its folder under the page); needs 'page'"},
+                            "region": {"type": "object", "description": "Capture only this rectangle of the page: {x, y, width, height} in page coordinates; needs 'page'"},
+                            "margin": {"type": "number", "default": 8, "description": "Space kept around 'visual', in page units"},
                             "pid": {"type": "integer", "description": "Desktop process id; optional when exactly one instance is running"},
                             "scale": {"type": "number", "description": "Scale factor 1.0-3.0 (default 1.0)"},
                             "output_dir": {"type": "string", "description": "Folder to save PNGs (default: a 'bridge-screenshots' folder in the temp dir)"}
@@ -2047,18 +2062,30 @@ class PowerBIMCPServer:
                     description=(
                         "Report as code: build or update the loaded PBIP report from ONE declarative JSON spec "
                         "(theme, pages, visuals, text, shapes, images, navigation buttons, slicers with sync, "
-                        "HTML Content and Deneb visuals, private custom visuals, hidden pop-ups with open/close "
-                        "bookmarks, and elements shared across pages). Idempotent: every page and element has a "
-                        "stable name, so re-applying updates in place and an unchanged spec rewrites nothing. "
-                        "All-or-nothing: the whole spec is validated (names, layout, navigation targets, and "
-                        "every field against the model) before any file is written. Pages and visuals the spec "
-                        "did not create are never touched. Use dry_run=true first to see the plan. "
-                        "Spec keys: theme, custom_visuals, page_defaults, pages[{name, display_name, width, "
-                        "height, background, elements[], popups[]}], shared[{name, pages, elements[], popups[]}], "
-                        "bookmarks[], page_order, active_page. Element: {name, type, x, y, width, height, ...} "
-                        "with type textbox | shape | image | button | slicer | html | deneb | visual | group; a "
-                        "visual takes visual_type and fields {role: 'Table.Field'}; a button takes text and "
-                        "action {type: page | bookmark | back | url | clear_slicers, target}. Fields are "
+                        "HTML Content and Deneb visuals, custom visuals from a .pbiviz or built from a "
+                        "definition, hidden pop-ups with open/close bookmarks, and elements shared across "
+                        "pages), including Power BI's native report features: filters on the report, a page or "
+                        "a visual (in / not_in, comparisons, between, blank, top N, relative date; hidden, "
+                        "locked, single-select), drillthrough pages with a back button and drillthrough "
+                        "buttons, report-page tooltips, visual interactions (filter / highlight / none), the "
+                        "phone layout, and bookmark groups. Idempotent: every page, element, bookmark and "
+                        "filter has a stable name, so re-applying updates in place and an unchanged spec "
+                        "rewrites nothing. All-or-nothing: the whole spec is validated (names, layout, "
+                        "navigation targets, every field and every filter value against the model) before any "
+                        "file is written. Pages and visuals the spec did not create are never touched, and "
+                        "filters, interactions or drillthrough fields added in Power BI Desktop to a file the "
+                        "spec writes are kept. Use dry_run=true first to see the plan. "
+                        "Spec keys: theme, custom_visuals[{pbiviz | definition | appsource, alias}], "
+                        "page_defaults, filters[], pages[{name, display_name, width, height, background, "
+                        "filters[], interactions[{from, to, type}], drillthrough{fields, back_button}, tooltip, "
+                        "elements[], popups[]}], shared[{name, pages, elements[], popups[]}], bookmarks[], "
+                        "bookmark_groups[], page_order, active_page. Element: {name, type, x, y, width, height, "
+                        "mobile{x, y, width, height}, ...} with type textbox | shape | image | button | slicer | "
+                        "html | deneb | visual | group; a visual takes visual_type (or custom: an alias), "
+                        "fields {role: 'Table.Field'}, filters[] and tooltip_page; a button takes text and "
+                        "action {type: page | bookmark | back | url | clear_slicers | drillthrough, target}; "
+                        "html takes measure and edition (regular | secure). Filter: {field, in | not_in | op + "
+                        "value | between | blank | top{n, by} | relative_date{last, unit}}. Fields are "
                         "'Table.Field' or {measure: 'Table.Name'} / {column: 'Table.Name'}. Full format and an "
                         "example: docs/REPORT_SPEC.md."),
                     inputSchema={
@@ -2067,8 +2094,8 @@ class PowerBIMCPServer:
                             "spec": {"type": "object", "description": "The report spec (see docs/REPORT_SPEC.md)"},
                             "spec_path": {"type": "string", "description": "Alternative: path to a JSON file holding the spec"},
                             "dry_run": {"type": "boolean", "default": False, "description": "Validate and return the files that would be written or removed, without touching disk"},
-                            "prune": {"type": "boolean", "default": False, "description": "Also remove pages, elements and bookmarks that an earlier apply created and this spec no longer contains (never anything else)"},
-                            "adopt": {"type": "boolean", "default": False, "description": "Take over existing pages or elements that already use a name from the spec instead of refusing"},
+                            "prune": {"type": "boolean", "default": False, "description": "Also remove pages, elements and bookmarks that an earlier apply created and this spec no longer contains (never anything else). Filters, interactions and phone positions the spec no longer declares are removed without it"},
+                            "adopt": {"type": "boolean", "default": False, "description": "Take over existing pages, elements, bookmarks, filters or bookmark groups that already use a name from the spec instead of refusing"},
                             "backup": {"type": "boolean", "default": True, "description": "Back up the project before writing"},
                             "skip_field_validation": {"type": "boolean", "default": False, "description": "Do not check field references against the model"}
                         },
@@ -2250,11 +2277,26 @@ class PowerBIMCPServer:
                         "without changing it. Structure: unparseable JSON, byte order marks, folder and name "
                         "mismatches, pages.json consistency, custom visuals used but not registered, visuals "
                         "outside the page, misplaced properties, mixed schema versions, fields missing from the "
-                        "model. Design: overlapping data visuals, crowded pages, missing alt text and titles, "
-                        "tiny elements, inconsistent page sizes, hidden pages nothing navigates to, the same "
-                        "field sliced on several pages without a sync group, buttons and bookmarks pointing at "
-                        "missing targets, hard-coded colours that bypass the theme. Governance notes: private "
-                        "(uncertified) custom visuals and script-capable HTML visuals a tenant admin may block."),
+                        "model (in visuals and in report and page filters), paths too long for Windows (Desktop "
+                        "refuses such a report), visual interactions that name a missing visual, duplicate "
+                        "filter names, phone-layout positions outside the phone canvas, bookmark groups listing "
+                        "a bookmark twice. Design: overlapping data visuals, crowded pages, missing alt text and "
+                        "titles, tiny elements, inconsistent page sizes, hidden pages nothing navigates to, the "
+                        "same field sliced on several pages without a sync group, buttons and bookmarks "
+                        "pointing at missing targets, hard-coded colours; drillthrough pages with no field, no "
+                        "Back button, no visual that can reach them, or used as the landing page; tooltip pages "
+                        "that are visible, oversized or unused, and tooltips pointing at a missing or "
+                        "non-tooltip page; slicers switched off for their whole page; phone layouts that leave "
+                        "data visuals out. Governance notes: which visuals are certified (Deneb and HTML Content "
+                        "Secure are; private .pbiviz visuals and HTML Content Regular, the only edition that "
+                        "runs scripts, are not), and hidden filters that restrict what readers see. "
+                        "Interactivity: for each private custom visual, what its package declares and what its "
+                        "script calls (cross-filter on click, cross-highlight, context menu and drillthrough, "
+                        "tooltips, privileges), with a warning where a visual that cannot select shares a page "
+                        "with other data visuals; for Deneb and HTML Content, the interactivity settings stored "
+                        "in each visual. The summary also returns drillthrough_pages, tooltip_pages, filters, "
+                        "visual_interactions, mobile_layout, bookmark_groups, custom_visual_capabilities, "
+                        "store_visual_interactivity, certification and path_lengths."),
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -2281,6 +2323,144 @@ class PowerBIMCPServer:
                         "type": "object",
                         "properties": {},
                         "required": []
+                    }
+                ),
+                Tool(
+                    name="bridge_open",
+                    description=(
+                        "Open a .pbip or .pbix in Power BI Desktop and wait until its Desktop Bridge reports the "
+                        "file as open, so bridge_reload, bridge_screenshot and desktop_connect can be used right "
+                        "after. Before starting Desktop it checks every path of the project against the Windows "
+                        "limit (a file path of 260 characters or more makes Desktop stop with a dialog the bridge "
+                        "cannot see) and refuses with the offending paths. A file that is already open is not "
+                        "opened twice. minimized=true starts the window minimized without taking the focus. "
+                        "Returns the process id, the report pages and the Analysis Services port."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "A .pbip or .pbix file, or a folder holding exactly one .pbip"},
+                            "timeout_seconds": {"type": "number", "default": 120, "description": "How long to wait for the bridge (10 to 600)"},
+                            "minimized": {"type": "boolean", "default": False, "description": "Start the Desktop window minimized, without taking the keyboard focus"}
+                        },
+                        "required": ["path"]
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "opened": {"type": "boolean"},
+                            "already_open": {"type": "boolean"},
+                            "pid": {"type": ["integer", "null"]},
+                            "file": {"type": ["string", "null"]},
+                            "pages": {"type": "array"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="build_custom_visual",
+                    description=(
+                        "Build a real Power BI custom visual (.pbiviz) from a compact definition: data roles, a "
+                        "format pane, CSS and a JavaScript render function. No pbiviz toolchain is needed: the "
+                        "server packages the visual with its own runtime. The built visual behaves like a native "
+                        "one: clicking a data point selects it and cross-filters the page (Ctrl adds), other "
+                        "visuals cross-highlight it, right-click opens the Power BI context menu (drill through, "
+                        "drill, include / exclude, copy), hover shows Power BI tooltips including report-page "
+                        "tooltips, and it has a format pane, keyboard support, theme colours and a landing page. "
+                        "The render code marks a data point with data-row=\"<row index>\" and the runtime does "
+                        "the rest; a 'JavaScript app in a measure' (function main(app)) can be built unchanged. "
+                        "The guid is derived from the name, so a rebuild keeps reports working, and the same "
+                        "definition gives the same bytes. Author code is checked (no network access, no eval) and "
+                        "syntax-checked with Node when installed; it is never run. Leave out output_path to "
+                        "check and report without writing. Place the result with pbir_apply_spec "
+                        "(custom_visuals + a visual element). The package is not certified."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "definition": {"type": "object", "description": "The visual: name, roles [{name, kind: grouping | measure, display_name?, max?}], js | js_files | js_folder, css | css_file, features {selection, highlight, context_menu, tooltips, drilldown, keyboard, landing_page, ...}, format [{name, display_name?, properties: [{name, type: toggle | color | number | font_size | text | dropdown, default?}]}], display_name, description, version"},
+                            "definition_path": {"type": "string", "description": "A definition JSON file; file names inside it are read relative to its folder. Use this or 'definition'"},
+                            "base_dir": {"type": "string", "description": "Folder the file names of an inline definition are relative to"},
+                            "output_path": {"type": "string", "description": "Where to write the .pbiviz. Leave out to check and report without writing"},
+                            "minify": {"type": "boolean", "default": True},
+                            "validate_only": {"type": "boolean", "default": False, "description": "Only validate the definition and its sources"}
+                        },
+                        "required": []
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "success": {"type": "boolean"},
+                            "errors": {"type": "array"},
+                            "warnings": {"type": "array"},
+                            "path": {"type": ["string", "null"]},
+                            "written": {"type": "boolean"}
+                        }
+                    }
+                ),
+                Tool(
+                    name="inspect_custom_visual",
+                    description=(
+                        "Describe a custom visual from its .pbiviz file or from the folder a report keeps it "
+                        "unpacked in (<Report>/CustomVisuals/<guid>): name, guid, API version, data roles, "
+                        "format pane, the privileges it asks for, and which native behaviours it supports as far "
+                        "as its capabilities and script show (cross-filter on click, cross-highlight, context "
+                        "menu and drillthrough, tooltips, drill-down, keyboard focus, landing page). Reads only."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "A .pbiviz file or an unpacked visual folder"}
+                        },
+                        "required": ["path"]
+                    },
+                    outputSchema={"type": "object", "properties": {"error": {"type": ["string", "null"]}}}
+                ),
+                Tool(
+                    name="generate_deneb_spec",
+                    description=(
+                        "Generate a Deneb (Vega-Lite) spec for a bar, column, stacked bar or column, line, area, "
+                        "scatter, heatmap, lollipop or bullet chart, or small multiples of one, with Power BI "
+                        "interactivity wired in: cross-filter on click (unselected marks dim), cross-highlight "
+                        "from other visuals, Power BI tooltips including report-page tooltips, and the "
+                        "right-click menu that leads to drillthrough. Uses the report theme's colours and the "
+                        "model's own format strings on axes, labels and tooltips. With a PBIP project loaded, "
+                        "field names are checked against its model and given the model's spelling (Deneb's "
+                        "names are case-sensitive). Returns the spec, the config, the fields to bind, the Deneb "
+                        "settings the spec relies on, and a ready 'deneb' element for pbir_apply_spec. "
+                        "Generates only; writes nothing."),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["bar", "column", "stacked_bar", "stacked_column", "line", "area", "scatter", "heatmap", "lollipop", "bullet"]},
+                            "fields": {"type": "object", "description": "{role: field}. A field is 'Table.Field' or {\"column\" | \"measure\": \"Table.Name\"}. bar / column / lollipop: category, value, facet?; stacked_bar / stacked_column: category, series, value, facet?; line / area: category, value, series?, facet?; bullet: category, value, target; scatter: x, y (say column or measure), category?, series?, size?, facet?; heatmap: x, y, value. A facet column makes small multiples"},
+                            "title": {"type": "string", "description": "The visual's title (set on the element, drawn by Power BI)"},
+                            "sort": {"type": "string", "enum": ["value_desc", "value_asc", "category_asc", "category_desc", "none"]},
+                            "color": {"description": "Theme colour for single-colour marks: a zero-based index, a name (min, middle, max, negative, neutral, positive, bad, good) or {theme, shade -1..1}. Heatmap: 'linear' or 'divergent'"},
+                            "value_format": {"description": "A Power BI format string, or {role: format}"},
+                            "top_n": {"type": "integer", "minimum": 1},
+                            "labels": {"type": "boolean", "description": "Data labels, in the model's full format"},
+                            "label_units": {"type": "boolean", "default": False, "description": "Shorten data labels to one unit for the whole series (K, M, bn)"},
+                            "category_type": {"type": "string", "enum": ["ordinal", "temporal", "quantitative"]},
+                            "facet_columns": {"type": "integer", "minimum": 1},
+                            "panel_width": {"type": "integer", "minimum": 1},
+                            "panel_height": {"type": "integer", "minimum": 1},
+                            "width": {"type": "integer", "minimum": 1, "description": "Small multiples: the visual's width, so the panels are sized to fit it"},
+                            "cross_filter": {"type": "boolean", "default": True},
+                            "cross_highlight": {"type": "boolean", "default": True},
+                            "tooltips": {"type": "boolean", "default": True},
+                            "context_menu": {"type": "boolean", "default": True},
+                            "max_selected": {"type": "integer", "minimum": 1, "maximum": 250, "default": 50},
+                            "config": {"type": "object", "description": "Vega-Lite config merged over the standard one"}
+                        },
+                        "required": ["kind", "fields"],
+                        "additionalProperties": False
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "spec": {"type": "object"},
+                            "config": {"type": "object"},
+                            "fields": {"type": "array"},
+                            "element": {"type": "object"},
+                            "error": {"type": ["string", "null"]}
+                        }
                     }
                 )
             ]
@@ -2559,19 +2739,22 @@ class PowerBIMCPServer:
             self.desktop_connector = PowerBIDesktopConnector()
         return self.desktop_connector
 
+    def _desktop_unavailable(self, connector) -> str:
+        """Why no Desktop tool can work on this machine, with what the library loader found."""
+        return ("Error: Desktop connectivity unavailable. Ensure 'psutil' is installed and "
+                "the ADOMD.NET client library can be found. Newer Power BI Desktop builds no "
+                "longer ship it, so install SSMS or the Microsoft.AnalysisServices.AdomdClient "
+                "NuGet package, or set ADOMD_DLL_PATH to the folder containing "
+                "Microsoft.AnalysisServices.AdomdClient.dll.\n\n"
+                + self._redact(connector.availability_details()))
+
     async def _handle_desktop_discover(self) -> str:
         """Discover running Power BI Desktop instances"""
         try:
             connector = self._get_desktop_connector()
 
             if not connector.is_available():
-                return (
-                    "Error: Desktop connectivity unavailable. Ensure 'psutil' is installed and "
-                    "the ADOMD.NET client library can be found. Newer Power BI Desktop builds no "
-                    "longer ship it, so install SSMS or the Microsoft.AnalysisServices.AdomdClient "
-                    "NuGet package, or set ADOMD_DLL_PATH to the folder containing "
-                    "Microsoft.AnalysisServices.AdomdClient.dll."
-                )
+                return self._desktop_unavailable(connector)
 
             instances = await asyncio.get_event_loop().run_in_executor(
                 None, connector.discover_instances
@@ -2597,6 +2780,8 @@ class PowerBIMCPServer:
         """Connect to a Power BI Desktop instance"""
         try:
             connector = self._get_desktop_connector()
+            if not connector.is_available():
+                return self._desktop_unavailable(connector)   # not "is Desktop running?": it may well be
             port = args.get("port")
             rls_role = args.get("rls_role")
 
@@ -3784,6 +3969,15 @@ class PowerBIMCPServer:
             "are held until tom_commit_transaction, or discarded by tom_rollback_transaction."
         )
 
+    @staticmethod
+    def _with_lead(lead: str, message: str) -> str:
+        """``lead`` followed by the connector's message, unless that message opens with the same
+        words already (the live connector's does: "Transaction rolled back. Local edits ...")."""
+        message = (message or "").strip()
+        if message.lower().startswith(lead.lower().rstrip(".")):
+            return message
+        return f"{lead} {message}".strip()
+
     async def _handle_tom_commit_transaction(self) -> str:
         """Commit pending TOM edits. A failed commit leaves the transaction open."""
         if not self._tom_transaction_active:
@@ -3793,7 +3987,7 @@ class PowerBIMCPServer:
         message = self._redact(getattr(result, "message", "") or "")
         if getattr(result, "success", False):
             self._tom_pending_measures.clear()
-            return f"Transaction committed. {message}".strip()
+            return self._with_lead("Transaction committed.", message)
         return (f"Commit failed: {message or 'unknown error'}\n\n"
                 "Nothing was saved and the transaction is still open. Fix the problem and run "
                 "tom_commit_transaction again, or run tom_rollback_transaction to discard the pending edits.")
@@ -3807,7 +4001,7 @@ class PowerBIMCPServer:
         message = self._redact(getattr(result, "message", "") or "")
         if getattr(result, "success", False):
             self._tom_pending_measures.clear()
-            return f"Transaction rolled back. {message}".strip()
+            return self._with_lead("Transaction rolled back.", message)
         return f"Rollback failed: {message or 'unknown error'}. The transaction is still open."
 
     # ==================== MODEL ANALYSIS (Bundle B) ====================
@@ -4606,7 +4800,7 @@ class PowerBIMCPServer:
                         "secure local APIs'.\n")
                 return (out, {"instances": []})
             for b in bridges:
-                client = desktop_bridge.DesktopBridgeClient(b["pipe"])
+                client = desktop_bridge.DesktopBridgeClient(b["pipe"], ready_wait=4.0)
                 inst: Dict[str, Any] = {"pid": b["pid"]}
                 try:
                     state = await loop.run_in_executor(None, client.get_state)
@@ -4676,21 +4870,57 @@ class PowerBIMCPServer:
             else:
                 page_id = desktop_bridge.resolve_page_id(pages, ref) or ref  # allow raw ids for .pbix
                 targets = [page_id]
+            # One visual, or one rectangle of the page, instead of the whole page.
+            region = args.get("region")
+            visual = str(args.get("visual") or "").strip()
+            part = ""
+            if region is not None or visual:
+                if len(targets) != 1:
+                    msg = "A 'visual' or a 'region' needs one page; pass 'page'."
+                    return (f"Error: {msg}", {"error": msg, "screenshots": []})
+                def number(value: Any) -> bool:
+                    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                            and value == value and abs(value) != float("inf"))
+
+                if visual:
+                    margin = args.get("margin", 8)
+                    if not number(margin):
+                        msg = "'margin' must be a number (page units)."
+                        return (f"Error: {msg}", {"error": msg, "screenshots": []})
+                    region = desktop_bridge.visual_region(state.get("currentFilePath") or "", targets[0], visual,
+                                                          margin=margin)
+                    if region is None:
+                        msg = (f"No visual named '{visual}' with a position inside page '{targets[0]}' of the "
+                               "open report.")
+                        return (f"Error: {msg}", {"error": msg, "screenshots": []})
+                    part = " " + re.sub(r"[^A-Za-z0-9_-]", "_", visual)[:40]
+                else:
+                    ok = (isinstance(region, dict) and all(number(region.get(k)) for k in ("x", "y", "width", "height"))
+                          and region["width"] > 0 and region["height"] > 0)
+                    if not ok:
+                        msg = "'region' needs numeric x, y, width and height (page coordinates), width and height above 0."
+                        return (f"Error: {msg}", {"error": msg, "screenshots": []})
+                    # The rectangle is part of the name: two regions of one page are two files.
+                    part = " region " + "_".join(f"{region[k]:g}" for k in ("x", "y", "width", "height"))
             out_dir = Path(args.get("output_dir") or (Path(tempfile.gettempdir()) / "bridge-screenshots"))
             out_dir.mkdir(parents=True, exist_ok=True)
             scale = args.get("scale")
             by_id = {p["id"]: p["display_name"] for p in pages}
             shots = []
             for page_id in targets:
-                snap = await loop.run_in_executor(None, client.capture_snapshot, page_id, scale)
+                snap = await loop.run_in_executor(None, client.capture_snapshot, page_id, scale, region)
                 data = base64.b64decode(snap.get("payload") or "")
                 display = snap.get("pageDisplayName") or by_id.get(page_id, page_id)
                 safe = re.sub(r'[<>:"/\\|?*]', "_", display)
                 safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(page_id))[:24]
-                path = out_dir / f"{safe} [{safe_id}].png"
+                path = out_dir / f"{safe} [{safe_id}]{part}.png"
                 path.write_bytes(data)
-                shots.append({"page_id": page_id, "page": display, "path": str(path), "bytes": len(data)})
-            out = f"=== Captured {len(shots)} page screenshot(s) from Desktop (pid {pid}) ===\n\n"
+                shot = {"page_id": page_id, "page": display, "path": str(path), "bytes": len(data)}
+                if region is not None:
+                    shot["region"] = region
+                shots.append(shot)
+            what = f"'{visual}'" if visual else ("region" if region is not None else "page")
+            out = f"=== Captured {len(shots)} {what} screenshot(s) from Desktop (pid {pid}) ===\n\n"
             for s in shots:
                 out += f"  {s['page']}: {s['path']} ({s['bytes']:,} bytes)\n"
             out += "\nRead the PNG file(s) to visually verify the report."
@@ -4720,7 +4950,9 @@ class PowerBIMCPServer:
             if state.get("hasUnsavedChanges") and not args.get("force"):
                 return ("Refused: Power BI Desktop has UNSAVED changes for "
                         f"'{state.get('currentFilePath')}'. Reloading would discard them. "
-                        "Save in Desktop first, or pass force=true to discard.")
+                        "Save in Desktop first, or pass force=true to discard. (Desktop also sets this flag "
+                        "by itself a few seconds after it opens or reloads a project; if nobody edited the "
+                        "report in Desktop, force=true loses nothing.)")
             reload_model = args.get("reload_model_definition", True)
             result = await loop.run_in_executor(None, client.reload_file, bool(reload_model))
             scope = "report + model definition" if reload_model else "report only"
@@ -4732,6 +4964,148 @@ class PowerBIMCPServer:
             return f"Bridge refused the reload: {e}"
         except Exception as e:
             return f"Error reloading: {redact_secrets(str(e), [self.client_secret])}"
+
+    async def _handle_bridge_open(self, args: Dict[str, Any]):
+        """Open a .pbip or .pbix in Power BI Desktop and wait for its bridge. Returns (text, result)."""
+        empty = {"opened": False, "already_open": False, "pid": None, "file": None, "pages": []}
+        try:
+            raw = str(args.get("path") or "").strip()
+            if not raw:
+                msg = "Provide 'path': a .pbip or .pbix file (or a folder holding exactly one .pbip)."
+                return (f"Error: {msg}", dict(empty, error=msg))
+            path = Path(raw)
+            project = None
+            if path.is_dir() or path.suffix.lower() == ".pbip":
+                project = PowerBIPBIPConnector.find_pbip_from_path(str(path))
+                if project is None:
+                    msg = f"'{raw}' is not a .pbip file, or its folder does not hold exactly one."
+                    return (f"Error: {msg}", dict(empty, error=msg))
+                path = Path(project.pbip_file)
+            elif path.suffix.lower() != ".pbix" or not path.is_file():
+                msg = f"'{raw}' is not an existing .pbip or .pbix file."
+                return (f"Error: {msg}", dict(empty, error=msg))
+
+            # Desktop stops at the first over-long path with a dialog the bridge cannot see.
+            roots: List[Any] = [path]
+            if project is not None:
+                roots += [project.report_folder, project.semantic_model_folder]
+            too_long = desktop_bridge.long_paths(roots)
+            if too_long:
+                msg = (f"{len(too_long)} path(s) in this project are too long for Power BI Desktop "
+                       f"(files must be under {desktop_bridge.MAX_FILE_PATH} characters, folders under "
+                       f"{desktop_bridge.MAX_DIR_PATH}). Move the project to a shorter folder.")
+                out = f"Not opened: {msg}\n"
+                for p in too_long[:5]:
+                    out += f"  {p['length']} chars: {p['path']}\n"
+                return (out, dict(empty, file=str(path), error=msg, long_paths=too_long[:20]))
+
+            try:
+                timeout = float(args.get("timeout_seconds") or 120)
+            except (TypeError, ValueError):
+                timeout = 120.0
+            timeout = max(10.0, min(timeout, 600.0))
+            loop = asyncio.get_event_loop()
+            minimized = args.get("minimized") is True or str(args.get("minimized")).strip().lower() in (
+                "1", "true", "yes", "on")
+            result = await loop.run_in_executor(
+                None, lambda: desktop_bridge.open_file(str(path), timeout=timeout, minimized=minimized))
+            result = dict(empty, **result)
+            if not result.get("opened"):
+                return (f"Not opened: {result.get('error')}", result)
+
+            result["pages"] = desktop_bridge.pages_for_file(str(path))
+            if result.get("pid"):
+                result["msmdsrv_port"] = await loop.run_in_executor(
+                    None, desktop_bridge.msmdsrv_port_for_desktop_pid, result["pid"])
+            how = "is already open" if result.get("already_open") else f"opened in {result.get('waited_seconds')} s"
+            out = f"'{path}' {how} in Power BI Desktop (pid {result['pid']}).\n"
+            if result.get("msmdsrv_port"):
+                out += f"  analysis services port: {result['msmdsrv_port']} (use with desktop_connect)\n"
+            if result["pages"]:
+                out += "  pages: " + ", ".join(f"{p['display_name']} [{p['id']}]" for p in result["pages"]) + "\n"
+            out += ("Edit the project on disk, then bridge_reload and bridge_screenshot to see the result. "
+                    "Desktop tends to report unsaved changes a few seconds after it opens a project although "
+                    "nothing was edited; bridge_reload then needs force=true.")
+            return (out, result)
+        except Exception as e:
+            msg = redact_secrets(str(e), [self.client_secret])
+            return (f"Error opening the file in Desktop: {msg}", dict(empty, error=msg))
+
+    # ==================== Custom visuals and Deneb specs ====================
+
+    async def _handle_build_custom_visual(self, args: Dict[str, Any]):
+        """Package a real .pbiviz custom visual from a compact definition. Returns (text, result)."""
+        empty = {"success": False, "errors": [], "warnings": [], "path": None, "written": False}
+        try:
+            output_path = args.get("output_path")
+            validate_only = bool(args.get("validate_only", False))
+            if output_path and not validate_only and self._read_only:
+                msg = ("Refused: writing a .pbiviz is a write operation and the server is in READ-ONLY mode. "
+                       "Leave out output_path to check the definition without writing.")
+                return (msg, dict(empty, errors=[msg], error="read_only"))
+            try:
+                if args.get("definition_path"):
+                    definition, base = custom_visual.load_definition(args["definition_path"])
+                else:
+                    definition, base = args.get("definition"), args.get("base_dir")
+                    if isinstance(definition, str):
+                        definition = json.loads(definition)
+            except custom_visual.DefinitionError as e:
+                return ("Not built:\n" + "\n".join(f"  - {x}" for x in e.errors), dict(empty, errors=list(e.errors)))
+            except ValueError as e:
+                msg = f"'definition' is not valid JSON: {e}"
+                return (f"Error: {msg}", dict(empty, errors=[msg]))
+            if not isinstance(definition, dict):
+                msg = "Provide 'definition' (an object) or 'definition_path' (a JSON file)."
+                return (f"Error: {msg}", dict(empty, errors=[msg]))
+
+            loop = asyncio.get_event_loop()
+            if validate_only:
+                checked = await loop.run_in_executor(None, custom_visual.validate_definition, definition, base)
+                text = "Valid." if checked["valid"] else "Not valid:\n" + "\n".join(f"  - {x}" for x in checked["errors"])
+                text += "".join(f"\nWarning: {w}" for w in checked["warnings"])
+                return (text, dict(empty, success=bool(checked["valid"]), errors=list(checked["errors"]),
+                                   warnings=list(checked["warnings"])))
+            minify = bool(args.get("minify", True))
+            result = await loop.run_in_executor(
+                None, lambda: custom_visual.build_custom_visual(definition, output_path, base_dir=base, minify=minify))
+            return (custom_visual.describe_build(result), dict(empty, **result))
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error building the custom visual: {msg}", dict(empty, errors=[msg]))
+
+    async def _handle_inspect_custom_visual(self, args: Dict[str, Any]):
+        """Describe a .pbiviz or an unpacked custom visual folder. Returns (text, result)."""
+        try:
+            path = str(args.get("path") or "").strip()
+            if not path:
+                msg = "Provide 'path': a .pbiviz file or a report's CustomVisuals/<guid> folder."
+                return (f"Error: {msg}", {"error": msg})
+            info = await asyncio.get_event_loop().run_in_executor(None, custom_visual.inspect_custom_visual, path)
+            return (custom_visual.describe_inspection(info), info)
+        except pbir_packages.PbivizError as e:
+            msg = self._redact(str(e))
+            return (f"Error: {msg}", {"error": msg})
+        except Exception as e:
+            msg = self._redact(str(e))
+            return (f"Error inspecting the custom visual: {msg}", {"error": msg})
+
+    async def _handle_generate_deneb_spec(self, args: Dict[str, Any]):
+        """A Deneb (Vega-Lite) spec with Power BI interactivity wired in. Returns (text, result)."""
+        try:
+            # Every argument is passed on: an option the generator does not know is its error to
+            # report, not something to drop without a word.
+            options = {k: v for k, v in args.items() if k not in ("kind", "fields", "model_fields") and v is not None}
+            # Deneb's dataset names are case-sensitive while the report spec binds the model's own
+            # spelling, so with a project loaded the names are checked and corrected against it.
+            model_fields = self._pbip_model_fields()
+            if model_fields:
+                options["model_fields"] = model_fields
+            result = deneb_specs.generate_deneb_spec(args.get("kind"), args.get("fields"), **options)
+            return (deneb_specs.to_text(result), dict(result, error=None))
+        except (ValueError, TypeError) as e:
+            msg = self._redact(str(e))
+            return (f"Error: {msg}", {"error": msg})
 
     async def _handle_analyze_model_storage(self, args: Dict[str, Any]) -> str:
         """VertiPaq-style storage analysis: per-table row counts (reliable via DAX) plus

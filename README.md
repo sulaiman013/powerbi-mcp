@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue?style=flat-square" alt="MCP compatible"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-green?style=flat-square" alt="Python 3.10+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tools-90-purple?style=flat-square" alt="90 tools"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tools-94-purple?style=flat-square" alt="94 tools"></a>
   <a href="#"><img src="https://img.shields.io/badge/Live-Windows-lightgrey?style=flat-square" alt="Windows for live connectivity"></a>
   <a href="#"><img src="https://img.shields.io/badge/Offline-cross--platform-success?style=flat-square" alt="Offline cross-platform"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT license"></a>
@@ -32,8 +32,8 @@ on disk, and the running Power BI Desktop app itself (through Microsoft's Deskto
 hot-reload and screenshots). Every tool call passes one request boundary: a read-only gate, a
 query-only guard, access policies and PII masking on query results, and secret redaction.
 
-It exposes **90 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
-50 assert-based test suites.
+It exposes **94 tools** plus MCP **resources**, **prompts**, and **completion**, and ships with
+53 assert-based test suites.
 
 | Capability | What you get |
 |------------|--------------|
@@ -43,10 +43,11 @@ It exposes **90 tools** plus MCP **resources**, **prompts**, and **completion**,
 | **Bulk DAX creation** | Measure-suite generator (time intelligence, ratios, ranks) written offline or live |
 | **Data modelling** | Date-dimension generator, calculation groups, hierarchies, offline TMDL authoring |
 | **Warehouse audit** | Star-schema classification + findings, referential-integrity orphan scan |
-| **Report as code** | Build a whole designed report from one declarative spec: theme, pages, visuals, navigation, pop-ups, synced slicers |
-| **Custom reporting techniques** | HTML and SVG measures, DAX-as-transport payload measures, a JavaScript app inside a measure, Deneb and custom visuals |
+| **Report as code** | Build a whole designed report from one declarative spec: theme, pages, visuals, navigation, pop-ups, synced slicers, plus the native features: filters, drillthrough, report-page tooltips, visual interactions, phone layout, bookmark groups |
+| **Custom reporting techniques** | HTML and SVG measures, DAX-as-transport payload measures, a JavaScript app inside a measure, Deneb specs generated with cross-filter, cross-highlight, tooltips and the context menu wired in |
+| **Custom visuals** | Build a real `.pbiviz` from a compact definition, without the pbiviz toolchain: click to cross-filter, cross-highlight, context menu and drillthrough, Power BI tooltips, a format pane |
 | **Self-contained publishing** | Embed data in the model, stage a report for an in-place publish that keeps its links |
-| **Desktop Bridge (preview)** | Hot-reload the open report and screenshot pages in the RUNNING Desktop |
+| **Desktop Bridge (preview)** | Open a report in Desktop, hot-reload it, and screenshot pages or single visuals in the RUNNING Desktop |
 | **DAX safety loop** | Validate before committing; impact analysis; atomic transactions |
 | **Model quality** | Best Practice Analyzer, AI-readiness scoring, VertiPaq-style storage analysis |
 | **Diagnostics and ops** | Refresh-failure triage, unused-object detection, RLS test matrix |
@@ -100,14 +101,29 @@ limit which rows a user can see).
   nothing; changing one element rewrites one file; anything wrong (a field that does not exist,
   a button pointing at a missing page) stops the whole apply before a single file is written.
   > "Build a three-page report from this spec, with a filters pop-up on every page."
+- **Use Power BI's own report features from the same spec.** Filters on the report, a page or
+  a visual (lists, comparisons, ranges, top N, relative dates; hidden or locked), drillthrough
+  pages with a back button, report-page tooltips, which visual filters or highlights which, the
+  phone layout, and bookmark groups. A filter or a drillthrough field someone adds in Desktop
+  later is kept when the spec is applied again.
+  > "Add a drillthrough page for city, make the slicer highlight the chart instead of filtering it, and lay the page out for phones."
 - **Go beyond native visuals.** Generate measures that return styled HTML (KPI cards, headline
   sentences with live numbers, ranked bar lists) or inline SVG, pack fact rows into a text
   measure for a JavaScript app that filters in the browser with no query per click, and assemble
   that app from CSS and JavaScript modules into measures, minified and size-checked.
   > "Pack the incidents fact at row grain and build the app measures from this folder of modules."
+- **Build visuals that behave like native ones.** A measure-driven HTML visual cannot filter the
+  page when you click it. Two routes can: a Deneb chart generated with cross-filter,
+  cross-highlight, tooltips and the right-click menu already wired in, or a real custom visual
+  (`.pbiviz`) built from a short definition and a render function, with no Microsoft toolchain
+  to install. In a built visual, clicking a row selects it and filters the page, other visuals
+  highlight it, right-click offers drill through, and hovering shows Power BI's own tooltips.
+  > "Turn this ranked list into a custom visual I can click to filter the page, and put it on the Overview page."
 - **Audit the report like a model.** Structure (broken JSON, unregistered custom visuals, visuals
   off the page), design (overlaps, crowded pages, missing alt text and titles, navigation that
-  points nowhere) and governance notes (uncertified and script-capable visuals).
+  points nowhere, drillthrough pages nothing can reach, tooltip pages nobody uses) and governance
+  notes (which visuals are certified, hidden filters). For each custom visual it reads the package
+  and says what a click in it can and cannot do.
   > "Audit the report design and list what would not survive a tenant that blocks uncertified visuals."
 - **Publish without a gateway.** Embed small static data in the model so the service can refresh
   it with no local files, and stage the report bound to the published model so importing it
@@ -301,7 +317,7 @@ docker run --rm -i -v /path/to/MyReport:/work powerbi-mcp
 
 ## Tools
 
-90 tools across the categories below. The full reference, with read / write / destructive
+94 tools across the categories below. The full reference, with read / write / destructive
 markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Category | Count | Highlights |
@@ -317,6 +333,7 @@ markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | PBIP diagnostics | 4 | fix broken visuals, fix DAX quoting, scan broken refs, validate |
 | Report authoring (PBIR, preview) | 4 | `pbir_add_page`, `pbir_add_visual`, `pbir_bind_fields`, `pbir_validate_report` |
 | Report as code | 7 | `pbir_apply_spec`, `audit_report_design`, `generate_payload_measure`, `build_js_app_measure`, `generate_html_measure`, `pbip_embed_data`, `pbip_stage_publish` |
+| Custom visuals and Deneb | 3 | `build_custom_visual` (a real `.pbiviz`, no toolchain), `inspect_custom_visual`, `generate_deneb_spec` (interactivity wired in) |
 | Model quality and performance | 4 | `run_bpa`, `audit_ai_readiness`, `analyze_model_storage`, `analyze_query_performance` |
 | DAX quality | 2 | `dax_lint` (performance anti-patterns), `dax_suggest_rewrite` |
 | Authoring helpers | 2 | `generate_svg_measure` (sparkline/bullet/progress/pill), `audit_naming` |
@@ -325,7 +342,7 @@ markers, is in **[docs/TOOLS.md](docs/TOOLS.md)**.
 | Bulk DAX creation | 3 | `generate_measure_suite`, `batch_create_measures`, `pbip_add_measures` |
 | Data modelling (offline TMDL) | 3 | `pbip_create_date_table`, `pbip_add_calculation_group`, `pbip_add_hierarchy` |
 | Warehouse audit | 2 | `audit_star_schema`, `scan_referential_integrity` |
-| Desktop Bridge (preview) | 4 | `bridge_status`, `bridge_manifest`, `bridge_reload` (hot-reload), `bridge_screenshot` |
+| Desktop Bridge (preview) | 5 | `bridge_open`, `bridge_status`, `bridge_manifest`, `bridge_reload` (hot-reload), `bridge_screenshot` (a page or one visual) |
 | Documentation, diff, CI | 5 | `export_data_dictionary`, `model_snapshot`, `model_diff`, `pre_deploy_gate`, `run_dax_tests` |
 | Diagnostics and ops | 4 | `refresh_doctor`, `find_unused_objects`, `impact_analysis`, `rls_test_harness` |
 | Governance-ops fleet (admin) | 3 | `cross_workspace_lineage`, `fleet_refresh_monitor`, `usage_and_orphan_analytics` |
@@ -376,18 +393,25 @@ With Power BI Desktop June 2026+ the agent can drive a complete authoring loop a
 RUNNING app, with the files on disk as the source of truth:
 
 ```
+bridge_open            open the project in Desktop and wait for the bridge (not needed if it is open)
+   |
 bridge_status          which file is open, unsaved-change state, pages, and the AS port
    |
 pbip_* / pbir_* tools  author offline: measures, date table, calc groups, pages, visuals
    |
 bridge_reload          hot-reload the open file from disk - no close/reopen
    |
-bridge_screenshot      PNG of each page so the agent can SEE and fix its own work
+bridge_screenshot      PNG of each page, or of one visual, so the agent can SEE and fix its own work
 ```
 
-`bridge_reload` refuses to run over unsaved Desktop changes (pass `force=true` to override),
-and `bridge_status` reports the matching Analysis Services port so the same window is one
-`desktop_connect` away from live DAX and TOM.
+`bridge_open` checks every path of the project against the Windows limit first (a file path of
+260 characters or more makes Desktop stop with a dialog nothing can see from outside), never
+opens a file twice, and can start the window minimized. `bridge_reload` refuses to run over
+unsaved Desktop changes (pass `force=true` to override; Desktop sets that flag by itself a few
+seconds after opening a project), and `bridge_status` reports the matching Analysis Services
+port so the same window is one `desktop_connect` away from live DAX and TOM. The client reads
+the bridge's own manifest, so it works with the argument shape of Desktop 2.159 and with the
+earlier preview builds.
 
 ---
 
@@ -454,7 +478,7 @@ tables:
 
 | Doc | Contents |
 |-----|----------|
-| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 90 tools, resources, prompts, env vars |
+| [docs/TOOLS.md](docs/TOOLS.md) | Complete reference of all 94 tools, resources, prompts, env vars |
 | [docs/REPORT_SPEC.md](docs/REPORT_SPEC.md) | The declarative report spec behind `pbir_apply_spec`, with an example |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, request boundary, security layer, verification methodology, file map |
 | [docs/TESTING.md](docs/TESTING.md) | How to run the suites and what each covers |
@@ -465,7 +489,7 @@ tables:
 
 ## Testing and verification
 
-The 50 suites in `tests/` are assert-based scripts that run without Power BI (pure logic is
+The 53 suites in `tests/` are assert-based scripts that run without Power BI (pure logic is
 tested directly; the server and the live connectors are driven through fakes). CI runs them on
 Windows and Linux.
 
@@ -482,13 +506,19 @@ What backs each claim:
    checked byte for byte.
 3. **Doc-verification**: API contracts (PBIR and TMDL shapes, REST/INFO surfaces, the Desktop
    Bridge protocol) checked against Microsoft Learn and real exports.
-4. **Engine and live checks (2026-07)**: generated TMDL parsed under Microsoft's
-   `TmdlSerializer`; ADOMD queries, TOM batch writes and the Desktop Bridge exercised against a
-   running Power BI Desktop. These predate the 3.8.0 rewrite and have not been repeated on it.
+4. **Engine and live checks**: generated TMDL parsed under Microsoft's `TmdlSerializer`
+   (2026-07). Against Power BI Desktop 2.159 on 2026-11-11: ADOMD queries, DAX validation, the
+   model audits, a TOM transaction with rollback, and the Desktop Bridge (open, reload, page and
+   single-visual screenshots); reports generated by `pbir_apply_spec` with every native feature;
+   generated Deneb charts; and custom visuals built by `build_custom_visual`, whose selection,
+   highlight, tooltip and context-menu calls were answered by the real host.
+5. **Independent review**: each part of 3.9.0 was reviewed by a reviewer that did not write it,
+   against Microsoft's published schemas, the visuals API typings, Deneb's source and Desktop.
 
-Not verified by execution: generated DAX and M are not evaluated by an engine in the suites,
-generated reports are not opened in Desktop by them, and the cloud paths have not been run
-against a tenant. Details in [docs/TESTING.md](docs/TESTING.md).
+Not verified by execution: mouse clicks and hovering cannot be driven through the bridge, so
+click-to-filter, drilling through, tooltip pages on hover and the phone view were not observed;
+generated DAX and M are not evaluated by an engine in the suites; and the cloud paths have not
+been run against a tenant. Details in [docs/TESTING.md](docs/TESTING.md).
 
 ---
 
@@ -497,7 +527,7 @@ against a tenant. Details in [docs/TESTING.md](docs/TESTING.md).
 ```
 powerbi-mcp/
 ├── src/
-│   ├── server.py                    # MCP server: 90 tools, request boundary, handlers
+│   ├── server.py                    # MCP server: 94 tools, request boundary, handlers
 │   ├── dax_tokens.py                # Shared DAX tokenizer + reference rewriting
 │   ├── safe_io.py                   # Faithful atomic writes + multi-file transaction
 │   ├── powerbi_*_connector.py       # Desktop (ADOMD), XMLA, REST, TOM, PBIP
@@ -516,7 +546,7 @@ powerbi-mcp/
 │   ├── refresh_diagnostics.py, governance.py
 │   └── security/                    # policies, query analysis, PII, audit, redaction
 ├── config/policies.yaml
-├── tests/                           # 50 assert-based suites
+├── tests/                           # 53 assert-based suites
 ├── docs/                            # TOOLS, REPORT_SPEC, ARCHITECTURE, TESTING
 ├── .github/workflows/tests.yml      # CI: the suites on Windows and Linux
 ├── run_tests.py
@@ -536,11 +566,12 @@ powerbi-mcp/
 |------------|-------|
 | Live connectivity is Windows only | ADOMD.NET, TOM, and the Desktop Bridge named pipe require Windows. The offline subset runs cross-platform via Docker. |
 | TOM renames break visuals | Use the PBIP tools for safe renames (they update the report layer too). |
-| `bridge_screenshot` depends on a Desktop preview fix | On some Desktop builds `report.snapshot.capture` returns an internal error for any input (a Desktop-side preview defect). Status, manifest, and hot-reload work. |
+| The Desktop Bridge is a preview and its protocol moves | Desktop 2.159 changed how every bridge method takes its arguments. The client now follows the manifest of the running build, but a later build can change it again. A screenshot of one visual needs a build with `report.snapshot.capture/v2`. The bridge cannot click or save. |
 | Cloud paths are doc-verified, not live-verified | XMLA/REST/admin tools are tested with fakes and fact-checked against Microsoft Learn; they have not yet been exercised against a production tenant. |
-| The 3.8.0 rewrite has not been re-run live | The connectors and the rename engine were rewritten and tested through fakes and on copies of real projects; the earlier live Desktop verification has not been repeated on the new code. |
-| Generated DAX, M and reports are not engine-tested | Measure generators, embedded partitions and the report spec are tested for shape and fidelity, not evaluated by Power BI in the suites. Validate with `validate_dax` and look with `bridge_screenshot`. |
-| HTML Content, Deneb and custom visuals are not certified | Reports that use them will not render in a tenant that only allows certified visuals; `audit_report_design` lists them. A script-driven visual also cannot cross-filter other visuals. |
+| Live checks cover Desktop, not the service | The live tools were run against Power BI Desktop 2.159 on 2026-11-11 (connect, DAX, validation, the model audits, a transaction with rollback, the bridge). Not every tool was exercised, and nothing was run against a tenant. |
+| Clicks were not observed | Generated reports, Deneb specs and built custom visuals were loaded and rendered in Desktop, and a built visual's selection, highlight, tooltip and context-menu calls were answered by the real host. The bridge cannot click, so cross-filtering by click, drilling through, tooltip pages on hover and the phone view should be clicked through once. Generated DAX and M are not evaluated by an engine in the suites: use `validate_dax`. |
+| Private custom visuals and HTML Content Regular are not certified | A tenant that only allows certified visuals renders Deneb and HTML Content Secure, and blocks private `.pbiviz` visuals (those built by `build_custom_visual` included) and HTML Content Regular, the only edition that runs a JavaScript app. `audit_report_design` lists what a report uses. An HTML measure cannot cross-filter other visuals; a Deneb visual or a built custom visual can. |
+| The custom visual runtime is small on purpose | One categorical data mapping (grouping and measure roles): no table or matrix mapping, no per-point conditional formatting, no localisation. Number formatting covers the common .NET format strings, not all of them. |
 | Access policies are defence in depth | They work on query text and result names. Use row-level and object-level security in the model as the boundary. |
 | Cloud enhanced refresh needs Premium | XMLA and enhanced refresh need PPU / Premium / Fabric capacity. Basic refresh and history work on Pro. |
 | Fleet governance is admin-gated | Scanner and Activity tools need Fabric admin, or a service principal allowed to use read-only admin APIs. |
@@ -576,6 +607,12 @@ powerbi-mcp/
   measures, data embedding, publish staging.
 - A rebuilt rename engine (tokenizer and parsers instead of regexes), connector-owned
   transactions, fail-closed policies, a CI pipeline.
+- Native report features in the report spec: filters, drillthrough, report-page tooltips,
+  visual interactions, phone layout, bookmark groups.
+- Custom visuals built without the toolchain, with cross-filtering, highlighting, the context
+  menu and tooltips; Deneb specs generated with the interactivity wired in.
+- Open a report in Desktop from the server, screenshots of a single visual, and a live pass of
+  the Desktop tools against Power BI Desktop 2.159.
 
 ### Planned
 
@@ -584,9 +621,12 @@ powerbi-mcp/
 - Refresh trigger/monitor/cancel (Enhanced Refresh API + Desktop TMSL).
 - PyPI packaging and tagged releases.
 - Live validation of the cloud XMLA/REST/admin paths against a production tenant, and a live
-  re-run of the Desktop paths on the rewritten connectors.
-- Evaluate generated DAX and open generated reports in Desktop as part of the test run.
-- Report spec: drillthrough, report and page filters, visual interactions, mobile layout.
+  re-run of the rename engine.
+- Evaluate generated DAX and open generated reports in Desktop as part of the test run; a way to
+  click through generated reports (the Desktop Bridge cannot click yet).
+- Report spec: data state inside bookmarks, cross-report drillthrough settings on the report.
+- Custom visuals: table and matrix data mappings, per-point conditional formatting.
+- A port to the mcp SDK 2.x.
 - Best Practice Analyzer auto-fix; field parameters, object-level security, translations.
 - Remote HTTP transport with Microsoft Entra OAuth (today, use the official remote Power BI MCP
   server for cloud auth).

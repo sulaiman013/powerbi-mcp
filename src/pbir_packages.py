@@ -63,6 +63,29 @@ def read_pbiviz(path: str) -> Dict[str, Any]:
             "files": files}
 
 
+def read_unpacked(folder: str) -> Dict[str, Any]:
+    """Read a visual a report keeps unpacked (<Report>/CustomVisuals/<guid>/). Returns what
+    read_pbiviz returns for the archive those files came from."""
+    manifest = os.path.join(folder, "package.json")
+    if not os.path.isfile(manifest):
+        raise PbivizError(f"{folder} has no package.json, so it is not an unpacked custom visual")
+    with open(manifest, "rb") as f:
+        files: Dict[str, bytes] = {"package.json": f.read()}
+    try:
+        visual = json.loads(files["package.json"].decode("utf-8-sig"))["visual"]
+        guid = str(visual["guid"])
+    except (ValueError, KeyError, TypeError) as e:
+        raise PbivizError(f"{manifest}: package.json does not name the visual's guid ({e})") from e
+    meta = f"resources/{guid}.pbiviz.json"
+    path = os.path.join(folder, "resources", f"{guid}.pbiviz.json")
+    if not guid or any(ch in guid for ch in '/\\:*?"<>|. ') or not os.path.isfile(path):
+        raise PbivizError(f"{folder} has no {meta}")
+    with open(path, "rb") as f:
+        files[meta] = f.read()
+    return {"guid": guid, "name": str(visual.get("name", guid)), "version": str(visual.get("version", "")),
+            "files": files}
+
+
 def custom_visual_files(guid: str, files: Dict[str, bytes]) -> Dict[str, bytes]:
     """Where a package's files go inside the report folder: {"CustomVisuals/<guid>/<member>": bytes}."""
     return {f"CustomVisuals/{guid}/{rel}": data for rel, data in files.items()}

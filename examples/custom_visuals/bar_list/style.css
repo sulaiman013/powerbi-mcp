@@ -1,0 +1,12 @@
+.bl { display: flex; flex-direction: column; gap: 6px; padding: 4px 2px; }
+.bl-row { display: grid; grid-template-columns: minmax(60px, 28%) 1fr auto; align-items: center; gap: 10px; padding: 3px 6px; border-radius: 4px; }
+.bl-row:hover { background: rgba(0, 0, 0, 0.04); }
+.bl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bl-track { display: flex; align-items: stretch; }
+.bl-bar { border-radius: 3px; min-width: 2px; overflow: hidden; }
+.bl-fill { height: 100%; border-radius: 3px; transition: width 200ms ease; }
+.bl-value { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bl-row.vk-selected .bl-name, .bl-row.vk-selected .bl-value { font-weight: 600; }
+/* A highlight is told by the solid part of the bar, so the row itself is not faded. */
+.vk-has-highlights .bl-row.vk-dimmed { opacity: 1; }
+.vk-high-contrast .bl-bar { outline: 1px solid var(--vk-foreground); }

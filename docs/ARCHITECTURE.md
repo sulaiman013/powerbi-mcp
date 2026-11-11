@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Python **stdio MCP server** (`src/server.py`) that routes 90 tools to lazily-created
+A Python **stdio MCP server** (`src/server.py`) that routes 94 tools to lazily-created
 connectors behind one request boundary, with pure-Python modules for everything that does not
 need a live Power BI (parsers, emitters, generators, linters, auditors).
 
@@ -104,7 +104,12 @@ Two small modules now own that problem for everyone:
   `dax_tokens`.
 - **`desktop_bridge.py`** - Desktop Bridge client: pipe discovery, Content-Length JSON-RPC
   framing, response-id matching, a timeout that cancels the blocked read, page resolution
-  across PBIR folders, embedded-PBIR `.pbix`, and legacy Layout.
+  across PBIR folders, embedded-PBIR `.pbix`, and legacy Layout. The argument shape of each
+  method is taken from the running build's own manifest (Desktop 2.159 wraps arguments in an
+  envelope, earlier builds do not), and a call waits while Desktop answers "not ready". It
+  also opens a file through its Windows association and waits for its bridge (path lengths
+  checked first, never a second window on one project), and works out the rectangle of one
+  visual, parent groups included, for a focused screenshot.
 
 ### Offline PBIP engine
 - **`tmdl_scan.py`** - a TMDL object tree and model catalog (tables, columns, measures,
@@ -123,11 +128,24 @@ Two small modules now own that problem for everyone:
 ### Report as code
 - **`pbir_builders.py`** - pure PBIR emitters for everything a designed report needs: text,
   shapes, images, action buttons, slicers with sync groups, visual groups, bookmarks, pages,
-  themes, HTML Content and Deneb visuals, private custom visual registration.
-  `pbir_packages.py` reads `.pbiviz` packages.
+  themes, HTML Content and Deneb visuals, private custom visual registration, page bindings
+  (drillthrough, tooltip pages), visual interactions, the phone layout, bookmark groups.
+  `pbir_filters.py` builds report, page and visual filters and merges them with filters added
+  in Desktop. `pbir_packages.py` reads `.pbiviz` packages.
 - **`report_spec.py`** - the declarative spec behind `pbir_apply_spec`: validation, expansion of
-  pop-ups and shared elements, idempotent apply, prune, dry run. See [REPORT_SPEC.md](REPORT_SPEC.md).
-- **`report_audit.py`** - read-only audit of the report layer: structure, design, governance.
+  pop-ups and shared elements, idempotent apply, prune, dry run, and ownership by manifest so
+  that what a person added in Desktop to a file the spec writes is kept. See
+  [REPORT_SPEC.md](REPORT_SPEC.md).
+- **`report_audit.py`** - read-only audit of the report layer: structure, design, governance,
+  and interactivity (what each custom visual's package declares and its script calls).
+- **`custom_visual.py`** - builds a real `.pbiviz` from a compact definition without the pbiviz
+  toolchain: validation, a safety pass over the author's code, capabilities, a deterministic
+  package, and an inspector for any `.pbiviz`. The JavaScript a built visual ships with lives in
+  **`visual_kit/`**: selection and cross-filtering, highlights, the context menu, tooltips,
+  keyboard, the format pane and number formatting. Author code is checked, never run, by the
+  server.
+- **`deneb_specs.py`** - generates Deneb (Vega-Lite) specs for ten chart kinds with Power BI
+  interactivity wired in, and the `deneb` element that places them.
 - **`payload_measures.py`** - "DAX as transport": text measures that pack rows for a JavaScript
   consumer, with the matching parser.
 - **`js_app_measure.py`** - assembles CSS and JavaScript modules into measures for the HTML
@@ -190,7 +208,7 @@ boundary. Metadata tools list column names regardless of policy.
   Activity tools need Fabric admin or a service principal allowed read-only admin APIs.
 
 ## Verification methodology
-1. **Assert suites** (`tests/`, 50 suites, no Power BI needed) for all pure logic, with the
+1. **Assert suites** (`tests/`, 53 suites, no Power BI needed) for all pure logic, with the
    server and the live connectors driven through fakes.
 2. **Runs against real projects.** The rename engine, the report spec and the report audit
    were run on scratch copies of real, complex reports and checked for byte-level fidelity
@@ -229,6 +247,10 @@ src/
   pbir_authoring.py             PBIR field projections, single pages and visuals
   pbir_builders.py              PBIR emitters for designed reports
   pbir_packages.py              .pbiviz package reading
+  pbir_filters.py               PBIR filters: report, page and visual level
+  custom_visual.py              Builds and inspects .pbiviz custom visuals
+  visual_kit/                   JavaScript runtime a built custom visual ships with
+  deneb_specs.py                Deneb (Vega-Lite) spec generator with interactivity
   report_spec.py                Declarative report spec (pbir_apply_spec)
   report_audit.py               Report-layer audit
   payload_measures.py           Row-packing text measures + JavaScript parsers
@@ -250,6 +272,6 @@ src/
   security/                     security_layer, access_policy, query_analysis, config,
                                 pii_detector, audit_logger, redaction, transforms, names, env
 config/policies.yaml            Access policy definitions
-tests/                          50 assert-based suites (run via run_tests.py)
+tests/                          53 assert-based suites (run via run_tests.py)
 docs/                           TOOLS, ARCHITECTURE, TESTING, REPORT_SPEC
 ```

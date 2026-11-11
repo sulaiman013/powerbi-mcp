@@ -410,6 +410,54 @@ def test_deneb_spec_follows_its_fields():
               str(r.warnings))
 
 
+def test_deneb_supporting_fields_follow_a_rename():
+    print("\n== Deneb: the highlight and format fields beside a measure follow its rename ==")
+    spec = {
+        "data": {"name": "dataset"},
+        "layer": [
+            {"mark": {"type": "bar", "opacity": 0.3}, "encoding": {"x": {"field": "Revenue", "type": "quantitative"}}},
+            {"mark": "bar", "encoding": {
+                "x": {"field": "Revenue__highlight", "type": "quantitative"},
+                "opacity": {"condition": {"test": "datum.Revenue__highlightStatus == 'on'", "value": 1}, "value": 0.4}}},
+            {"mark": "text", "encoding": {"text": {
+                "value": {"expr": "pbiFormat(datum['Revenue'], datum['Revenue__format'])"}}}},
+        ],
+        "transform": [
+            {"calculate": "isValid(datum['Revenue__highlight']) ? datum['Revenue__highlight'] : datum.Revenue",
+             "as": "front"},
+            {"calculate": "datum.Revenue__formatted + ' / ' + datum[\"Revenue__highlightComparator\"]", "as": "label"},
+            {"filter": "datum.Revenues > 0 && datum.Revenue__other == 1"},
+        ],
+        "encoding": {"y": {"field": "Region", "type": "nominal"}},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        p = fx.build_project(tmp, visuals={"overview/spec": deneb(spec=spec)})
+        r = p.connector.rename_measure_in_files("Revenue", "Total Revenue")
+        check("measure rename succeeds", r.success, r.message)
+        s = spec_of(p.visual("overview", "spec"))
+        eq("the highlight field of an encoding", s["layer"][1]["encoding"]["x"]["field"], "Total Revenue__highlight")
+        eq("the highlight status in an expression", s["layer"][1]["encoding"]["opacity"]["condition"]["test"],
+           "datum['Total Revenue__highlightStatus'] == 'on'")
+        eq("the format field beside its measure", s["layer"][2]["encoding"]["text"]["value"]["expr"],
+           "pbiFormat(datum['Total Revenue'], datum['Total Revenue__format'])")
+        eq("highlight with fallback, both spellings",
+           s["transform"][0]["calculate"],
+           "isValid(datum['Total Revenue__highlight']) ? datum['Total Revenue__highlight'] : datum['Total Revenue']")
+        eq("formatted value and comparator", s["transform"][1]["calculate"],
+           "datum['Total Revenue__formatted'] + ' / ' + datum[\"Total Revenue__highlightComparator\"]")
+        eq("a different field that only starts with the name, or carries another suffix, is not touched",
+           s["transform"][2]["filter"], "datum.Revenues > 0 && datum.Revenue__other == 1")
+        eq("the plain field still follows", s["layer"][0]["encoding"]["x"]["field"], "Total Revenue")
+        eq("names the transforms output are their own", [t.get("as") for t in s["transform"][:2]], ["front", "label"])
+
+        r = p.connector.rename_measure_in_files("Total Revenue", "Sales")
+        s = spec_of(p.visual("overview", "spec"))
+        check("renaming back to an identifier keeps every supporting field in step",
+              r.success and s["layer"][1]["encoding"]["x"]["field"] == "Sales__highlight"
+              and s["layer"][2]["encoding"]["text"]["value"]["expr"] == "pbiFormat(datum['Sales'], datum['Sales__format'])"
+              and "Total Revenue" not in json.dumps(s), json.dumps(s)[:500])
+
+
 def test_deneb_cases_that_must_not_be_rewritten():
     print("\n== Deneb: custom display names, derived fields and broken specs are left alone ==")
     with tempfile.TemporaryDirectory() as tmp:
@@ -631,6 +679,7 @@ if __name__ == "__main__":
     print("=" * 70)
     for fn in (test_column_rename, test_measure_rename, test_table_rename, test_hierarchies_and_variations,
                test_same_named_columns_and_dotted_tables, test_deneb_spec_follows_its_fields,
+               test_deneb_supporting_fields_follow_a_rename,
                test_deneb_cases_that_must_not_be_rewritten, test_legacy_report_json,
                test_stale_kinds_extension_measures_and_visual_calculations,
                test_round_trip_and_untouched_files, test_repair_after_model_only_rename):

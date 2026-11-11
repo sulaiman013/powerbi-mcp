@@ -1,0 +1,31 @@
+{
+  "name": "barList",
+  "display_name": "Bar list",
+  "description": "A ranked list of horizontal bars. Each row is a data point: click to cross-filter, right-click for drillthrough, hover for the tooltip. When another visual is selected, the highlighted part of each bar is drawn solid.",
+  "version": "1.0.0.0",
+  "roles": [
+    {"name": "category", "display_name": "Category", "kind": "grouping", "description": "One bar per value. Drop several columns or a hierarchy to drill."},
+    {"name": "value", "display_name": "Value", "kind": "measure", "max": 1, "description": "The length of the bar"},
+    {"name": "tooltips", "display_name": "Tooltips", "kind": "measure", "tooltips": true, "description": "Extra measures for the tooltip"}
+  ],
+  "features": {"drilldown": "category"},
+  "format": [
+    {"name": "bars", "display_name": "Bars", "properties": [
+      {"name": "color", "display_name": "Colour", "type": "color"},
+      {"name": "height", "display_name": "Bar height", "type": "number", "default": 14, "min": 4, "max": 40},
+      {"name": "order", "display_name": "Order", "type": "dropdown", "default": "value", "items": [
+        {"value": "value", "display_name": "Largest first"},
+        {"value": "model", "display_name": "As sorted by the report"}]}
+    ]},
+    {"name": "labels", "display_name": "Value labels", "properties": [
+      {"name": "show", "type": "toggle", "default": true},
+      {"name": "fontSize", "display_name": "Text size", "type": "font_size", "default": 9},
+      {"name": "units", "display_name": "Display units", "type": "dropdown", "default": "auto", "items": [
+        {"value": "auto", "display_name": "Auto"},
+        {"value": "none", "display_name": "None"}]}
+    ]}
+  ],
+  "landing": {"text": "Add a column to Category and a measure to Value."},
+  "css_file": "style.css",
+  "js_files": ["render.js"]
+}

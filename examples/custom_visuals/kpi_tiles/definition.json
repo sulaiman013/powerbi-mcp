@@ -1,0 +1,23 @@
+{
+  "name": "kpiTiles",
+  "display_name": "KPI tiles",
+  "description": "One tile per measure. When another visual is selected, each tile shows the highlighted value against its total. Right-click gives the visual's context menu; the tooltips are raised by the script itself.",
+  "version": "1.0.0.0",
+  "roles": [
+    {"name": "values", "display_name": "Measures", "kind": "measure", "max": 8, "description": "One tile for each measure"}
+  ],
+  "format": [
+    {"name": "tiles", "display_name": "Tiles", "properties": [
+      {"name": "columns", "display_name": "Tiles per row (0 = fit)", "type": "number", "default": 0, "min": 0, "max": 8},
+      {"name": "color", "display_name": "Accent colour", "type": "color"},
+      {"name": "vary", "display_name": "One theme colour per tile", "type": "toggle", "default": false},
+      {"name": "fontSize", "display_name": "Value size", "type": "font_size", "default": 18, "min": 8, "max": 60},
+      {"name": "units", "display_name": "Display units", "type": "dropdown", "default": "auto", "items": [
+        {"value": "auto", "display_name": "Auto"},
+        {"value": "none", "display_name": "None"}]}
+    ]}
+  ],
+  "landing": {"text": "Add one or more measures."},
+  "css_file": "style.css",
+  "js_files": ["render.js"]
+}

@@ -565,6 +565,169 @@ def test_packages():
         eq("the limit can be set", pbir_packages.path_length_problems(root, [short], limit=5), [short])
 
 
+def test_native_features():
+    print("\n== drillthrough, tooltip pages, interactions, the phone layout, bookmark groups ==")
+    city = {"Column": {"Expression": {"SourceRef": {"Entity": "Customer"}}, "Property": "City"}}
+    binding = pb.page_binding("bind1", "Drillthrough", [{"filter": "f1", "expr": city, "name": "p1"}])
+    parameter = {"name": "p1", "boundFilter": "f1", "asAggregation": False, "qnaSingleSelectRequired": False,
+                 "fieldExpr": city}
+    eq("a drillthrough binding points each field at its filter, the way Desktop saves one", binding,
+       {"name": "bind1", "type": "Drillthrough", "parameters": [parameter]})
+    eq("cross-report, and without the source's other filters",
+       pb.page_binding("b", "Drillthrough", [{"filter": "f1", "expr": city}], cross_report=True,
+                       keep_all_filters=False),
+       {"name": "b", "type": "Drillthrough", "referenceScope": "CrossReport",
+        "parameters": [dict(parameter, name="Param_f1")], "acceptsFilterContext": "None"})
+
+    # a binding someone added a field to in Desktop
+    theirs = {"name": "hand", "boundFilter": "desk", "asAggregation": False, "fieldExpr": city}
+    on_disk = {"name": "bind1", "type": "Drillthrough", "parameters": [theirs, parameter]}
+    eq("a parameter bound by hand stays where it is", pb.merge_binding(on_disk, binding, ["f1"]), on_disk)
+    changed = pb.page_binding("bind1", "Drillthrough", [{"filter": "f2", "expr": city, "name": "p2"}],
+                              keep_all_filters=False)
+    eq("ours are replaced: the one the spec dropped goes, the new one is added, theirs stays",
+       pb.merge_binding(on_disk, changed, ["f1"]),
+       {"name": "bind1", "type": "Drillthrough",
+        "parameters": [theirs, dict(parameter, name="p2", boundFilter="f2")], "acceptsFilterContext": "None"})
+    eq("when the spec declares no binding any more, a hand-bound field keeps the binding alive",
+       pb.merge_binding(on_disk, None, ["f1"]),
+       {"name": "bind1", "type": "Drillthrough", "parameters": [theirs]})
+    eq("and with only ours in it, the binding goes", pb.merge_binding(binding, None, ["F1"]), None)
+    eq("a page that had no binding takes ours", pb.merge_binding(None, binding), binding)
+    eq("a binding with no parameters left has no parameter list",
+       pb.merge_binding(binding, pb.page_binding("t", "Tooltip"), ["f1"]), {"name": "t", "type": "Tooltip"})
+    kept = pb.merge_binding(on_disk, binding, ["f1"])
+    kept["parameters"][1]["fieldExpr"]["Column"]["Property"] = "changed"
+    eq("the result shares nothing with the binding it was given",
+       binding["parameters"][0]["fieldExpr"]["Column"]["Property"], "City")
+    eq("a tooltip binding with no fields", pb.page_binding("t", "Tooltip"), {"name": "t", "type": "Tooltip"})
+    try:
+        pb.page_binding("x", "Popup")
+        check("an unknown binding type is refused", False)
+    except ValueError:
+        check("an unknown binding type is refused", True)
+    drill = pb.page("detail", "Detail", drillthrough=True, binding=binding)
+    eq("a drillthrough page", [drill["type"], drill["pageBinding"], "visibility" in drill],
+       ["Drillthrough", binding, False])
+    binding["parameters"].clear()
+    eq("the page keeps its own copy of the binding", len(drill["pageBinding"]["parameters"]), 1)
+    tip = pb.page("tip", "Tip", 320, 240, tooltip=True, binding=pb.page_binding("t", "Tooltip"))
+    eq("a tooltip page with its binding", [tip["type"], tip["visibility"], tip["pageBinding"]],
+       ["Tooltip", "HiddenInViewMode", {"name": "t", "type": "Tooltip"}])
+    check("an ordinary page has neither", not {"type", "pageBinding"} & set(pb.page("p", "P")))
+    try:
+        pb.page("p", "P", tooltip=True, drillthrough=True)
+        check("a page cannot be both", False)
+    except ValueError:
+        check("a page cannot be both", True)
+
+    # show and section only, as in visuals Desktop saved; with a "type" of 'ReportPage' Power BI
+    # was seen to fall back to the default tooltip
+    eq("a visual that shows a tooltip page", pb.container_objects(tooltip_page="tip")["visualTooltip"],
+       [{"properties": {"show": L("true"), "section": L("'tip'")}}])
+    eq("with tooltip: true as well", pb.container_objects(tooltip=True, tooltip_page="tip")["visualTooltip"],
+       [{"properties": {"show": L("true"), "section": L("'tip'")}}])
+    check("no tooltip type is written",
+          "ReportPage" not in json.dumps(pb.container_objects(tooltip_page="tip")))
+    try:
+        pb.container_objects(tooltip=False, tooltip_page="tip")
+        check("a tooltip page on a visual with tooltips off is refused", False)
+    except ValueError:
+        check("a tooltip page on a visual with tooltips off is refused", True)
+
+    eq("a drillthrough button", pb.action_link("drillthrough", "detail", tooltip="Open detail",
+                                               disabled_tooltip="Pick a city first"),
+       [{"properties": {"show": L("true"), "type": L("'Drillthrough'"), "drillthroughSection": L("'detail'"),
+                        "enabledTooltip": L("'Open detail'"), "disabledTooltip": L("'Pick a city first'")}}])
+    try:
+        pb.action_link("drillthrough")
+        check("a drillthrough action needs its page", False)
+    except ValueError:
+        check("a drillthrough action needs its page", True)
+    check("other actions keep their single tooltip",
+          "enabledTooltip" not in pb.action_link("page", "p", tooltip="Go")[0]["properties"])
+
+    eq("interactions", [pb.visual_interaction("a", "b", k) for k in ("filter", "highlight", "none")],
+       [{"source": "a", "target": "b", "type": "DataFilter"},
+        {"source": "a", "target": "b", "type": "HighlightFilter"},
+        {"source": "a", "target": "b", "type": "NoFilter"}])
+    try:
+        pb.visual_interaction("a", "b", "Filter")
+        check("an unknown interaction is refused", False)
+    except ValueError:
+        check("an unknown interaction is refused", True)
+
+    eq("a phone position", pb.mobile_state(pb.position(0, 120, 323, 200, 7)),
+       {"$schema": pb.DEFAULT_SCHEMAS["mobile"],
+        "position": {"x": 0, "y": 120, "z": 7, "width": 323, "height": 200, "tabOrder": 7}})
+    check("the mobile schema is its own", "visualContainerMobileState" in pb.DEFAULT_SCHEMAS["mobile"])
+    eq("with the project's schema", pb.mobile_state(POS, "https://example.test/m.json")["$schema"],
+       "https://example.test/m.json")
+    eq("a bookmark group", pb.bookmark_group("views", "Views", ("a", "b")),
+       {"name": "views", "displayName": "Views", "children": ["a", "b"]})
+
+    eq("Deneb's version literal is the one Deneb 2.0 writes", pb.DENEB_VEGA_LITE_VERSION, "6.4.3")
+    for bad in (0, 251, 2.5, True, "50", float("nan")):
+        try:
+            pb.deneb_visual("d", POS, ["T.C"], {}, max_selected=bad)
+            check(f"max_selected {bad!r} is refused", False)
+        except ValueError as e:
+            check(f"max_selected {bad!r} is refused", "from 1 to 250" in str(e), str(e))
+    eq("the ends of the range pass",
+       [pb.deneb_visual("d", POS, ["T.C"], {}, max_selected=n)["visual"]["objects"]["vega"][0]["properties"]
+        ["selectionMaxDataPoints"] for n in (1, 250)], [L("1D"), L("250D")])
+    deneb = pb.deneb_visual("d", POS, ["T.C"], {}, selection=True, cross_highlight=True, context_menu=False)
+    eq("Deneb's own switches for the context menu and cross-highlight",
+       [k for k in deneb["visual"]["objects"]["vega"][0]["properties"] if k.startswith("enable")],
+       ["enableTooltips", "enableContextMenu", "enableHighlight", "enableSelection"])
+    vega = deneb["visual"]["objects"]["vega"][0]["properties"]
+    eq("and their values", [vega["enableContextMenu"], vega["enableHighlight"]], [L("false"), L("true")])
+    def active(doc, role):
+        return [p.get("active", False) for p in doc["visual"]["query"]["queryState"][role]["projections"]]
+
+    levels = {"category": [{"column": "T.A"}, {"column": "T.B"}, {"column": "T.C"}],
+              "value": [{"measure": "T.M"}]}
+    custom = pb.data_visual("v", "myVisual123", POS, levels, mark_active=False, drill_roles=["category"])
+    eq("a custom visual's drill role with several fields starts on the first",
+       [active(custom, "category"), active(custom, "value")], [[True, False, False], [False]])
+    plain = pb.data_visual("v", "myVisual123", POS, levels, mark_active=False)
+    eq("without the role named as one it drills on, nothing is marked", active(plain, "category"),
+       [False, False, False])
+    single = pb.data_visual("v", "myVisual123", POS, {"category": [{"column": "T.A"}]}, mark_active=False,
+                            drill_roles=["category"])
+    eq("one field needs no mark", active(single, "category"), [False])
+    chosen = pb.data_visual("v", "myVisual123", POS, {"category": [
+        {"column": "T.A", "active": True}, {"column": "T.B", "active": True}, {"column": "T.C"}]},
+        mark_active=False, drill_roles=["category"])
+    eq("a field can say for itself whether it is active", active(chosen, "category"), [True, True, False])
+    native = pb.data_visual("v", "barChart", POS, {"Category": [{"column": "T.A", "active": False},
+                                                                {"column": "T.B", "active": True}]})
+    eq("on a native visual too, in place of the first-field rule", active(native, "Category"), [False, True])
+    eq("a field that says nothing leaves the rule alone",
+       active(pb.data_visual("v", "barChart", POS, {"Category": [{"column": "T.A"}, {"column": "T.B"}]}),
+              "Category"), [True, False])
+    written = chosen["visual"]["query"]["queryState"]["category"]["projections"]
+    check("no stray key reaches the projection",
+          all(set(p) <= {"field", "queryRef", "nativeQueryRef", "active"} for p in written))
+
+    eq("the two editions of HTML Content", pb.HTML_CONTENT_EDITIONS,
+       {"regular": "htmlContent443BE3AD55E043BF878BED274D3A6855",
+        "secure": "htmlContent443BE3AD55E043BF878BED274D3A6865"})
+    eq("the default is still the regular one", pb.HTML_CONTENT_ID, pb.HTML_CONTENT_EDITIONS["regular"])
+    eq("the phone canvas is 323 wide", pb.PHONE_WIDTH, 323)
+    for bad in (float("nan"), float("inf")):
+        try:
+            pb.lit_num(bad)
+            check(f"{bad!r} is not written as a number", False)
+        except ValueError:
+            check(f"{bad!r} is not written as a number", True)
+    quiet = pb.data_visual("v", "barChart", POS, {"Category": "T.C"}, drill_filter_other_visuals=False)
+    eq("a visual that a drill elsewhere does not filter",
+       [quiet["visual"]["drillFilterOtherVisuals"],
+        pb.data_visual("v", "barChart", POS, {"Category": "T.C"})["visual"]["drillFilterOtherVisuals"]],
+       [False, True])
+
+
 def test_purity():
     print("\n== emitters do not share state ==")
     frame = pb.container_objects(**pb.PLAIN_CHROME)
@@ -585,7 +748,8 @@ def test_purity():
 
 if __name__ == "__main__":
     for fn in (test_literals, test_objects, test_decoration, test_button_and_slicer, test_data_visuals,
-               test_group_page_bookmark, test_theme_and_report, test_packages, test_purity):
+               test_group_page_bookmark, test_theme_and_report, test_packages, test_native_features,
+               test_purity):
         fn()
     print()
     if _failures:

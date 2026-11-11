@@ -10,6 +10,7 @@ import builtins
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -79,10 +80,17 @@ class FakePipe:
         self.respond = respond
         self._resp = None
         self.closed = False
+        self.requests = []
+
+    def begin(self):
+        """The client opens the pipe afresh for every call."""
+        self.wrote = b""
+        self.closed = False
 
     def write(self, data):
         self.wrote += data
         request = json.loads(self.wrote.split(b"\r\n\r\n", 1)[1])
+        self.requests.append(request)
         self._resp = io.BytesIO(b"".join(db.encode_frame(m) for m in self.respond(request)))
         return len(data)
 
@@ -109,7 +117,13 @@ class PipePatch:
 
     def __enter__(self):
         self.real = builtins.open
-        builtins.open = lambda path, *a, **k: self.pipe if path == FAKE else self.real(path, *a, **k)
+
+        def fake_open(path, *a, **k):
+            if path != FAKE:
+                return self.real(path, *a, **k)
+            getattr(self.pipe, "begin", lambda: None)()
+            return self.pipe
+        builtins.open = fake_open
         return self.pipe
 
     def __exit__(self, *a):
@@ -121,8 +135,46 @@ def answer(result):
     return lambda req: [{"jsonrpc": "2.0", "id": req["id"], "result": result}]
 
 
+METHODS = ("application.state.get/v1", "report.snapshot.capture/v1", "file.reload/v1")
+
+
+def manifest_of(enveloped, extra=()):
+    """A bridge manifest in the shape of the first preview builds (a method's arguments are its
+    params) or of Desktop 2.159 (they sit in an ``args`` envelope)."""
+    properties = {"client": {}, "clientActivityId": {}, "args": {"type": "object"}} if enveloped else {"pageId": {}}
+    return {"methods": [{"name": n, "params": {"type": "object", "properties": properties}}
+                        for n in METHODS + tuple(extra)]}
+
+
+def build(enveloped, result, extra=(), refuse=None):
+    """A fake bridge of one kind of build: answers bridge.manifest with its manifest and every
+    other call with ``result`` (or, with ``refuse``, an error when refuse(params) is true)."""
+    def respond(req):
+        if req["method"] == "bridge.manifest":
+            return [{"jsonrpc": "2.0", "id": req["id"], "result": manifest_of(enveloped, extra)}]
+        if refuse and refuse(req["params"]):
+            return [{"jsonrpc": "2.0", "id": req["id"],
+                     "error": {"code": -32602, "message": "Request arguments are required."}}]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": result}]
+    return respond
+
+
+def first_preview_build():
+    """Pretend the manifest was already read and described a first-preview build, so a test of
+    something else exchanges exactly one request per call."""
+    forget_shapes()
+    db.DesktopBridgeClient._manifests[FAKE] = {n: False for n in METHODS}
+
+
+def forget_shapes():
+    """Drop what earlier calls learned about the fake pipe's argument shape."""
+    db.DesktopBridgeClient._manifests.clear()
+    db.DesktopBridgeClient._learned.clear()
+
+
 def test_client():
     print("\n== client call / error handling (fake pipe) ==")
+    first_preview_build()
     c = db.DesktopBridgeClient(FAKE, timeout=5)
     with PipePatch(FakePipe(answer({"methods": [{"name": "file.reload/v1"}]}))) as pipe:
         res = c.manifest()
@@ -148,6 +200,292 @@ def test_client():
     with PipePatch(FakePipe(answer({"payload": "AAAA"}))) as pipe:
         c.capture_snapshot("page1", scale=2.5)
     check("snapshot passes explicit scale", pipe.request["params"]["scale"] == 2.5)
+
+
+def test_argument_shapes():
+    print("\n== the client sends the argument shape the running build's manifest declares ==")
+    envelope = lambda args: {"client": db.CLIENT_NAME, "args": args}  # noqa: E731
+
+    forget_shapes()
+    c = db.DesktopBridgeClient(FAKE, timeout=5)
+    with PipePatch(FakePipe(build(True, {"success": True}, extra=("report.snapshot.capture/v2",)))) as pipe:
+        c.reload_file(reload_model_definition=False)
+        check("Desktop 2.159: reload arguments go in the args envelope",
+              pipe.request["params"] == envelope({"reloadModelDefinition": False}), str(pipe.request["params"]))
+        c.capture_snapshot("p1")
+        check("so do screenshot arguments", pipe.request["method"] == "report.snapshot.capture/v1"
+              and pipe.request["params"] == envelope({"pageId": "p1", "scale": 1.0}), str(pipe.request))
+        c.get_state()
+        check("a call without arguments sends an empty envelope", pipe.request["params"] == envelope({}))
+        c.capture_snapshot("p1", scale=2, region={"x": 10, "y": 20, "width": 300, "height": 150})
+        check("a region is captured with capture/v2",
+              pipe.request["method"] == "report.snapshot.capture/v2" and pipe.request["params"] == envelope(
+                  {"pageId": "p1", "scale": 2.0, "region": {"x": 10.0, "y": 20.0, "width": 300.0, "height": 150.0}}),
+              str(pipe.request))
+        asked = [r["method"] for r in pipe.requests].count("bridge.manifest")
+        check("the manifest is read once for the pipe, not once per call", asked == 1, str(asked))
+        check("a method the manifest lists is supported, another is not",
+              c.supports("file.reload/v1") and not c.supports("file.save/v1"))
+
+    forget_shapes()
+    with PipePatch(FakePipe(build(False, {"success": True}))) as pipe:
+        c.reload_file()
+        check("first preview builds: the arguments are the params",
+              pipe.request["params"] == {"reloadModelDefinition": True}, str(pipe.request["params"]))
+        e = raises("a region on a build without capture/v2 is refused with the reason", db.BridgeError,
+                   lambda: c.capture_snapshot("p1", region={"x": 0, "y": 0, "width": 1, "height": 1}), "region")
+        check("and nothing was sent for it", pipe.request["method"] == "file.reload/v1" and e is not None)
+
+    # A bridge whose manifest cannot be read: the current shape first, the earlier one once.
+    def old_bridge_without_manifest(req):
+        if req["method"] == "bridge.manifest":
+            return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "MethodNotFound"}}]
+        if "args" in req["params"]:
+            return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32602, "message": "Invalid params"}}]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": {"success": True}}]
+
+    forget_shapes()
+    with PipePatch(FakePipe(old_bridge_without_manifest)) as pipe:
+        r = c.reload_file()
+        sent = [("args" in q["params"]) for q in pipe.requests if q["method"] == "file.reload/v1"]
+        check("with no manifest it falls back to the earlier shape after 'invalid params'",
+              r == {"success": True} and sent == [True, False], str(sent))
+        c.reload_file()
+        sent = [("args" in q["params"]) for q in pipe.requests if q["method"] == "file.reload/v1"]
+        check("and remembers which shape worked", sent == [True, False, False], str(sent))
+
+    forget_shapes()
+    with PipePatch(FakePipe(build(True, {"ok": 1}, refuse=lambda params: True))) as pipe:
+        e = raises("an 'invalid params' answer from a build whose shape is known is not retried",
+                   db.BridgeError, c.reload_file, "arguments are required")
+        check("one attempt only", [q["method"] for q in pipe.requests].count("file.reload/v1") == 1
+              and e is not None and e.code == db.INVALID_PARAMS)
+
+        raises("and the manifest is read afresh for the next call (another build may own the pipe now)",
+               db.BridgeError, c.reload_file)
+        check("  it was asked again", [q["method"] for q in pipe.requests].count("bridge.manifest") == 2,
+              str([q["method"] for q in pipe.requests]))
+
+    # A manifest that could not be read is not remembered: the bridge may only be starting.
+    state = {"manifest_fails": 1}
+
+    def slow_starter(req):
+        if req["method"] == "bridge.manifest":
+            if state["manifest_fails"]:
+                state["manifest_fails"] -= 1
+                return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "starting"}}]
+            return [{"jsonrpc": "2.0", "id": req["id"],
+                     "result": manifest_of(True, extra=("report.snapshot.capture/v2",))}]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": {"payload": "AAAA"}}]
+
+    forget_shapes()
+    with PipePatch(FakePipe(slow_starter)) as pipe:
+        check("with no manifest yet, whether a method exists is unknown, not 'no'",
+              c.supports("report.snapshot.capture/v2") is None)
+        c.capture_snapshot("p1", region={"x": 0, "y": 0, "width": 5, "height": 5})
+        check("so a region capture is tried rather than refused, and the manifest is read once it answers",
+              pipe.request["method"] == "report.snapshot.capture/v2" and c.supports("report.snapshot.capture/v2") is True,
+              str(pipe.request["method"]))
+
+    def refuses_everything(req):
+        if req["method"] == "bridge.manifest":
+            return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "MethodNotFound"}}]
+        shape = "current" if "args" in req["params"] else "earlier"
+        return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32602, "message": f"bad {shape} arguments"}}]
+
+    forget_shapes()
+    with PipePatch(FakePipe(refuses_everything)):
+        raises("when both shapes are refused, the answer to the current shape is the one reported",
+               db.BridgeError, c.reload_file, "bad current arguments")
+
+    # Desktop answers "not ready" for a few seconds after opening a file and during a reload.
+    attempts = {"n": 0}
+
+    def not_ready_twice(req):
+        if req["method"] == "bridge.manifest":
+            return [{"jsonrpc": "2.0", "id": req["id"], "result": manifest_of(True)}]
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            code = db.HOST_NOT_READY if attempts["n"] == 1 else db.OPERATION_IN_PROGRESS
+            return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": code, "message": "Host is not ready"}}]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": {"success": True}}]
+
+    pause = db.RETRY_PAUSE
+    db.RETRY_PAUSE = 0.01
+    try:
+        forget_shapes()
+        with PipePatch(FakePipe(not_ready_twice)):
+            check("a call waits while Desktop is not ready or busy, then succeeds",
+                  db.DesktopBridgeClient(FAKE, timeout=5, ready_wait=5).reload_file() == {"success": True}
+                  and attempts["n"] == 3, str(attempts))
+            attempts["n"] = 0
+            e = raises("with no waiting allowed, 'not ready' is reported at once", db.BridgeError,
+                       db.DesktopBridgeClient(FAKE, timeout=5, ready_wait=0).reload_file, "not ready")
+            check("  after one attempt", attempts["n"] == 1 and e is not None and e.code == db.HOST_NOT_READY)
+    finally:
+        db.RETRY_PAUSE = pause
+
+    # The first capture of a page after a reload can exceed Desktop's own 30-second limit.
+    captures = {"n": 0, "always": False}
+
+    def slow_first_capture(req):
+        if req["method"] == "bridge.manifest":
+            return [{"jsonrpc": "2.0", "id": req["id"], "result": manifest_of(True)}]
+        captures["n"] += 1
+        if captures["n"] == 1 or captures["always"]:
+            return [{"jsonrpc": "2.0", "id": req["id"], "error": {
+                "code": db.CAPTURE_TIMED_OUT, "message": "report.snapshot.capture exceeded timeout of 30s."}}]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": {"payload": "AAAA"}}]
+
+    forget_shapes()
+    with PipePatch(FakePipe(slow_first_capture)):
+        check("a capture that timed out inside Desktop is tried once more",
+              c.capture_snapshot("p1") == {"payload": "AAAA"} and captures["n"] == 2, str(captures))
+        captures.update(n=0, always=True)
+        e = raises("and only once: a page that cannot be drawn is still an error", db.BridgeError,
+                   lambda: c.capture_snapshot("p1"), "exceeded timeout")
+        check("  after two attempts", captures["n"] == 2 and e is not None and e.code == db.CAPTURE_TIMED_OUT)
+    forget_shapes()
+
+
+def test_visual_region():
+    print("\n== the rectangle of one visual, for a focused screenshot ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        pbip = os.path.join(tmp, "Sales.pbip")
+        visuals = Path(tmp) / "Sales.Report" / "definition" / "pages" / "p1" / "visuals"
+        for folder, doc in (("chart", {"name": "chart", "position": {"x": 100, "y": 50, "width": 400, "height": 300}}),
+                            ("a1b2", {"name": "kpi", "position": {"x": 2, "y": 3, "width": 120, "height": 60}}),
+                            ("broken", {"name": "broken"})):
+            (visuals / folder).mkdir(parents=True)
+            (visuals / folder / "visual.json").write_text(json.dumps(doc), encoding="utf-8")
+        check("found by folder name, widened by the margin",
+              db.visual_region(pbip, "p1", "chart", margin=10) == {"x": 90.0, "y": 40.0, "width": 420.0, "height": 320.0})
+        check("found by the name inside visual.json; the margin stops at the top and left page edges",
+              db.visual_region(pbip, "p1", "KPI", margin=8) == {"x": 0.0, "y": 0.0, "width": 130.0, "height": 71.0},
+              str(db.visual_region(pbip, "p1", "KPI", margin=8)))
+        check("no such visual, no such page, no position, not a PBIP: None",
+              db.visual_region(pbip, "p1", "nope") is None and db.visual_region(pbip, "p9", "chart") is None
+              and db.visual_region(pbip, "p1", "broken") is None
+              and db.visual_region(os.path.join(tmp, "Sales.pbix"), "p1", "chart") is None)
+
+        # The bridge refuses a region that reaches past the page, so the margin stops there too.
+        page = visuals.parent
+        (page / "page.json").write_text(json.dumps({"name": "p1", "width": 1280, "height": 720}), encoding="utf-8")
+        for folder, pos in (("full", {"x": 0, "y": 0, "width": 1280, "height": 720}),
+                            ("corner", {"x": 1100, "y": 600, "width": 180, "height": 120}),
+                            ("outside", {"x": 1400, "y": 800, "width": 50, "height": 50})):
+            (visuals / folder).mkdir()
+            (visuals / folder / "visual.json").write_text(json.dumps({"name": folder, "position": pos}), encoding="utf-8")
+        check("a full-page visual gives exactly the page",
+              db.visual_region(pbip, "p1", "full", margin=8) == {"x": 0.0, "y": 0.0, "width": 1280.0, "height": 720.0},
+              str(db.visual_region(pbip, "p1", "full", margin=8)))
+        check("the margin stops at the right and bottom page edges",
+              db.visual_region(pbip, "p1", "corner", margin=8) == {"x": 1092.0, "y": 592.0, "width": 188.0, "height": 128.0},
+              str(db.visual_region(pbip, "p1", "corner", margin=8)))
+        check("a visual that lies outside its page has no region", db.visual_region(pbip, "p1", "outside") is None)
+
+        (visuals / "aslist").mkdir()
+        (visuals / "aslist" / "visual.json").write_text("[1, 2]", encoding="utf-8")
+        check("a visual.json that is not an object is skipped, not a crash",
+              db.visual_region(pbip, "p1", "aslist") is None and db.visual_region(pbip, "p1", "chart") is not None)
+        raises("a margin that is not a number is an error, not 'no such visual'", (ValueError, TypeError),
+               lambda: db.visual_region(pbip, "p1", "chart", margin="wide"))
+
+        # A visual inside a group is stored relative to the group (Desktop draws a child written
+        # at (40, 40) in a group at (300, 200) at page position (340, 240)); groups can nest.
+        for folder, doc in (("grp", {"name": "grp", "position": {"x": 300, "y": 200, "width": 400, "height": 300},
+                                     "visualGroup": {"displayName": "g"}}),
+                            ("inner", {"name": "inner", "parentGroupName": "grp",
+                                       "position": {"x": 20, "y": 30, "width": 200, "height": 150},
+                                       "visualGroup": {"displayName": "i"}}),
+                            ("child", {"name": "child", "parentGroupName": "grp",
+                                       "position": {"x": 40, "y": 40, "width": 100, "height": 50}}),
+                            ("deep", {"name": "deep", "parentGroupName": "inner",
+                                      "position": {"x": 5, "y": 5, "width": 60, "height": 40}}),
+                            ("looped", {"name": "looped", "parentGroupName": "looped",
+                                        "position": {"x": 7, "y": 9, "width": 10, "height": 10}})):
+            (visuals / folder).mkdir()
+            (visuals / folder / "visual.json").write_text(json.dumps(doc), encoding="utf-8")
+        check("a grouped visual's region includes its group's offset",
+              db.visual_region(pbip, "p1", "child", margin=0) == {"x": 340.0, "y": 240.0, "width": 100.0, "height": 50.0},
+              str(db.visual_region(pbip, "p1", "child", margin=0)))
+        check("nested groups add up",
+              db.visual_region(pbip, "p1", "deep", margin=0) == {"x": 325.0, "y": 235.0, "width": 60.0, "height": 40.0},
+              str(db.visual_region(pbip, "p1", "deep", margin=0)))
+        check("a group that names itself as its parent does not loop for ever",
+              db.visual_region(pbip, "p1", "looped", margin=0) == {"x": 14.0, "y": 18.0, "width": 10.0, "height": 10.0},
+              str(db.visual_region(pbip, "p1", "looped", margin=0)))
+
+        # A page folder renamed by hand still belongs to the page its page.json names.
+        renamed = Path(tmp) / "Sales.Report" / "definition" / "pages" / "Overview folder"
+        (renamed / "visuals" / "v").mkdir(parents=True)
+        (renamed / "page.json").write_text(json.dumps({"name": "pg7", "width": 800, "height": 600}), encoding="utf-8")
+        (renamed / "visuals" / "v" / "visual.json").write_text(
+            json.dumps({"name": "v", "position": {"x": 10, "y": 10, "width": 100, "height": 100}}), encoding="utf-8")
+        check("the page is found by the name in page.json when its folder is named differently",
+              db.visual_region(pbip, "pg7", "v", margin=0) == {"x": 10.0, "y": 10.0, "width": 100.0, "height": 100.0},
+              str(db.visual_region(pbip, "pg7", "v", margin=0)))
+
+
+def test_long_paths_walk():
+    print("\n== the path check does not follow links and reads paths of any length ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "R.Report")
+        pages = os.path.join(report, "definition", "pages")
+        os.makedirs(pages)
+        with open(os.path.join(pages, "page.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        loop = os.path.join(pages, "loop")
+        linked = False
+        try:
+            os.symlink(pages, loop, target_is_directory=True)
+            linked = True
+        except (OSError, NotImplementedError):
+            if os.name == "nt":
+                made = subprocess.run(["cmd", "/c", "mklink", "/J", loop, pages], capture_output=True)
+                linked = made.returncode == 0
+        if not linked:
+            print("  [SKIP] this file system offers neither symlinks nor junctions")
+        else:
+            limits = (db.MAX_FILE_PATH, db.MAX_DIR_PATH)
+            db.MAX_FILE_PATH = db.MAX_DIR_PATH = len(loop) + len(os.sep + "loop") * 2
+            try:
+                found = db.long_paths([report])
+            finally:
+                db.MAX_FILE_PATH, db.MAX_DIR_PATH = limits
+                if os.path.islink(loop):
+                    os.unlink(loop)
+                else:
+                    os.rmdir(loop)
+            check("a folder that links back into the report is not walked round and round",
+                  found == [], str([p["path"][-60:] for p in found][:3]))
+
+        seen = []
+        real_scandir = db.os.scandir
+
+        def scandir(path):
+            seen.append(path)
+            return real_scandir(path)
+        db.os.scandir = scandir
+        try:
+            db.long_paths([report])
+        finally:
+            db.os.scandir = real_scandir
+        if os.name == "nt":
+            check("on Windows every folder is listed in the long-path form, so one beyond the limit is not missed",
+                  bool(seen) and all(p.startswith("\\\\?\\") for p in seen), str(seen[:2]))
+            prefixed = db.long_paths(["\\\\?\\" + os.path.abspath(report)])
+            limits = db.MAX_DIR_PATH
+            db.MAX_DIR_PATH = len(os.path.abspath(report))
+            try:
+                found = db.long_paths(["\\\\?\\" + os.path.abspath(report)])
+            finally:
+                db.MAX_DIR_PATH = limits
+            check("a root given in the long-path form is measured without its prefix",
+                  prefixed == [] and any(p["path"] == os.path.abspath(report) and p["length"] == len(os.path.abspath(report))
+                                         for p in found), str(found[:2]))
+        else:
+            check("off Windows paths are listed as they are", bool(seen) and not any(p.startswith("\\\\?\\") for p in seen))
 
 
 def test_response_matching():
@@ -367,12 +705,193 @@ def test_reload_guard_and_status():
         db.discover_bridges = orig_disc
 
 
+class Instances:
+    """Fake Desktop windows for the open-file code: {pid: currentFilePath}. Patches discovery
+    and the client, and records what was launched."""
+
+    def __init__(self, files=None, busy=()):
+        self.files = dict(files or {})
+        self.busy = set(busy)                 # pids that answer "not ready" instead of their state
+        self.launched = []
+        self.now = 0.0
+
+    def __enter__(self):
+        self._disc, self._client = db.discover_bridges, db.DesktopBridgeClient
+        db.discover_bridges = lambda: [{"pid": p, "pipe": f"pipe-{p}"} for p in sorted(self.files)]
+        owner = self
+
+        class Client:
+            def __init__(self, pipe, timeout=60, ready_wait=None):
+                self.pid = int(pipe.split("-")[1])
+
+            def get_state(self):
+                if self.pid in owner.busy:
+                    raise db.BridgeError(db.HOST_NOT_READY, "Host is not ready to accept operations")
+                return {"currentFilePath": owner.files[self.pid], "hasUnsavedChanges": False}
+
+        db.DesktopBridgeClient = Client
+        return self
+
+    def __exit__(self, *exc):
+        db.discover_bridges, db.DesktopBridgeClient = self._disc, self._client
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_open_file():
+    print("\n== opening a file in Desktop: path limit, already open, wait, honest failure ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        deep = os.path.join(tmp, "Report", "definition", "pages")
+        os.makedirs(deep)
+        target = os.path.join(tmp, "Sales.pbip")
+        for path in (target, os.path.join(deep, "page.json")):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{}")
+        check("ordinary paths are fine", db.long_paths([target, os.path.join(tmp, "Report")]) == [])
+        limits = (db.MAX_FILE_PATH, db.MAX_DIR_PATH)
+        db.MAX_FILE_PATH, db.MAX_DIR_PATH = len(os.path.join(deep, "page.json")), len(deep) + 1
+        try:
+            found = db.long_paths([target, os.path.join(tmp, "Report"), None])
+        finally:
+            db.MAX_FILE_PATH, db.MAX_DIR_PATH = limits
+        check("a file at the limit is reported, with its length and the limit it broke",
+              [(os.path.basename(p["path"]), p["length"] == p["limit"]) for p in found] == [("page.json", True)],
+              str(found))
+        db.MAX_DIR_PATH = len(deep)
+        try:
+            dirs = [p["path"] for p in db.long_paths([os.path.join(tmp, "Report")])]
+        finally:
+            db.MAX_DIR_PATH = limits[1]
+        check("so is a folder at the folder limit", dirs == [deep], str(dirs))
+        check("the same file under two spellings is one file",
+              db.same_file(target, os.path.join(tmp, ".", "Sales.pbip"))
+              and not db.same_file(target, os.path.join(deep, "page.json")))
+
+        with Instances({7: target}) as desk:
+            r = db.open_file(target, launch=desk.launched.append, sleep=desk.sleep, clock=desk.clock)
+            check("a file that is already open is not opened again",
+                  r["opened"] and r["already_open"] and r["pid"] == 7 and desk.launched == [], str(r))
+
+        with Instances({7: ""}) as desk:
+            def launch(path):
+                desk.launched.append(path)
+
+            def sleep(seconds):
+                desk.sleep(seconds)
+                if desk.now >= 6:
+                    desk.files[21] = target          # the new window finishes loading
+            r = db.open_file(target, timeout=60, poll=2, launch=launch, sleep=sleep, clock=desk.clock)
+            check("it launches the file and waits until the window has reported it twice in a row",
+                  r["opened"] and not r["already_open"] and r["pid"] == 21 and desk.launched == [target]
+                  and r["waited_seconds"] == 8.0, str(r))
+
+        # Desktop reports the path a moment before it accepts operations, then goes quiet again.
+        with Instances({}) as desk:
+            def flaky_launch(path):
+                desk.launched.append(path)
+
+            def flaky_sleep(seconds):
+                desk.sleep(seconds)
+                if desk.now == 4:
+                    desk.files[30] = target              # first report
+                elif desk.now == 6:
+                    desk.busy.add(30)                    # "host is not ready" right after it
+                elif desk.now == 10:
+                    desk.busy.discard(30)                # ready for good
+            r = db.open_file(target, timeout=60, poll=2, launch=flaky_launch, sleep=flaky_sleep, clock=desk.clock)
+            check("one report followed by 'not ready' does not count as open",
+                  r["opened"] and r["pid"] == 30 and r["waited_seconds"] == 12.0, str(r))
+
+        # The window that holds the file is busy (a reload, a screenshot) when we ask.
+        with Instances({7: target}, busy={7}) as desk:
+            def recover(seconds):
+                desk.sleep(seconds)
+                if desk.now >= 4:
+                    desk.busy.clear()
+            r = db.open_file(target, launch=desk.launched.append, sleep=recover, clock=desk.clock)
+            check("a busy window is waited for, not answered with a second window on the same file",
+                  r["opened"] and r["already_open"] and r["pid"] == 7 and desk.launched == [], str(r))
+        with Instances({7: target, 9: ""}, busy={7}) as desk:
+            r = db.open_file(target, timeout=120, launch=desk.launched.append, sleep=desk.sleep, clock=desk.clock)
+            check("a window that stays busy stops the launch, and the message names it",
+                  r["opened"] is False and desk.launched == [] and r["busy_instances"] == [7]
+                  and "pid 7" in r["error"] and "was not started" in r["error"], str(r))
+            check("  after the busy wait, not after the whole timeout", r["waited_seconds"] <= db.BUSY_WAIT + 2, str(r))
+            found, undecided = db.running_instances(target)
+            check("the lookup says which windows could not answer", found is None and undecided == [7])
+            check("the simple lookup cannot tell 'busy' from 'not open' and says so in its name only",
+                  db.instance_for_file(target) is None)
+
+        with Instances({}) as desk:
+            def launch_dialog(path):
+                desk.files[33] = ""                  # a window opens but never shows the file
+            r = db.open_file(target, timeout=10, poll=2, launch=launch_dialog, sleep=desk.sleep, clock=desk.clock)
+            check("a window that never reports the file is a failure that names the pid",
+                  r["opened"] is False and r["new_instances"] == [33] and "pid 33" in r["error"]
+                  and "error dialog" in r["error"], str(r))
+            desk.files.clear()
+            desk.now = 0.0
+            r = db.open_file(target, timeout=10, poll=2, launch=lambda p: None, sleep=desk.sleep, clock=desk.clock)
+            check("no bridge at all points at the preview option",
+                  r["opened"] is False and r["new_instances"] == [] and "preview option" in r["error"], str(r))
+
+            def refuse(path):
+                raise OSError("no application is associated")
+            r = db.open_file(target, launch=refuse, sleep=desk.sleep, clock=desk.clock)
+            check("a launch Windows refuses is reported, not raised",
+                  r["opened"] is False and "associated" in r["error"], str(r))
+
+            started = []
+            real_startfile = getattr(db.os, "startfile", None)
+            db.os.startfile = lambda path, **kw: started.append((path, kw))
+            try:
+                db.open_file(target, timeout=2, poll=2, minimized=True, sleep=desk.sleep, clock=desk.clock)
+                db.open_file(target, timeout=2, poll=2, sleep=desk.sleep, clock=desk.clock)
+            finally:
+                if real_startfile is None:
+                    del db.os.startfile
+                else:
+                    db.os.startfile = real_startfile
+            check("minimized starts the window minimized without taking the focus; the default is a normal window",
+                  started == [(target, {"show_cmd": db.SHOW_MINIMIZED_NO_FOCUS}), (target, {})], str(started))
+
+        import server
+        s = server.PowerBIMCPServer()
+        text, res = asyncio.run(s._handle_bridge_open({"path": os.path.join(tmp, "missing.pbip")}))
+        check("the tool refuses a path that is not a project", res["opened"] is False and "not a .pbip" in text, text)
+        text, res = asyncio.run(s._handle_bridge_open({}))
+        check("and a call without a path", res["opened"] is False and "Provide 'path'" in text, text)
+        db.MAX_FILE_PATH = len(target)
+        try:
+            with Instances({}) as desk:
+                text, res = asyncio.run(s._handle_bridge_open({"path": target}))
+        finally:
+            db.MAX_FILE_PATH = limits[0]
+        check("the tool refuses an over-long path before starting Desktop",
+              res["opened"] is False and "too long" in text and res["long_paths"][0]["path"] == target, text)
+        port_lookup = db.msmdsrv_port_for_desktop_pid
+        db.msmdsrv_port_for_desktop_pid = lambda pid: 51234      # no look at this machine's real processes
+        try:
+            with Instances({7: target}) as desk:
+                text, res = asyncio.run(s._handle_bridge_open({"path": tmp}))
+        finally:
+            db.msmdsrv_port_for_desktop_pid = port_lookup
+        check("the tool accepts the project folder and reports the running window",
+              res["opened"] and res["already_open"] and res["pid"] == 7 and "already open" in text, text)
+        check("with the engine port for desktop_connect", res.get("msmdsrv_port") == 51234 and "51234" in text, text)
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("  DESKTOP BRIDGE TESTS")
     print("=" * 70)
-    for fn in (test_framing, test_client, test_response_matching, test_timeout_is_bounded, test_discovery,
-               test_msmdsrv_port_lookup, test_page_resolution, test_reload_guard_and_status):
+    for fn in (test_framing, test_client, test_argument_shapes, test_response_matching, test_timeout_is_bounded,
+               test_discovery, test_msmdsrv_port_lookup, test_page_resolution, test_visual_region, test_long_paths_walk,
+               test_reload_guard_and_status, test_open_file):
         fn()
     print("\n" + "=" * 70)
     if _failures:

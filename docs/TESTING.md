@@ -7,7 +7,7 @@ through fakes.
 
 ## Run everything
 ```bash
-python run_tests.py              # all 50 suites
+python run_tests.py              # all 53 suites
 python run_tests.py rename dax   # only suites whose file name contains a given word
 ```
 Run one suite:
@@ -68,6 +68,9 @@ build a server write their audit entries to a temporary folder, never to the rep
 |-------|--------|
 | `test_pbir_builders.py` | PBIR emitters (text, shapes, images, buttons, slicers, groups, bookmarks, themes, HTML Content, Deneb, custom visuals) against shapes taken from real files |
 | `test_report_spec.py` | The declarative spec: validation, idempotence (twice applied gives identical bytes), prune, dry run, nothing written on failure, unmanaged pages untouched |
+| `test_pbir_filters.py` | PBIR filter builders: typed literals, every filter form, options, merging with filters added in Desktop |
+| `test_custom_visual.py` | Custom visual builder: package structure, determinism, capabilities per feature, validation and safety messages, the inspector, and the runtime's behaviour in Node against a model of the visual host (Node-dependent checks skip cleanly without Node) |
+| `test_deneb_specs.py` | Deneb spec generator: structure of every chart kind, each interactivity option adds and removes only its own parts, which field sits on which channel, field-name escaping, the element applied through the report spec, error messages. With Node and the `vega` and `vega-lite` packages in the folder named by `DENEB_VEGA_MODULES` (`npm install --prefix <folder> vega@6 vega-lite@6`), every kind is also compiled and rendered; without them that part is skipped |
 | `test_report_audit.py` | Report audit: structure, design and governance findings; robustness against wrong-typed JSON |
 | `test_payload_measures.py` | Row-packing measures and their JavaScript parsers; escape chains decode correctly; budget estimates |
 | `test_js_app_measure.py` | JavaScript-app assembly: the string/template/regex-aware minifier, build refusals, re-evaluation guard, sizes (Node-dependent checks skip cleanly without Node) |
@@ -125,13 +128,52 @@ These runs are not part of the repository's tests, which use synthetic fixtures 
 ## What is not verified by execution
 - **Generated DAX and M** (measure suites, payload, HTML and SVG measures, embedded partitions)
   are checked for shape, escaping and lint, not evaluated by an engine. Use `validate_dax`.
-- **Generated reports** are not opened in Power BI Desktop by the suite. Use `bridge_reload` and
-  `bridge_screenshot`.
-- **Live Desktop paths** were verified against a running Power BI Desktop in 2026-07 (ADOMD
-  queries, TOM batch writes, the star-schema audit, the Desktop Bridge). The connectors and the
-  rename engine have been rewritten since and were not re-run live.
+- **Clicks and hovering.** The Desktop Bridge cannot click, hover or save. Clicking a visual to
+  filter the page, drilling through, a tooltip page appearing on hover, the phone view and the
+  format pane were not observed. What stands in for them is described in the next section.
+- **Generated reports** are not opened in Power BI Desktop by the suite itself. Use `bridge_open`,
+  `bridge_reload` and `bridge_screenshot`.
+- **The whole tool list was not run live.** The live pass below covers the main Desktop tools,
+  not all of them, and the rename engine was not re-run live after its 3.8 rewrite.
 - **Cloud paths** (XMLA/REST/Admin) are tested with fakes and doc-verified against Microsoft
   Learn; end-to-end verification needs a real tenant.
+
+## Live verification against Power BI Desktop (2026-11-11, Desktop 2.159)
+Run on copies of a real report (5 pages, 120 visuals, HTML Content, Deneb and a custom visual)
+opened in Power BI Desktop. None of this is part of the repository's tests.
+
+- **Live tools.** Through the server's own dispatcher: discover and connect, list tables,
+  columns and measures, run DAX, `validate_dax` (a valid and an invalid expression), the
+  dependency scan, the Best Practice Analyzer, the star-schema audit, the referential-integrity
+  scan, AI-readiness, storage analysis, the DAX linter, a TOM transaction with two staged
+  measure batches that was rolled back and left nothing behind, PBIP validation, the report
+  audit, and the bridge: open, status, manifest, reload, a page screenshot, a screenshot of one
+  visual and of one visual inside a group.
+- **What that pass found and fixed.** The bridge client sent arguments in the shape of the first
+  preview builds, which Desktop 2.159 rejects; a project path of 260 characters stopped Desktop
+  with a dialog the bridge cannot see; a machine with only the .NET (Core) builds of the client
+  libraries could not connect; and a second window could be started on a project whose window
+  was merely busy.
+- **Report spec.** A spec using every native feature was applied, reloaded and screenshotted:
+  each filter form changed the numbers as it should (inclusive boundaries, top and bottom N,
+  relative dates), the filter pane showed the display names, lock and hidden marks, and
+  drillthrough pages, tooltip pages, interactions, phone positions and bookmark groups were
+  accepted and drawn. Re-applying wrote nothing, and pruning restored the folder byte for byte.
+- **Custom visuals.** Packages built by `build_custom_visual` loaded and drew the same numbers as
+  native visuals beside them. A probe visual then called the runtime's own functions from its
+  render code: selecting a point cross-filtered and cross-highlighted the native visuals, a
+  second built visual received the highlight values, the host tooltip was shown and hidden,
+  and the context menu opened with an enabled "Drill through". The report-page tooltip form the
+  spec now writes was established the same way. This verifies the calls into Power BI, not the
+  mouse and keyboard handlers that lead to them, which are tested in Node against a model of
+  the host.
+- **Deneb.** Generated specs for the chart kinds drew in Deneb with the model's formats and the
+  theme's colours. Their selection, highlight, tooltip and context-menu behaviour was checked
+  against Deneb's source and a port of its handlers, not observed.
+- **Independent review.** Each part was reviewed by a reviewer that did not write it: generated
+  files validated against Microsoft's published PBIR schemas, the runtime read against the
+  typings of `powerbi-visuals-api`, the audit run over 31 real reports, and the findings fixed
+  before release.
 
 ## Engine-level verification of generated TMDL (2026-07)
 A full project generated by `pbip_add_measures` + `pbip_create_date_table` (fiscal variant) +

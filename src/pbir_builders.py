@@ -9,7 +9,11 @@ slicers, visual groups, show/hide bookmarks, a theme built from a small palette,
 AppSource / private custom visual plumbing.
 
 Every shape was taken from report files that open in Power BI Desktop. A few are inferred from
-the format rather than seen in such a file; they are marked "(inferred)" at the function.
+the format rather than seen in such a file; they are marked "(inferred)" at the function. The
+native report features (page_binding, visual_interaction, mobile_state, bookmark_group, the
+drillthrough action and the tooltip page of a visual) follow the public PBIR schemas instead,
+and a report built with them was loaded into Desktop: the pages rendered and a drillthrough
+button drew in its disabled state. What a click then does was not observed.
 
 Conventions
   * A field is "Table.Field", "'Table Name'.Field", or a dict
@@ -23,8 +27,9 @@ Conventions
 """
 import copy
 import json
+import math
 import re
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 import pbir_authoring
 
@@ -38,17 +43,28 @@ DEFAULT_SCHEMAS: Dict[str, str] = {
     "version": _SCHEMA_ROOT + "versionMetadata/1.0.0/schema.json",
     "bookmark": _SCHEMA_ROOT + "bookmark/1.4.0/schema.json",
     "bookmarksMetadata": _SCHEMA_ROOT + "bookmarksMetadata/1.0.0/schema.json",
+    # The mobile state that shares its visualConfiguration (2.3.0) with visualContainer 2.7.0 to 2.9.0.
+    "mobile": _SCHEMA_ROOT + "visualContainerMobileState/2.3.0/schema.json",
 }
 REPORT_DEFINITION_VERSION = "2.0.0"
 
 # AppSource visuals are referenced by id in report.json "publicCustomVisuals"; nothing is stored
-# in the project. Two HTML Content ids occur in reports that open in Desktop. Which edition each
-# one is (the one that runs scripts, or the certified one that does not) was not established, so
-# neither is named for it: pass the id your report already uses.
-HTML_CONTENT_ID = "htmlContent443BE3AD55E043BF878BED274D3A6855"
-HTML_CONTENT_ID_ALT = "htmlContent443BE3AD55E043BF878BED274D3A6865"
+# in the project. HTML Content comes in two editions with one id each (the publisher's PBIR
+# guide, html-content.com/docs/pbir-guide, lists both). Regular is not certified and, from
+# version 2.0, runs <script> elements and inline handlers: a JavaScript app in a measure needs
+# it. Secure is the certified edition and sanitizes the HTML it is given: static HTML works in
+# both, and markup that Regular draws can be dropped by Secure.
+HTML_CONTENT_EDITIONS = {"regular": "htmlContent443BE3AD55E043BF878BED274D3A6855",
+                         "secure": "htmlContent443BE3AD55E043BF878BED274D3A6865"}
+HTML_CONTENT_ID = HTML_CONTENT_EDITIONS["regular"]
+HTML_CONTENT_ID_ALT = HTML_CONTENT_EDITIONS["secure"]
 DENEB_ID = "deneb7E15AEF80B9E4D4F8E12924291ECE89A"
-DENEB_VEGA_LITE_VERSION = "6.4.1"
+# The Vega-Lite version Deneb 2.0.1.0 stamps on a visual it saves (read from visuals saved by it).
+DENEB_VEGA_LITE_VERSION = "6.4.3"
+DENEB_MAX_SELECTED = 250          # the top of Deneb's "data point limit" for cross-filtering
+# The width of the phone canvas. Microsoft Learn, "Best practices for creating mobile-optimized
+# reports": "323 pt is the maximum screen width on the mobile layout canvas". It has no fixed height.
+PHONE_WIDTH = 323
 
 # The version triple Desktop stores beside a custom theme. Used only when the report has no
 # base theme to copy it from.
@@ -70,6 +86,8 @@ def _num(n: Union[int, float]) -> str:
     if isinstance(n, int):
         return str(n)
     f = float(n)
+    if not math.isfinite(f):
+        raise ValueError(f"{n!r} is not a number a report file can hold")
     return str(int(f)) if f.is_integer() else repr(f)
 
 
@@ -257,13 +275,15 @@ def container_objects(*, title: Any = None, subtitle: Any = None, background: An
                       shadow: Optional[bool] = None, padding: Any = None, header: Optional[bool] = None,
                       alt_text: Optional[str] = None, lock_aspect: Optional[bool] = None,
                       keep_layer_order: Optional[bool] = True, tooltip: Optional[bool] = None,
+                      tooltip_page: Optional[str] = None,
                       link: Optional[List[Json]] = None, extra: Optional[Mapping[str, Any]] = None) -> Json:
     """The visualContainerObjects of a visual: the frame every visual has, whatever its type.
 
     None leaves a setting to the theme. ``padding`` is one number or {top, bottom, left, right}.
     ``link`` is an action from action_link. ``keep_layer_order`` is on by default: without it
     Desktop lifts a clicked visual above its neighbours, and a full-page visual then covers the
-    buttons drawn over it. ``extra`` is merged last, object by object.
+    buttons drawn over it. ``tooltip_page`` names a tooltip page to show instead of the default
+    tooltip. ``extra`` is merged last, object by object.
     """
     out: Json = {}
     for key, obj in (("title", _text_object(title)), ("subTitle", _text_object(subtitle)),
@@ -280,7 +300,15 @@ def container_objects(*, title: Any = None, subtitle: Any = None, background: An
                                                                 "right") if s in sides})]
     if link:
         out["visualLink"] = copy.deepcopy(link)
-    if tooltip is not None:
+    if tooltip_page:
+        if tooltip is False:
+            raise ValueError("a visual with its tooltip switched off cannot show a tooltip page")
+        # show and section, and no "type": that is what visuals saved by Desktop with a page
+        # tooltip carry. Seen in Desktop, with a custom visual calling the host's tooltip
+        # service: with no type (or type 'Canvas') the tooltip page appears, filtered to the row;
+        # with type 'ReportPage', which this function once wrote, the default tooltip appears.
+        out["visualTooltip"] = props(show=lit_bool(True), section=lit_str(tooltip_page))
+    elif tooltip is not None:
         out["visualTooltip"] = _show(tooltip)
     if lock_aspect is not None:
         out["lockAspect"] = _show(lock_aspect)
@@ -297,14 +325,19 @@ def container_objects(*, title: Any = None, subtitle: Any = None, background: An
 
 
 def action_link(kind: str, target: Optional[str] = None, *, tooltip: Optional[str] = None,
-                default_tooltip: Optional[bool] = None) -> List[Json]:
+                default_tooltip: Optional[bool] = None,
+                disabled_tooltip: Optional[str] = None) -> List[Json]:
     """The visualLink object that makes a button, shape or image clickable.
 
     kind: "page" (target = page name), "bookmark" (target = bookmark name), "clear_slicers",
-    "back" (inferred) or "url" (target = web address, inferred).
+    "back" (inferred), "url" (target = web address, inferred) or "drillthrough" (target = the
+    drillthrough page). A drillthrough button only works once the reader has picked a data
+    point that carries one of that page's drillthrough fields, so it has two tooltips: ``tooltip``
+    for when it can be used and ``disabled_tooltip`` for when it cannot.
     """
     kinds = {"page": ("PageNavigation", "navigationSection"), "bookmark": ("Bookmark", "bookmark"),
-             "clear_slicers": ("ClearAllSlicers", None), "back": ("Back", None), "url": ("WebUrl", "webUrl")}
+             "clear_slicers": ("ClearAllSlicers", None), "back": ("Back", None), "url": ("WebUrl", "webUrl"),
+             "drillthrough": ("Drillthrough", "drillthroughSection")}
     if kind not in kinds:
         raise ValueError(f"unknown action kind {kind!r}; use one of {sorted(kinds)}")
     link_type, target_prop = kinds[kind]
@@ -313,7 +346,12 @@ def action_link(kind: str, target: Optional[str] = None, *, tooltip: Optional[st
         if not target:
             raise ValueError(f"action {kind!r} needs a target")
         p[target_prop] = lit_str(target)
-    if tooltip:
+    if kind == "drillthrough":
+        if tooltip:
+            p["enabledTooltip"] = lit_str(tooltip)
+        if disabled_tooltip:
+            p["disabledTooltip"] = lit_str(disabled_tooltip)
+    elif tooltip:
         p["tooltip"] = lit_str(tooltip)
     if default_tooltip is not None:
         p["showDefaultTooltip"] = lit_bool(default_tooltip)
@@ -350,7 +388,7 @@ def visual_container(name: str, pos: Mapping[str, Any], visual: Json, *, schema_
 def _body(visual_type: str, objects: Optional[Json], container: Optional[Json],
           default_chrome: Mapping[str, Any],
           query_state: Optional[Json] = None, link: Optional[List[Json]] = None,
-          extra: Optional[Mapping[str, Any]] = None) -> Json:
+          extra: Optional[Mapping[str, Any]] = None, drill_filter: bool = True) -> Json:
     vco = copy.deepcopy(container) if container is not None else container_objects(**default_chrome)
     if link:
         vco["visualLink"] = copy.deepcopy(link)
@@ -365,7 +403,7 @@ def _body(visual_type: str, objects: Optional[Json], container: Optional[Json],
     body["visualContainerObjects"] = vco
     for key, value in (extra or {}).items():
         body[key] = value
-    body["drillFilterOtherVisuals"] = True
+    body["drillFilterOtherVisuals"] = bool(drill_filter)
     return body
 
 
@@ -374,7 +412,8 @@ def _body(visual_type: str, objects: Optional[Json], container: Optional[Json],
 ACTIVE_ROLES = {"category", "rows", "columns"}
 
 
-def query_state(fields_by_role: Mapping[str, Any], *, mark_active: bool = True) -> Json:
+def query_state(fields_by_role: Mapping[str, Any], *, mark_active: bool = True,
+                drill_roles: Iterable[str] = ()) -> Json:
     """query.queryState from {role: field | [fields]}.
 
     Each projection comes from pbir_authoring.emit_projection. A plain string is read as a
@@ -382,16 +421,27 @@ def query_state(fields_by_role: Mapping[str, Any], *, mark_active: bool = True) 
     flag is set the way Desktop sets it (see ACTIVE_ROLES), which is narrower than
     pbir_authoring.build_query_state, where the first field of every role is active.
     ``mark_active=False`` is for tables and custom visuals, whose fields are never active.
+
+    ``drill_roles`` names the roles a custom visual drills on (capabilities.drilldown.roles).
+    Given several fields, such a role needs the level it starts on marked active: without the
+    mark Desktop refuses the visual ("too many columns in the bucket"). A field in object form
+    can say "active": true | false itself, and then nothing is marked for its role by rule.
     """
+    drill = {str(r) for r in drill_roles}
     state: Json = {}
     for role, refs in fields_by_role.items():
         default = "Measure" if role.lower() in pbir_authoring.AGGREGATING_ROLES else "Column"
+        given = [ref for ref in (refs if isinstance(refs, list) else [refs]) if ref]
+        explicit = any(isinstance(ref, Mapping) and ref.get("active") is not None for ref in given)
+        by_rule = (mark_active and role.lower() in ACTIVE_ROLES) or (role in drill and len(given) > 1)
         projections: List[Json] = []
-        for ref in (refs if isinstance(refs, list) else [refs]):
-            if not ref:
-                continue
+        for ref in given:
             item = projection(ref, default)
-            if mark_active and not projections and role.lower() in ACTIVE_ROLES and "Column" in item["field"]:
+            if explicit:
+                active = isinstance(ref, Mapping) and ref.get("active") is True
+            else:
+                active = by_rule and not projections and "Column" in item["field"]
+            if active:
                 item["active"] = True
             projections.append(item)
         if projections:
@@ -402,17 +452,20 @@ def query_state(fields_by_role: Mapping[str, Any], *, mark_active: bool = True) 
 def data_visual(name: str, visual_type: str, pos: Mapping[str, Any],
                 fields_by_role: Optional[Mapping[str, Any]] = None, *, objects: Optional[Json] = None,
                 container: Optional[Json] = None, mark_active: Optional[bool] = None,
+                drill_roles: Iterable[str] = (), drill_filter_other_visuals: bool = True,
                 schema_url: Optional[str] = None, parent_group: Optional[str] = None,
                 hidden: bool = False) -> Json:
     """Any native or custom visual: type, position, fields by role, formatting.
 
     Fields go through query_state. ``mark_active`` defaults to off for a table (tableEx) and on
-    otherwise; pass False for a custom visual. With no ``container`` the frame is left to the theme.
+    otherwise; pass False for a custom visual, with ``drill_roles`` when it drills. With no
+    ``container`` the frame is left to the theme. ``drill_filter_other_visuals`` is the format's
+    drillFilterOtherVisuals: off keeps a drill in another visual from filtering this one.
     """
     if mark_active is None:
         mark_active = visual_type != "tableEx"
-    state = query_state(dict(fields_by_role or {}), mark_active=mark_active)
-    body = _body(visual_type, objects, container, {}, state)
+    state = query_state(dict(fields_by_role or {}), mark_active=mark_active, drill_roles=drill_roles)
+    body = _body(visual_type, objects, container, {}, state, drill_filter=drill_filter_other_visuals)
     return visual_container(name, pos, body, schema_url=schema_url, parent_group=parent_group, hidden=hidden)
 
 
@@ -653,7 +706,8 @@ def json_literal(value: Union[str, Mapping[str, Any], Sequence[Any]]) -> Json:
 def deneb_visual(name: str, pos: Mapping[str, Any], fields: Sequence[FieldRef],
                  spec: Union[str, Mapping[str, Any]], *, config: Union[str, Mapping[str, Any], None] = None,
                  provider: str = "vegaLite", version: Optional[str] = None, tooltips: bool = True,
-                 selection: bool = False, max_selected: int = 50, container: Optional[Json] = None,
+                 selection: bool = False, max_selected: int = 50, cross_highlight: Optional[bool] = None,
+                 context_menu: Optional[bool] = None, container: Optional[Json] = None,
                  schema_url: Optional[str] = None, parent_group: Optional[str] = None,
                  hidden: bool = False) -> Json:
     """A Deneb visual. ``fields`` become the columns of the dataset named "dataset" in the spec;
@@ -661,7 +715,12 @@ def deneb_visual(name: str, pos: Mapping[str, Any], fields: Sequence[FieldRef],
 
     ``version`` is the Vega-Lite (or Vega) version Deneb records; the default is the one seen
     with provider "vegaLite". Give it explicitly for provider "vega". ``selection`` turns on
-    cross-filtering; the spec must then use Deneb's __selected__ field itself.
+    cross-filtering; the spec must then use Deneb's __selected__ field itself, and
+    ``max_selected`` (1 to 250) is how many selected rows Deneb passes on.
+    ``cross_highlight`` lets a selection in another visual highlight this one: Deneb then adds
+    a "<measure>__highlight" column for the spec to draw. ``context_menu`` is the right-click
+    menu, which is where a reader finds drill through. Both are left to Deneb's own defaults
+    (highlight off, menu on) unless given.
     """
     if provider not in ("vegaLite", "vega"):
         raise ValueError("provider must be 'vegaLite' or 'vega'")
@@ -669,10 +728,20 @@ def deneb_visual(name: str, pos: Mapping[str, Any], fields: Sequence[FieldRef],
         if provider != "vegaLite":
             raise ValueError("give the Vega version explicitly for provider 'vega'")
         version = DENEB_VEGA_LITE_VERSION
+    whole = isinstance(max_selected, (int, float)) and not isinstance(max_selected, bool) \
+        and math.isfinite(max_selected) and float(max_selected).is_integer()
+    if not whole or not 1 <= max_selected <= DENEB_MAX_SELECTED:
+        raise ValueError(f"max_selected must be a whole number from 1 to {DENEB_MAX_SELECTED}, "
+                         f"not {max_selected!r}")
     vega: Json = {"provider": lit_str(provider), "version": lit_str(version), "jsonSpec": json_literal(spec)}
     if config is not None:
         vega["jsonConfig"] = json_literal(config)
-    vega.update({"enableTooltips": lit_bool(tooltips), "enableSelection": lit_bool(selection),
+    vega["enableTooltips"] = lit_bool(tooltips)
+    if context_menu is not None:
+        vega["enableContextMenu"] = lit_bool(context_menu)
+    if cross_highlight is not None:
+        vega["enableHighlight"] = lit_bool(cross_highlight)
+    vega.update({"enableSelection": lit_bool(selection),
                  "selectionMode": lit_str("simple"), "selectionMaxDataPoints": lit_num(max_selected)})
     state = {"dataset": {"projections": [projection(f, "Column") for f in fields]}}
     body = _body(DENEB_ID, {"vega": [entry(vega)]}, container, {}, state)
@@ -701,14 +770,19 @@ def visual_group(name: str, pos: Mapping[str, Any], display_name: str, *, hidden
 def page(name: str, display_name: str, width: int = 1280, height: int = 720, *,
          display_option: str = "FitToPage",
          background: Any = None, wallpaper: Any = None, hidden: bool = False, tooltip: bool = False,
+         drillthrough: bool = False, binding: Optional[Json] = None,
          vertical_alignment: Optional[str] = None, schema_url: Optional[str] = None) -> Json:
     """A page.json document.
 
     ``background`` is a colour, {color, transparency}, or {image, scaling, transparency} naming
     a registered resource image. ``wallpaper`` is the colour around the page. ``hidden`` keeps
-    the page out of the reader's page list. ``tooltip`` makes it a tooltip page (and hides it).
-    display_option: "FitToPage", "FitToWidth" or "ActualSize" (the last is inferred).
+    the page out of the reader's page list. ``tooltip`` makes it a tooltip page (and hides it),
+    ``drillthrough`` a drillthrough page; either one needs ``binding``, from page_binding, for
+    Power BI to offer the page. display_option: "FitToPage", "FitToWidth" or "ActualSize" (the
+    last is inferred).
     """
+    if tooltip and drillthrough:
+        raise ValueError("a page is a tooltip page or a drillthrough page, not both")
     doc = pbir_authoring.build_page(name, display_name, width, height, schema_url)
     doc["displayOption"] = display_option
     objects: Json = {}
@@ -731,9 +805,96 @@ def page(name: str, display_name: str, width: int = 1280, height: int = 720, *,
         doc["objects"] = objects
     if hidden or tooltip:
         doc["visibility"] = "HiddenInViewMode"
-    if tooltip:
-        doc["type"] = "Tooltip"
+    if tooltip or drillthrough:
+        doc["type"] = "Tooltip" if tooltip else "Drillthrough"
+    if binding:
+        doc["pageBinding"] = copy.deepcopy(dict(binding))
     return doc
+
+
+BINDING_TYPES = ("Drillthrough", "Tooltip")
+
+
+def page_binding(name: str, kind: str, fields: Sequence[Mapping[str, Any]] = (), *,
+                 cross_report: bool = False, keep_all_filters: bool = True) -> Json:
+    """The pageBinding of a drillthrough or tooltip page (page schema: PageBinding).
+
+    ``name`` must be unique in the report. Each of ``fields`` is {"filter": the name of the
+    page filter that receives the value, "expr": the field as a query expression, "name": the
+    parameter's own name (optional)}: a data point carrying that field is what offers the
+    page. ``cross_report`` lets other reports drill through to it; ``keep_all_filters`` False
+    stops the source visual's other filters from travelling along.
+
+    A parameter is written the way Desktop saves a drillthrough field that is "used as
+    category": asAggregation and qnaSingleSelectRequired both false.
+    """
+    if kind not in BINDING_TYPES:
+        raise ValueError(f"a page binding is one of {list(BINDING_TYPES)}, not {kind!r}")
+    out: Json = {"name": name, "type": kind}
+    if cross_report:
+        out["referenceScope"] = "CrossReport"
+    if fields:
+        out["parameters"] = [{"name": f.get("name") or f"Param_{f['filter']}", "boundFilter": f["filter"],
+                              "asAggregation": False, "qnaSingleSelectRequired": False,
+                              "fieldExpr": copy.deepcopy(dict(f["expr"]))} for f in fields]
+    if not keep_all_filters:
+        out["acceptsFilterContext"] = "None"
+    return out
+
+
+def merge_binding(current: Any, ours: Optional[Mapping[str, Any]],
+                  previous: Iterable[str] = ()) -> Optional[Json]:
+    """The pageBinding a page should hold when someone may have added to it in Desktop.
+
+    ``ours`` is the binding this apply declares (None when it declares none) and ``previous``
+    names the filters an earlier apply bound. A parameter bound to any other filter is a field
+    somebody dragged in by hand: it stays, in its place. Returns None when no binding is left.
+    """
+    theirs = current if isinstance(current, Mapping) else {}
+    listed = theirs.get("parameters") if isinstance(theirs.get("parameters"), list) else []
+    mine = {str(p["boundFilter"]).lower(): p for p in (ours or {}).get("parameters") or []}
+    gone = {str(n).lower() for n in previous} - set(mine)
+    kept: List[Any] = []
+    placed = set()
+    foreign = False
+    for item in listed:
+        key = str(item.get("boundFilter", "")).lower() if isinstance(item, Mapping) else ""
+        if key in mine:
+            if key not in placed:
+                kept.append(copy.deepcopy(dict(mine[key])))
+                placed.add(key)
+        elif key not in gone:
+            kept.append(item)
+            foreign = True
+    if ours is None and not foreign:
+        return None
+    kept += [copy.deepcopy(dict(p)) for key, p in mine.items() if key not in placed]
+    out: Json = {k: copy.deepcopy(v) for k, v in dict(ours if ours is not None else theirs).items()
+                 if k != "parameters"}
+    if kept:
+        # the key order page_binding writes, so a merged binding reads like a fresh one
+        tail = {k: out.pop(k) for k in ("acceptsFilterContext",) if k in out}
+        out["parameters"] = kept
+        out.update(tail)
+    return out
+
+
+INTERACTION_TYPES = {"filter": "DataFilter", "highlight": "HighlightFilter", "none": "NoFilter"}
+
+
+def visual_interaction(source: str, target: str, kind: str) -> Json:
+    """One entry of a page's visualInteractions: what selecting a data point in ``source`` does
+    to ``target``. kind: "filter", "highlight" or "none". Pairs not listed keep Power BI's
+    default, which depends on the target's visual type."""
+    if kind not in INTERACTION_TYPES:
+        raise ValueError(f"an interaction is one of {list(INTERACTION_TYPES)}, not {kind!r}")
+    return {"source": source, "target": target, "type": INTERACTION_TYPES[kind]}
+
+
+def mobile_state(pos: Mapping[str, Any], schema_url: Optional[str] = None) -> Json:
+    """A visual's mobile.json: where it sits on the phone layout. A visual without the file is
+    not on the phone layout at all."""
+    return {"$schema": schema_url or DEFAULT_SCHEMAS["mobile"], "position": dict(pos)}
 
 
 def _exploration(page_name: str, groups: Optional[Mapping[str, bool]],
@@ -793,6 +954,11 @@ def bookmarks_metadata(names: Sequence[str], schema_url: Optional[str] = None) -
     """bookmarks.json: the order of the bookmarks pane."""
     return {"$schema": schema_url or DEFAULT_SCHEMAS["bookmarksMetadata"],
             "items": [{"name": n} for n in names]}
+
+
+def bookmark_group(name: str, display_name: str, children: Sequence[str]) -> Json:
+    """A group in bookmarks.json items: it takes the place of its bookmarks' own entries."""
+    return {"name": name, "displayName": display_name, "children": list(children)}
 
 
 def version_metadata(schema_url: Optional[str] = None) -> Json:

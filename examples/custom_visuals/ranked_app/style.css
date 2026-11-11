@@ -1,0 +1,10 @@
+.ra { list-style: none; margin: 0; padding: 4px; display: flex; flex-direction: column; gap: 4px; font: 12px "Segoe UI", sans-serif; }
+.ra-item { display: grid; grid-template-columns: 22px minmax(70px, 30%) 1fr auto; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+.ra-item:hover { background: rgba(0, 0, 0, 0.05); }
+.ra-place { opacity: 0.6; text-align: right; font-variant-numeric: tabular-nums; }
+.ra-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ra-meter { height: 8px; border-radius: 4px; background: rgba(0, 0, 0, 0.08); overflow: hidden; }
+.ra-meter i { display: block; height: 100%; border-radius: 4px; background: var(--vk-accent, #5B2DB4); }
+.ra-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+/* The measure page marks its own pick; the custom visual gets vk-selected from the kit. */
+.ra-item.ra-picked, .ra-item.vk-selected { background: rgba(0, 0, 0, 0.08); font-weight: 600; }

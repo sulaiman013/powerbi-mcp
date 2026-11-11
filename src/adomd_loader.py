@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -440,9 +441,63 @@ def _probe_tom(dll: Path) -> Any:
 _LOADED: Dict[str, LoadResult] = {}
 
 
+# ---------------------------------------------------------------- choosing the runtime
+
+def choose_runtime(adomd: Sequence[Path], tom: Sequence[Path]) -> str:
+    """The runtime that can load the most of what is installed: .NET Framework, unless the
+    .NET (Core) builds cover a library that the Framework builds do not.
+
+    A machine set up from the NuGet ``.netcore`` packages has only .NET (Core) builds; pythonnet
+    starts .NET Framework by default on Windows, where none of them load.
+    """
+    def covered(runtime: str) -> int:
+        return sum(1 for dlls in (adomd, tom)
+                   if any(is_compatible(dll_target_framework(d), runtime) for d in dlls))
+    return CORECLR if covered(CORECLR) > covered(NETFX) else NETFX
+
+
+_RUNTIME_SETTLED = False
+_RUNTIME_LOCK = threading.Lock()
+_USER_CONFIGURED = ("PYTHONNET_RUNTIME", "ADOMD_DLL_PATH", "TOM_DLL_PATH")
+
+
+def ensure_runtime() -> Optional[str]:
+    """Before pythonnet starts .NET, switch it to CoreCLR when only that can load the installed
+    libraries. Returns the runtime it selected, or None when it left pythonnet's choice alone:
+    the user has configured this by hand (PYTHONNET_RUNTIME, ADOMD_DLL_PATH or TOM_DLL_PATH is
+    set: a library pinned to a .NET Framework build stops working on CoreCLR, and it is tried
+    first whatever else is installed), .NET is already running, this is not Windows, or
+    pythonnet is not installed. Decided once per process."""
+    global _RUNTIME_SETTLED
+    with _RUNTIME_LOCK:
+        if _RUNTIME_SETTLED:
+            return None
+        _RUNTIME_SETTLED = True
+    if os.name != "nt" or any(os.environ.get(v) for v in _USER_CONFIGURED):
+        return None
+    try:
+        import pythonnet
+        if pythonnet.get_runtime_info() is not None:
+            return None
+    except Exception:
+        return None
+    if choose_runtime(adomd_candidates(NETFX), tom_candidates(NETFX)) != CORECLR:
+        return None
+    try:
+        pythonnet.load(CORECLR)
+    except Exception as exc:  # no .NET runtime installed: stay on the default and let the probes report
+        logger.warning("Only .NET (Core) builds of the Analysis Services libraries were found, but the "
+                       f".NET runtime could not be started ({_first_line(exc)}). Install the .NET "
+                       "runtime, or the lib/net45 builds of the libraries.")
+        return None
+    logger.info("Using the .NET (Core) runtime: the installed Analysis Services libraries are .NET (Core) builds.")
+    return CORECLR
+
+
 def load_adomd(force: bool = False) -> LoadResult:
     """Load ADOMD.NET once per process. ``result.value`` is an ``AdomdLibrary`` when available."""
     if force or "adomd" not in _LOADED:
+        ensure_runtime()
         runtime = active_runtime()
         result = load_first("ADOMD.NET", adomd_candidates(runtime), _probe_adomd, runtime)
         _LOADED["adomd"] = result
@@ -454,6 +509,7 @@ def load_tom(force: bool = False) -> LoadResult:
     """Load TOM (Microsoft.AnalysisServices.Tabular) once per process. ``result.value`` is the
     imported namespace module when available."""
     if force or "tom" not in _LOADED:
+        ensure_runtime()
         runtime = active_runtime()
         result = load_first("TOM", tom_candidates(runtime), _probe_tom, runtime)
         _LOADED["tom"] = result

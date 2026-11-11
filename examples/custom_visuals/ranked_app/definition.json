@@ -1,0 +1,12 @@
+{
+  "name": "rankedApp",
+  "display_name": "Ranked list (ported app)",
+  "description": "A script written for a measure-driven HTML page (function main(app), app.root, app.state, app.on), packaged as a custom visual without changing its modules. In the visual the rows come from the data roles and each item is a real data point; on the measure page the same modules read a payload measure and keep their own highlight.",
+  "version": "1.0.0.0",
+  "roles": [
+    {"name": "category", "display_name": "Category", "kind": "grouping", "max": 1},
+    {"name": "value", "display_name": "Value", "kind": "measure", "max": 1}
+  ],
+  "css_file": "style.css",
+  "js_folder": "modules"
+}

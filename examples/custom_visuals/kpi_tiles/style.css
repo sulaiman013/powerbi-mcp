@@ -1,0 +1,7 @@
+.kt { display: grid; gap: 10px; padding: 4px; height: 100%; align-content: start; }
+.kt-tile { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border: 1px solid rgba(0, 0, 0, 0.12); border-top: 3px solid var(--vk-accent); border-radius: 6px; background: var(--vk-background, #fff); min-width: 0; }
+.kt-tile:focus-visible { outline: 2px solid var(--vk-foreground); outline-offset: 1px; }
+.kt-label { font-size: 9pt; opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kt-value { font-weight: 600; line-height: 1.15; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kt-note { font-size: 8pt; opacity: 0.7; }
+.vk-high-contrast .kt-tile { border-color: var(--vk-foreground); }
