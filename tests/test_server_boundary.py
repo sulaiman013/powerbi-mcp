@@ -570,6 +570,10 @@ def test_identity():
     srv = make_server()
     check("server name has no stale version suffix", srv.server.name == "powerbi-mcp", srv.server.name)
     check("version is a semantic version string", server.__version__.count(".") == 2)
+    init = srv._initialization_options()
+    check("the MCP handshake reports the real name and version",
+          init.server_name == "powerbi-mcp" and init.server_version == server.__version__,
+          f"{init.server_name} {init.server_version}")
 
 
 def test_deneb_tool():

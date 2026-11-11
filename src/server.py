@@ -6896,20 +6896,25 @@ class PowerBIMCPServer:
     async def run(self):
         """Run the MCP server"""
         async with stdio_server() as (read_stream, write_stream):
-            logger.info("Power BI MCP Server V2 starting...")
+            logger.info(f"powerbi-mcp {__version__} starting...")
             logger.info("Supports: Power BI Desktop (local) + Power BI Service (cloud)")
             await self.server.run(
                 read_stream,
                 write_stream,
-                InitializationOptions(
-                    server_name="powerbi-mcp-v2",
-                    server_version="2.0.0",
-                    capabilities=self.server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={}
-                    )
-                )
+                self._initialization_options(),
             )
+
+    def _initialization_options(self) -> InitializationOptions:
+        """What the server tells an MCP client about itself in the handshake: its real name
+        and version."""
+        return InitializationOptions(
+            server_name="powerbi-mcp",
+            server_version=__version__,
+            capabilities=self.server.get_capabilities(
+                notification_options=NotificationOptions(),
+                experimental_capabilities={}
+            )
+        )
 
 
 def main():
